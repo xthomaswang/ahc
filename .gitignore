@@ -1,0 +1,27 @@
+# Python and uv
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+build/
+dist/
+*.egg-info/
+
+# AHC task folders: a task's config, layouts, run logs and prompts stay with the task
+.ahc/
+runs/
+
+# Local environment and secrets
+.env
+.env.*
+.envrc
+.claude/settings.local.json
+
+# OS and editors
+.DS_Store
+.vscode/
+.idea/
+
+# Private working notes, kept locally and not published
+docs/design.md
+docs/real-hardware-test-plan.md

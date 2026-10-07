@@ -1,0 +1,7 @@
+{
+  "attached_instruments": {
+    "right": {"model": "p300_multi_v2.1", "id": "sim-p300-multi"},
+    "left": {"model": "p20_single_v2.2", "id": "sim-p20-single"}
+  },
+  "attached_modules": {}
+}

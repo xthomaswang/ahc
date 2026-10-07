@@ -1,0 +1,14 @@
+{
+  "name": "agentic-hardware-control",
+  "description": "Agentic Hardware Control (AHC): one Claude Code plugin that lets agents drive lab robots (simulated Hamilton STARlet and Opentrons OT-2).",
+  "owner": {
+    "name": "xthomaswang"
+  },
+  "plugins": [
+    {
+      "name": "ahc",
+      "source": "./",
+      "description": "Agentic Hardware Control (AHC): drive lab robots (Hamilton STARlet, Opentrons OT-2) through one capability layer with server-side limits and a run log"
+    }
+  ]
+}

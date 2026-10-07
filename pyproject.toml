@@ -1,0 +1,36 @@
+[project]
+name = "ahc"
+version = "0.4.0"
+description = "Agentic Hardware Control (AHC): agent-agnostic MCP hardware layer for lab robots (prototype: Hamilton STARlet, Opentrons OT-2)"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "mcp==2.2.0",
+  # PyLabRobot 1.0.0b1; pinned to the commit validated on 2026-10-01 (the 1.0 API is still moving).
+  "pylabrobot @ git+https://github.com/pylabrobot/pylabrobot@6262d633394cecb76673f31c79f10cb0ab2fa001",
+  "pyyaml>=6.0",
+]
+
+[project.scripts]
+ahc-mcp = "ahc.server:main"
+ahc-demo = "ahc.viz.demo:main"
+ahc-dashboard = "ahc.viz.dashboard:main"
+ahc-sim = "ahc.devices.opentrons.sim:main"
+ahc-estop = "ahc.workspace.estop:main"
+
+[dependency-groups]
+dev = ["pytest>=8", "anyio>=4.5"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ahc"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]

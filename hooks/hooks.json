@@ -1,0 +1,24 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {"type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/estop-guard.sh\"", "timeout": 5},
+          {"type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/agent-feed.sh\" pre", "timeout": 5}
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [{"type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/agent-feed.sh\" post", "timeout": 5}]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [{"type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/agent-feed.sh\" stop", "timeout": 5}]
+      }
+    ]
+  }
+}

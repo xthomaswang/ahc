@@ -1,0 +1,29 @@
+{
+  "name": "ahc",
+  "version": "0.4.0",
+  "description": "Agentic Hardware Control (AHC): drive lab robots (Hamilton STARlet, Opentrons OT-2) through one capability layer with server-side limits and a run log",
+  "author": {
+    "name": "xthomaswang"
+  },
+  "license": "MIT",
+  "keywords": [
+    "lab-automation",
+    "liquid-handling",
+    "pylabrobot",
+    "mcp"
+  ],
+  "mcpServers": {
+    "ahc": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--quiet",
+        "--project",
+        "${CLAUDE_PLUGIN_ROOT}",
+        "ahc-mcp",
+        "--backend",
+        "sim"
+      ]
+    }
+  }
+}

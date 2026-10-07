@@ -126,6 +126,7 @@ class Lab:
     self.estop: dict[str, Any] | None = None  # the engaged emergency stop, held until a release record
     self._estop_mtime: float | None = None
     self.current_action: asyncio.Task | None = None  # what the emergency stop interrupts
+    self._halting: asyncio.Task | None = None  # the emergency stop reaching the device itself
     self.plan = PlanProgress()  # the agent's plan; fed by the run log entries this server records
     self.step_context: int | None = None  # the plan step of the call running now
     self._bound: str | None = None
@@ -164,6 +165,11 @@ class Lab:
         self.current_action.cancel()
       self.record({"type": "estop", "state": "engaged", "by": data.get("by"), "at": data.get("at"),
                    "reason": data.get("reason"), "interrupted": interrupted})
+      if self.adapter is not None:
+        try:  # not under self.lock: the action it stops may hold it
+          self._halting = asyncio.get_running_loop().create_task(self._halt_device(self.adapter))
+        except RuntimeError:  # no event loop (a synchronous caller): the server's watcher halts it instead
+          pass
     elif not data.get("engaged") and self.estop is not None and self.estop.get("id") == data.get("id"):
       self.estop = None
       self.record({"type": "estop", "state": "released", "by": data.get("released_by"), "at": data.get("released_at")})
@@ -171,6 +177,18 @@ class Lab:
         self.gate = Gate(layout=self.gate.layout, needs_person=self.gate.needs_person,
                          pending_layout=self.gate.pending_layout)
         self.gate_changed("emergency stop released: check the deck again")
+
+  async def _halt_device(self, adapter) -> None:
+    """The emergency stop reaching the device: the OT-2's run is stopped; other devices have no stop
+    this layer can reach yet. Logged either way."""
+    try:
+      halted = await adapter.halt()
+    except Exception as exc:  # noqa: BLE001 - the stop must be reported, never raised into the watcher
+      self.record({"type": "audit", "event": "device_halt_failed", "detail": f"{type(exc).__name__}: {exc}"})
+      return
+    self.record({"type": "audit", "event": "device_halted" if halted else "device_not_halted",
+                 "detail": "the device stopped its run" if halted else
+                           "no device-level stop for this device, or nothing was running on it"})
 
   async def watch_estop(self) -> None:
     """Runs for the server's life; a stat every 0.2 s, parsing only when the file changes."""
@@ -320,6 +338,9 @@ class Lab:
   def next_step(self) -> str:
     if self.estop is not None:
       return "The emergency stop is engaged: stop, tell the person and wait. Only the person releases it."
+    if getattr(self.adapter, "halted", False):
+      return ("The emergency stop stopped the device's run: the person removes any tips left on the pipettes, "
+              "then load_layout again; the deck is checked before anything moves.")
     status = self.config_status()["status"]
     if status == "invalid":
       return "Fix .ahc/config.yaml (see config.reason) or rewrite it with configure_devices."
@@ -475,6 +496,11 @@ class Lab:
                components=comps, layout_format=_layout_format(spec), checks=CHECKS,
                live_view={"enabled": self.view is not None, "url": self.view.url if self.view else None},
                next=self.next_step())
+    if not self.adapter.simulated:  # on real hardware the person sees which instrument this is
+      try:
+        out["device_identity"] = self.adapter.identity()
+      except Exception as exc:  # noqa: BLE001
+        out["device_identity"] = {"error": f"{type(exc).__name__}: {exc}"}
     sim = SIMULATORS.get(spec.model) if self.adapter.simulated else None
     if sim is not None:
       out["simulator"] = {**sim.status(self.ws), "start": sim.start_command(self.ws),
@@ -557,8 +583,9 @@ def create_server(workspace=None, backend: str | None = None, device: str | None
       entries = parse_devices(devices)
       if not entries:
         raise LabError("config_invalid", "devices is empty.", "Name the device the person chose.")
-      for e in entries:  # refuse limits that would loosen the description file's, before writing
+      for e in entries:  # refuse limits that would loosen the description file's, and entries that cannot run
         apply_limits(replace(load_device(e.model), id=e.id), limits or {})
+        ADAPTERS[e.model].check_options("sim" if lab.forced_sim else e.backend, {**e.options, **lab.options})
       text = lab.ws.read_config_text()
       try:
         previous = parse_config(text) if text else None
@@ -680,6 +707,12 @@ def create_server(workspace=None, backend: str | None = None, device: str | None
       needs_person = layout is not None and lab.adapter.simulated and not lab.ws.has_reference()
       built = await lab.adapter.load_layout(chosen)
       built.record_placements()
+      try:
+        identity = lab.adapter.identity()
+      except Exception as exc:  # noqa: BLE001 - who the device is must never stop the load
+        identity = {"error": f"{type(exc).__name__}: {exc}"}
+      if identity:
+        lab.record({"type": "device", "model": lab.spec.model, "backend": lab.adapter.backend, **identity})
       saved_as = name if layout is None else (name or lab.ws.next_layout_name())
       if layout is not None and not needs_person:
         lab.ws.save_layout(saved_as, layout, lab.spec.model)

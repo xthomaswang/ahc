@@ -13,7 +13,9 @@ and ask for the lab work.
 - a Hamilton STARlet, through PyLabRobot's firmware-level simulator;
 - an Opentrons OT-2, through Opentrons' own robot-server with a virtual motor controller.
 
-Nothing here has run on a physical instrument yet; bringing up a real OT-2 comes first.
+Nothing here has run on a physical instrument yet. The path to a real OT-2 is in place and rehearsed
+against the simulator (see [A real OT-2](#a-real-ot-2-bring-up)); it is the first to be tried on
+hardware.
 
 ## How it works
 
@@ -33,8 +35,8 @@ Nothing here has run on a physical instrument yet; bringing up a real OT-2 comes
   - After every layout load nothing moves until the deck check passes. In simulation the simulator
     judges it; on real hardware the person on site does. In simulation the person also confirms a
     layout the task folder has no reference for.
-  - An emergency stop (dashboard button or `ahc-estop`) halts the server's work at once until a
-    person releases it.
+  - An emergency stop (dashboard button or `ahc-estop`) halts the server's work at once, and an
+    OT-2's run on the robot, until a person releases it.
 
 ## Install (Claude Code)
 
@@ -94,6 +96,42 @@ ahc-sim ot2 --status
 
 Under the plugin, `ahc-sim` is not on `PATH`; the server's hints give its full path.
 
+## A real OT-2 (bring-up)
+
+The OT-2's real backend, `robot`, talks to the robot's own robot-server over the lab network: the
+same HTTP API the simulator serves. A task folder's config names the robot, and only the person's
+confirmation lets it run:
+
+```yaml
+devices:
+  - id: ot2
+    model: opentrons.ot2
+    backend: robot
+    options: {host: 192.168.1.20, port: 31950, robot_name: <the name /health reports>}
+```
+
+With `robot_name` set, the server refuses any other robot at that address. On real hardware every
+deck check, tip check and liquid check waits for the person's verdict.
+
+The first runs use `ahc-smoke`, a scripted client with no agent. It goes through the same server, one
+stage at a time, and asks the person at the terminal for every confirmation:
+
+```bash
+ahc-smoke --host <robot address> --stage connect   # identity; the person confirms the config. Nothing moves.
+ahc-smoke --stage init                             # + layout and the person's deck check (the robot may home)
+ahc-smoke --stage tips                             # + pick up one column of tips and put them back
+ahc-smoke --stage water                            # + 100 uL of water into plate column 12
+ahc-smoke --stage dilution                         # + a 3-column dye dilution in plate columns 1-3
+```
+
+The deck: slot 1 an Opentrons 300 uL tip rack (columns 1-5 full), slot 2 a Corning 2 mL deep-well
+plate with dye in column 1 and water in column 2, slot 3 an empty Corning 360 uL flat-bottom plate,
+and the trash in slot 12. Rehearse against a simulator first: run `ahc-sim ot2` in another folder,
+then `ahc-smoke --host 127.0.0.1 --port <its port> --stage dilution` in the task folder.
+
+The plugin still forces simulation, so an agent in Claude Code cannot reach a real robot yet;
+`ahc-smoke` can, and so can `ahc-mcp` started without `--backend sim`.
+
 ## Dashboard and demo
 
 Run these in a task folder. From a clone, prefix them with `uv run --project <clone>`; otherwise use
@@ -129,8 +167,9 @@ Press the red button on the dashboard, or run `ahc-estop` in the task folder. Th
 running command at once and refuses everything until a person releases it: the dashboard's
 Release, after a confirmation, or `ahc-estop --release` at a terminal. In Claude Code the plugin's
 hook also stops the agent itself. After a release, the deck is checked again before anything moves.
-The stop does not reach an instrument yet; on real hardware the instrument's own stop stays the
-primary safety control.
+On an OT-2 the stop also stops the robot's run, so after the release the layout is loaded again
+(tips left on the pipettes are the person's to remove first). It does not reach a STARlet yet. On
+real hardware the instrument's own stop stays the primary safety control.
 
 ## Other MCP clients
 
@@ -161,18 +200,22 @@ claude plugin validate .
 | `src/ahc/workspace/` | task folders: config, limits, layouts, references, emergency stop |
 | `src/ahc/verification/` | checks and the motion gate |
 | `src/ahc/plan.py` | the agent's plan and its progress |
+| `src/ahc/smoke.py` | `ahc-smoke`: scripted first runs on a real OT-2 |
 | `src/ahc/viz/` | dashboard, 3D view, demo |
 | `.claude-plugin/`, `skills/`, `hooks/` | the Claude Code plugin: manifest, skill, hooks |
 
 ## Known limits
 
-- **Simulation only.** Nothing here has run on a physical instrument.
+- **Not yet run on a physical instrument.** The OT-2's real path is rehearsed against the simulator
+  only.
 - **First-start timeout.** Claude Code waits 30 s for an MCP server to start. On a slow network the
   first start after an install or update can take longer while uv downloads; reconnect with `/mcp`.
 - **One device per server.**
 - **`AHC_DEVICE` conflicts.** If `AHC_DEVICE` is set and a folder's config names another model, the
   server reports `device_conflict` rather than guessing.
-- **The emergency stop does not reach an instrument yet** (see above).
+- **The emergency stop reaches an OT-2's run, not a STARlet** (see above).
+- **An unresponsive robot can hold up the server for up to 10 s** per request (the robot's HTTP calls
+  block), and with it the emergency stop's watcher.
 - **Live agent text is Claude Code only.** Other clients show their plan and steps, their reported
   decisions and the hardware calls. A step is ticked when the agent moves on to the next one, a few
   seconds after it actually ends.

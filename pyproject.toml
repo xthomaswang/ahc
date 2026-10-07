@@ -1,6 +1,6 @@
 [project]
 name = "ahc"
-version = "0.4.0"
+version = "0.5.0"
 description = "Agentic Hardware Control (AHC): agent-agnostic MCP hardware layer for lab robots (prototype: Hamilton STARlet, Opentrons OT-2)"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -17,6 +17,7 @@ ahc-demo = "ahc.viz.demo:main"
 ahc-dashboard = "ahc.viz.dashboard:main"
 ahc-sim = "ahc.devices.opentrons.sim:main"
 ahc-estop = "ahc.workspace.estop:main"
+ahc-smoke = "ahc.smoke:main"
 
 [dependency-groups]
 dev = ["pytest>=8", "anyio>=4.5"]

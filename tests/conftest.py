@@ -130,12 +130,12 @@ def give_reference(lab, text: str = "# Deck\nThe example deck, as the person set
 
 
 async def load_verified(lab, **args):
-  """load_layout, then the deck check that opens the motion gate. The simulator judges it, except for
-  a layout with no reference in the folder: then the person confirms it, which the test does here."""
+  """load_layout, then the deck check that opens the motion gate. The simulator judges it, except where
+  the person does (real hardware, or a layout with no reference in the folder): the test plays them."""
   loaded = await lab.call("load_layout", **args)
   step = {"plan_step": args["plan_step"]} if "plan_step" in args else {}
   verdict = await lab.call("verify", check="deck_matches_layout", **step)
-  if verdict["verdict"] == "pending" and verdict["gate"]["needs_person"]:
+  if verdict["verdict"] == "pending":
     verdict = await lab.call("record_verdict", check_id=verdict["check_id"], verdict="pass")
   assert verdict["verdict"] == "pass" and verdict["gate"]["state"] == "passed"
   return loaded

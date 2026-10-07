@@ -31,6 +31,18 @@ class Adapter(ABC):
   def simulated(self) -> bool:
     return self.backend == "sim"
 
+  @classmethod
+  def check_options(cls, backend: str, options: dict[str, Any]) -> None:
+    """Refuse a device entry this adapter could not run, before the person is asked to confirm it."""
+
+  def identity(self) -> dict[str, Any]:
+    """What the device says it is (name, serial, software), for the run log; {} if it cannot say."""
+    return {}
+
+  async def halt(self) -> bool:
+    """The emergency stop: stop the device itself, if it has a stop this adapter can reach. False if not."""
+    return False
+
   def require_layout(self) -> Layout:
     if self.layout is None:
       raise LabError("no_layout", "no deck layout is loaded.", "Call load_layout first.")

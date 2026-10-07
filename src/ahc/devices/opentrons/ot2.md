@@ -4,6 +4,7 @@ brand: opentrons
 title: Opentrons OT-2 with a P300 8-channel GEN2 (right) and a P20 single-channel GEN2 (left)
 backends:
   sim: "Opentrons robot-server (opentrons-ot2 repo) with a virtual Smoothie, reached over its HTTP API."
+  robot: "A real OT-2: its own robot-server on the lab network, over the same HTTP API. Set options.host (options.port if not 31950; options.robot_name to refuse any other robot) in the config; the person confirms it."
 layout:
   kind: slots
   slots: {min: 1, max: 11}

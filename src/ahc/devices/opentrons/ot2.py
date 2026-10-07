@@ -20,6 +20,7 @@ class OT2Adapter(OpentronsAdapter):
   async def start(self) -> None:
     await super().start()
     self.device = None
+    self.halted = False  # the emergency stop stopped this run; a new layout load starts a new one
 
   async def stop(self) -> None:
     if self.device is not None:
@@ -45,9 +46,10 @@ class OT2Adapter(OpentronsAdapter):
     await self.stop()
     device = OT2(host=self.host, port=self.port, deck=deck)
     await device.setup()
-    if self.simulated and device._run.software_version.startswith("0.0.0"):
-      # SIM ONLY: a dev robot-server has no /etc/VERSION.json and reports 0.0.0.dev0, which sends
-      # PyLabRobot down its pre-7.1 fixed-trash path. A real robot reports its own release.
+    if device._run.software_version.startswith("0.0.0"):
+      # A dev robot-server (the simulator, also when rehearsing the robot backend against it) has no
+      # /etc/VERSION.json and reports 0.0.0.dev0, which sends PyLabRobot down its pre-7.1
+      # fixed-trash path. A real robot always reports its own release, so this never fires there.
       device._run._software_version = "8.8.2"
     for mount, (name, channels) in self._EXPECTED.items():
       pipette = getattr(device, f"{mount}_pipette")
@@ -57,8 +59,20 @@ class OT2Adapter(OpentronsAdapter):
                        f"{mount} mount has {getattr(pipette, 'name', None)!r}, the description file expects {name!r}.",
                        "Fix the description file or the robot before running.")
     self.device = device
+    self.halted = False
     self.layout = new_layout
     return new_layout
+
+  async def halt(self) -> bool:
+    """Stop the robot's run at once. Not device.stop(): that waits for the command in flight to give
+    up PyLabRobot's operation lock. The run's own stop posts the stop action and waits until the
+    robot reports it stopped."""
+    device = self.device
+    if device is None or device._run is None or not device._run.active:
+      return False
+    self.halted = True
+    await device._run.stop()
+    return True
 
   def view_root(self):
     return self.device.deck if self.device is not None else None
@@ -66,10 +80,14 @@ class OT2Adapter(OpentronsAdapter):
   def _pipette(self, comp: Component):
     if self.device is None:
       raise LabError("no_layout", "the OT-2 is not set up.", "Call load_layout first.")
+    if self.halted:
+      raise LabError("device_halted", "the emergency stop stopped the OT-2's run, so it takes no more commands.",
+                     "Load the layout again (a new run). The person removes any tips left on the pipettes and "
+                     "checks the deck first.")
     return getattr(self.device, f"{comp.name}_pipette")
 
   def mounted_tips(self, comp: Component) -> list[Any]:
-    if self.device is None:
+    if self.device is None or self.halted:  # after a stop the robot's tips are the person's to check
       return []
     pipette = self._pipette(comp)
     if comp.channels == 1:

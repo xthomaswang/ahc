@@ -68,6 +68,9 @@ REFUSALS = [
   ("volume_count", "aspirate", dict(targets=["diluent"], volumes=[50, 50])),
   ("unknown_target", "aspirate", dict(targets=["buffer"], volumes=50)),
   ("wells_required", "aspirate", dict(targets=["plate"], volumes=50)),
+  ("bad_wells", "aspirate", dict(targets=["plate:col13"], volumes=50)),
+  ("insufficient_in_tips", "dispense", dict(targets=["plate:A1:H1"], volumes=50)),  # the tips hold nothing yet
+  ("above_liquid", "aspirate", dict(targets=["diluent"], volumes=50, liquid_height=35)),  # 100 mL is 33 mm deep
 ]
 
 
@@ -75,6 +78,82 @@ REFUSALS = [
 async def test_refusals_with_tips_mounted(starlet, code, tool, args):
   await loaded(starlet, with_tips=True)
   assert await starlet.refused(tool, device=DEV, **args) == code
+
+
+async def test_tips_have_room_only_for_what_they_do_not_hold(starlet):
+  await loaded(starlet, with_tips=True)  # 300 uL filter tips: 360 uL to the filter
+  await starlet.call("aspirate", device=DEV, targets=["diluent"], volumes=200)
+  text = await starlet.call_text("aspirate", device=DEV, targets=["diluent"], volumes=200)
+  assert "[exceeds_tip]" in text and "on top of the 200 uL they hold" in text
+  assert await starlet.refused("mix", device=DEV, targets=["diluent"], volume=200, repetitions=2) == "exceeds_tip"
+  assert await starlet.refused("dispense", device=DEV, targets=["plate:A1:H1"], volumes=250) == "insufficient_in_tips"
+  await starlet.call("dispense", device=DEV, targets=["plate:A1:H1"], volumes=200)
+
+
+# The native post-dispense mix and pre-wetting draw through the tips from the call's own targets.
+DRAW_REFUSALS = [
+  # 200 uL held, 50 dispensed: 150 stay in the tips, and 250 more would reach the filter.
+  ("exceeds_tip", 200, dict(volumes=50, specialized={"post_mix_volume_ul": 250, "post_mix_repetitions": 3})),
+  # An empty column gets 50 uL: a 250 uL mix would draw air.
+  ("insufficient_liquid", 50, dict(volumes=50, specialized={"post_mix_volume_ul": 250, "post_mix_repetitions": 3})),
+  # 100 uL arrive and the mix takes 50 back: 1.7 mm of liquid, and the mix runs at the dispense height.
+  ("above_liquid", 100, dict(volumes=100, liquid_height=5,
+                             specialized={"post_mix_volume_ul": 50, "post_mix_repetitions": 2})),
+]
+
+
+@pytest.mark.parametrize("code,held,args", DRAW_REFUSALS, ids=[c for c, _, _ in DRAW_REFUSALS])
+async def test_a_native_mix_is_checked_like_a_mix(starlet, code, held, args):
+  await loaded(starlet, with_tips=True)
+  await starlet.call("aspirate", device=DEV, targets=["diluent"], volumes=held)
+  assert await starlet.refused("dispense", device=DEV, targets=["plate:A1:H1"], **args) == code
+
+
+async def test_a_native_mix_leaves_room_for_the_transport_air(starlet):
+  await loaded(starlet, with_tips=True)  # 300 uL filter tips: 360 uL to the filter
+  await starlet.call("aspirate", device=DEV, targets=["diluent"], volumes=100)
+  mix = lambda volume, **more: {"post_mix_volume_ul": volume, "post_mix_repetitions": 1, **more}
+  # Back into the trough, so the liquid is there. 356 uL fit the empty tips, but not with the 5 uL of
+  # transport air the liquid class draws after the dispense.
+  text = await starlet.call_text("dispense", device=DEV, targets=["diluent"], volumes=100, specialized=mix(356))
+  assert "[exceeds_tip]" in text and "with 0 uL in the tips and 5 uL of transport air" in text
+  assert "Use at most 355 uL" in text
+  # Transport air given with the call is the one counted.
+  assert await starlet.refused("dispense", device=DEV, targets=["diluent"], volumes=100,
+                               specialized=mix(340, transport_air_volume_ul=30)) == "exceeds_tip"
+  await starlet.call("dispense", device=DEV, targets=["diluent"], volumes=100, specialized=mix(355))
+
+
+async def test_pre_wetting_needs_the_liquid_it_draws(starlet):
+  await loaded(starlet, with_tips=True)
+  await starlet.call("aspirate", device=DEV, targets=["diluent"], volumes=50)
+  await starlet.call("dispense", device=DEV, targets=["plate:A1:H1"], volumes=50)
+  text = await starlet.call_text("aspirate", device=DEV, targets=["plate:A1:H1"], volumes=10,
+                                 specialized={"pre_wetting_volume_ul": 60})
+  assert "[insufficient_liquid]" in text and "pre_wetting_volume_ul draws 60 uL" in text
+  await starlet.call("aspirate", device=DEV, targets=["plate:A1:H1"], volumes=10, specialized={"pre_wetting_volume_ul": 20})
+
+
+async def test_the_liquid_surface_caps_the_height_of_a_draw(starlet):
+  await loaded(starlet, with_tips=True)
+  await starlet.call("aspirate", device=DEV, targets=["diluent"], volumes=100)
+  await starlet.call("dispense", device=DEV, targets=["plate:A1:H1"], volumes=100)
+  # 50 uL are left after this draw, 1.7 mm deep: at 5 mm the tips would end in air.
+  text = await starlet.call_text("aspirate", device=DEV, targets=["plate:A1:H1"], volumes=50, liquid_height=5)
+  assert "[above_liquid]" in text and "50 uL is left" in text and "Use at most 1.1 mm" in text  # 1.19, rounded down
+  assert await starlet.refused("mix", device=DEV, targets=["plate:A1:H1"], volume=50, repetitions=2,
+                               liquid_height=5) == "above_liquid"
+  await starlet.call("aspirate", device=DEV, targets=["plate:A1:H1"], volumes=50, liquid_height=1)
+  await starlet.call("dispense", device=DEV, targets=["plate:A1:H1"], volumes=50, liquid_height=8)  # above is fine
+
+
+async def test_independent_channels_take_one_to_eight_tips(starlet):
+  await loaded(starlet)
+  text = await starlet.call_text("pick_up_tips", device=DEV, tips=["tips:A1:H8"])
+  assert "[tip_count]" in text and "64 tip spots for the 8 channels of starlet.pip" in text
+  one = await starlet.call("pick_up_tips", device=DEV, tips=["tips:A1"])
+  assert one["effective"]["where"] == "tips: A1"
+  assert (await starlet.call("get_state", device=DEV))["tips_mounted"] == {DEV: 1}
 
 
 async def test_paired_specialized_parameters(starlet):
@@ -212,3 +291,65 @@ async def test_a_refusal_after_liquid_moved_says_so(starlet, monkeypatch):
   twin = plate_volumes(await starlet.call("get_state", device=DEV))
   wells = replay(Path(starlet.server.lab.runlog.path))["plates"][0]["wells"]
   assert {w: d["v"] for w, d in wells.items() if d["v"] > 0} == twin  # the dashboard agrees with the device
+
+
+# -- the adapter --------------------------------------------------------------------------------
+
+async def test_a_failed_setup_leaves_no_half_built_device(starlet, monkeypatch):
+  from pylabrobot.hamilton.star.driver.simulator import STARSimulationDriver
+
+  await loaded(starlet)
+
+  async def not_found(self):
+    raise RuntimeError("USB device not found.")
+
+  monkeypatch.setattr(STARSimulationDriver, "_open", not_found)
+  assert await starlet.refused("load_layout", layout=STARLET_LAYOUT) == "device_refused"
+  adapter = starlet.server.lab.adapter
+  assert adapter.device is None and adapter.layout is None  # nothing left that half works
+  assert (await starlet.call("get_state", device=DEV))["layout"] is None  # readable, not an opaque error
+  monkeypatch.undo()
+  await loaded(starlet, with_tips=True)  # the retry works once the device answers
+
+
+async def test_the_starlet_runs_only_simulated():
+  from dataclasses import replace
+
+  from ahc.core.errors import LabError
+  from ahc.devices.hamilton.starlet import STARletAdapter
+  from ahc.devices.spec import load_device
+
+  spec = replace(load_device("hamilton.starlet"), backends={"sim": "simulated", "usb": "a real STARlet"})
+  with pytest.raises(LabError) as refused:
+    await STARletAdapter(spec, "usb", {}).start()  # never the simulator under real-hardware rules
+  assert refused.value.code == "backend_not_implemented"
+
+
+async def test_firmware_commands_are_counted_per_adapter(tmp_path, open_lab):
+  import logging
+
+  sim_logger = logging.getLogger("pylabrobot.hamilton.star.driver.simulator")
+  before = (list(sim_logger.handlers), sim_logger.level)
+  (tmp_path / "a").mkdir()
+  (tmp_path / "b").mkdir()
+  async with open_lab(tmp_path / "a", "sim") as a, open_lab(tmp_path / "b", "sim") as b:
+    await loaded(a)
+    await loaded(b)
+    idle = b.server.lab.adapter.command_count()
+    picked = await a.call("pick_up_tips", device=DEV)
+    assert picked["commands_sent"] > 0 and b.server.lab.adapter.command_count() == idle  # no cross-talk
+  assert (list(sim_logger.handlers), sim_logger.level) == before  # nothing global was touched
+
+
+async def test_the_mix_speed_ahc_chooses_is_recorded(starlet):
+  await loaded(starlet, with_tips=True)
+  await starlet.call("aspirate", device=DEV, targets=["diluent"], volumes=100)
+  native = await starlet.call("dispense", device=DEV, targets=["plate:A1:H1"], volumes=100,
+                              specialized={"post_mix_volume_ul": 50, "post_mix_repetitions": 2})
+  assert "at 100 uL/s (AHC's mix speed: no flow_rate given)" in native["note"]
+  await starlet.call("aspirate", device=DEV, targets=["diluent"], volumes=100)
+  inherited = await starlet.call("dispense", device=DEV, targets=["plate:A2:H2"], volumes=100, flow_rate=50,
+                                 specialized={"post_mix_volume_ul": 50, "post_mix_repetitions": 2})
+  assert "at 50 uL/s (the dispense's flow rate)" in inherited["note"]
+  mixed = await starlet.call("mix", device=DEV, targets=["plate:A1:H1"], volume=50, repetitions=2)
+  assert mixed["effective"]["flow_rate_ul_s"] == 100.0 and "at 100 uL/s" in mixed["note"]

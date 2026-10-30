@@ -2,12 +2,20 @@
 
 Called by hooks/agent-feed.sh before every tool call ("pre", which records the call), after it
 ("post": Claude Code writes the agent's text for a call to the transcript only around then, so this
-catches it without waiting for the next call) and when the agent finishes a turn ("stop"). It reads the tail of the session transcript Claude Code passes in and appends what is new
-to `<task>/.ahc/agent-feed.jsonl`, which the run dashboard shows live. A folder becomes an AHC task
-with the agent's first AHC tool call: from then on (with what was asked and said before it) the feed
-is written, before the server itself writes anything. Only tool names are recorded for tools other
-than AHC's, so shell commands and file contents never land in the feed. Standard library only: this
-runs with the system python3, outside the plugin's environment. AHC_FEED=0 turns it off.
+catches it without waiting for the next call) and when the agent finishes a turn ("stop"). It reads the
+tail of the session transcript Claude Code passes in and appends what is new to
+`<task>/.ahc/agent-feed.jsonl`, which the run dashboard shows live. A folder becomes an AHC task with
+the agent's first AHC tool call: from then on (with what was asked and said before it) the feed is
+written, before the server itself writes anything. Only tool names are recorded for tools other than
+AHC's, so shell commands and file contents never land in the feed.
+
+A call made while the folder's emergency stop is engaged is recorded as denied, not as being called:
+the stop hook (estop-guard.sh) refuses it, by the same reading of .ahc/estop.json. Parallel tool calls
+run this at once; the feed is locked while one of them reads what it holds and appends, and every call
+carries its tool_use_id, so nothing is written twice.
+
+Standard library only, and Python 3.9: this runs with the system python3, outside the plugin's
+environment. AHC_FEED=0 turns it off.
 """
 
 from __future__ import annotations
@@ -21,6 +29,7 @@ from pathlib import Path
 
 AHC_TOOL = "mcp__plugin_ahc_ahc__"
 TAIL_BYTES = 400_000
+FEED_TAIL_BYTES = 2_000_000
 TEXT_LIMIT = 600
 BRIEF_KEYS = ("check", "device", "targets", "volumes", "volume", "repetitions", "name", "decision", "op")
 
@@ -74,8 +83,9 @@ def _short(tool: str) -> str:
   return tool[len(AHC_TOOL):] if tool.startswith(AHC_TOOL) else tool
 
 
-def new_entries(event: str, data: dict, seen: set[str]) -> list[dict]:
-  """What this hook call adds: the request and agent text not seen before, then the call or the end."""
+def new_entries(event: str, data: dict, seen: set[str], stopped: bool = False) -> list[dict]:
+  """What this hook call adds: the request and agent text not seen before, then the call (denied while
+  the emergency stop is engaged) or the end."""
   session = data.get("session_id")
   records = _tail_records(data.get("transcript_path"))
   out: list[dict] = []
@@ -98,8 +108,11 @@ def new_entries(event: str, data: dict, seen: set[str]) -> list[dict]:
                         "t": _local(r.get("timestamp"))})
   if event == "pre":
     tool = data.get("tool_name") or ""
-    out.append({"kind": "doing", "tool": _short(tool), "brief": _brief(tool, data.get("tool_input") or {}),
-                "ahc": tool.startswith(AHC_TOOL), "t": _now()})
+    call = {"kind": "denied" if stopped else "doing", "tool": _short(tool),
+            "brief": _brief(tool, data.get("tool_input") or {}), "ahc": tool.startswith(AHC_TOOL), "t": _now()}
+    if data.get("tool_use_id"):
+      call["id"] = f"call:{data['tool_use_id']}"
+    out.append(call)
   elif event == "stop":  # the turn ended: the answer comes with the hook input, else from the transcript
     answer = data.get("last_assistant_message")
     if isinstance(answer, str) and answer.strip():
@@ -109,20 +122,60 @@ def new_entries(event: str, data: dict, seen: set[str]) -> list[dict]:
     out.append({"kind": "finished", "text": text[:TEXT_LIMIT], "id": "final:" + bid, "t": _now()})
   for e in out:
     e["session"] = session
-  return [e for e in out if e.get("kind") == "doing" or e.get("id") not in seen]
+  return [e for e in out if e.get("id") not in seen]
 
 
-def _seen(path: Path) -> set[str]:
+def _seen(text: str) -> set[str]:
   seen: set[str] = set()
-  if path.is_file():
-    for line in path.read_text(errors="replace").splitlines()[-2000:]:
-      try:
-        entry = json.loads(line)
-      except ValueError:
-        continue
-      if entry.get("id"):
-        seen.add(entry["id"])
+  for line in text.splitlines()[-2000:]:
+    try:
+      entry = json.loads(line)
+    except ValueError:
+      continue
+    if isinstance(entry, dict) and entry.get("id"):
+      seen.add(entry["id"])
   return seen
+
+
+def estop_engaged(ahc_dir: Path) -> bool:
+  """The folder's emergency stop, read as estop-guard.sh and the server read it: no file is no stop, a
+  JSON object whose "engaged" is false is a release, anything else counts as pressed."""
+  try:
+    data = json.loads((ahc_dir / "estop.json").read_bytes())
+  except FileNotFoundError:
+    return False
+  except Exception:  # noqa: BLE001 - unreadable or not JSON: pressed
+    return True
+  return not (isinstance(data, dict) and data.get("engaged") is False)
+
+
+def _lock(f) -> None:
+  """Hold the feed while this call reads what it holds and appends; give up after 2 s rather than hold
+  the agent up (a duplicate line is the worst that can happen then)."""
+  try:
+    import fcntl
+  except ImportError:
+    return
+  deadline = time.time() + 2
+  while True:
+    try:
+      fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+      return
+    except OSError:
+      if time.time() > deadline:
+        return
+      time.sleep(0.01)
+
+
+def task_folder(data: dict) -> Path:
+  """The task folder, as the server and the shell hooks resolve it: AHC_WORKSPACE (a relative one from
+  the project folder), else the project folder Claude Code started in."""
+  project = Path(os.environ.get("CLAUDE_PROJECT_DIR") or data.get("cwd") or os.getcwd())
+  chosen = os.environ.get("AHC_WORKSPACE")
+  if not chosen:
+    return project
+  folder = Path(chosen).expanduser()
+  return folder if folder.is_absolute() else project / folder
 
 
 def main() -> None:
@@ -133,17 +186,21 @@ def main() -> None:
     data = json.loads(sys.stdin.read() or "{}")
   except ValueError:
     return
-  project = Path(os.environ.get("CLAUDE_PROJECT_DIR") or data.get("cwd") or os.getcwd())
-  ahc_dir = project / ".ahc"
+  ahc_dir = task_folder(data) / ".ahc"
   feed = ahc_dir / "agent-feed.jsonl"
   tool = data.get("tool_name") or ""
+  if ahc_dir.resolve() == Path(os.environ.get("AHC_HOME") or "~/.ahc").expanduser().resolve():
+    return  # AHC's own data folder (AHC_HOME), not a task's: a session in the home folder is no AHC task
   if not ahc_dir.is_dir() and not tool.startswith(AHC_TOOL):
     return  # not an AHC task (yet): nothing to watch
-  entries = new_entries(event, data, _seen(feed))
+  stopped = event == "pre" and estop_engaged(ahc_dir)
   ahc_dir.mkdir(exist_ok=True)  # the first AHC call: the dashboard can show the agent from here on
-  with feed.open("a") as f:
-    for e in entries:
-      f.write(json.dumps(e, ensure_ascii=False) + "\n")
+  with open(feed, "a+b") as f:
+    _lock(f)
+    f.seek(0, os.SEEK_END)
+    f.seek(max(0, f.tell() - FEED_TAIL_BYTES))
+    entries = new_entries(event, data, _seen(f.read().decode("utf-8", errors="replace")), stopped)
+    f.write("".join(json.dumps(e, ensure_ascii=False) + "\n" for e in entries).encode("utf-8"))
 
 
 if __name__ == "__main__":

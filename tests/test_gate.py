@@ -88,7 +88,7 @@ async def test_on_real_hardware_the_person_opens_the_gate(starlet, monkeypatch):
   first = await deck_check(starlet)
   assert first["verdict"] == "pending" and first["gate"]["state"] == "pending"
   failed = await starlet.call("record_verdict", check_id=first["check_id"], verdict="fail")
-  assert failed["gate"]["state"] == "failed"
+  assert failed["gate"]["state"] == "failed" and "corrected layout" in failed["next"]
   assert await starlet.refused("pick_up_tips", device=DEV) == "gate_failed"
   second = await deck_check(starlet)
   # The first check was already answered; only the newest deck check can open the gate.
@@ -96,13 +96,20 @@ async def test_on_real_hardware_the_person_opens_the_gate(starlet, monkeypatch):
   tips = await starlet.call("verify", check="tips_mounted", device=DEV, expect="none")
   await starlet.call("record_verdict", check_id=tips["check_id"], verdict="pass")  # not the deck check
   assert (await starlet.call("get_state"))["gate"]["state"] == "pending"
+  # While the person's deck check waits, every pointer names that one check, and verify returns it again.
+  again = await deck_check(starlet)
+  assert again["check_id"] == second["check_id"] and again["verdict"] == "pending" and "repeat" in again
+  assert f"record_verdict(check_id='{second['check_id']}')" in await starlet.call_text("pick_up_tips", device=DEV)
+  assert f"Deck check {second['check_id']} waits for the person" in (await starlet.call("lab_overview"))["next"]
+  await starlet.call("load_layout", layout=STARLET_LAYOUT)  # reloading starts a new gate
   third = await deck_check(starlet)
-  stale = await starlet.call("record_verdict", check_id=second["check_id"], verdict="pass")
-  assert "gate" not in stale  # an older, unanswered deck check cannot open the gate
-  assert await starlet.refused("pick_up_tips", device=DEV) == "gate_pending"
+  assert await starlet.refused("record_verdict", check_id=second["check_id"], verdict="pass") == "check_superseded"
+  assert await starlet.refused("pick_up_tips", device=DEV) == "gate_pending"  # a stale verdict opened nothing
   opened = await starlet.call("record_verdict", check_id=third["check_id"], verdict="pass")
-  assert opened["gate"]["state"] == "passed"
+  assert opened["gate"]["state"] == "passed" and opened["next"] == "Liquid handling is open; describe_device(component) for limits."
   await starlet.call("pick_up_tips", device=DEV)
+  refused = [e["error"] for e in starlet.server.lab.runlog.entries if e.get("op") == "record_verdict"]
+  assert refused == ["unknown_check_id", "check_superseded"]  # refused verdicts are in the run log too
 
 
 async def test_gate_changes_are_in_the_run_log(starlet):
@@ -118,6 +125,22 @@ async def test_gate_refusals_are_logged(starlet):
   await starlet.call("load_layout", layout=STARLET_LAYOUT)
   await starlet.refused("pick_up_tips", device=DEV)
   assert (await starlet.call("get_run"))["refused"] == {"gate_pending": 1}
+
+
+async def test_every_refusal_is_in_the_run_log_once(starlet):
+  give_reference(starlet)
+  await starlet.call("load_layout", layout=STARLET_LAYOUT)
+  await deck_check(starlet)
+  refusals = [("pick_up_tips", dict(device="starlet.nope"), "unknown_component"),
+              ("pick_up_tips", dict(device="starlet.head96"), "not_supported"),
+              ("aspirate", dict(device=DEV, targets=["diluent"], volumes=50), "no_tips"),
+              ("verify", dict(check="nope"), "unknown_check"),
+              ("verify", dict(check="liquid_present", targets=["nowhere"]), "unknown_target"),
+              ("record_verdict", dict(check_id="nope", verdict="pass"), "unknown_check_id")]
+  for tool, args, code in refusals:
+    assert await starlet.refused(tool, **args) == code
+  logged = [(e["op"], e["error"]) for e in starlet.server.lab.runlog.entries if e.get("status") == "refused"]
+  assert logged == [(tool, code) for tool, _, code in refusals]
 
 
 async def test_a_live_view_wrapping_the_device_does_not_fail_the_deck_check(starlet):
@@ -164,6 +187,39 @@ async def test_a_rejected_layout_is_no_reference(starlet):
   corrected = await starlet.call("load_layout", layout=other_layout())
   assert corrected["needs_person"]  # the person confirms the corrected layout too
   assert (await deck_check(starlet))["verdict"] == "pending"
+
+
+@pytest.mark.parametrize("earlier", ["no gate yet", "a passed gate"])
+async def test_a_load_that_fails_after_the_device_loaded_keeps_everything_closed(starlet, monkeypatch, earlier):
+  give_reference(starlet)
+  if earlier == "a passed gate":
+    await starlet.call("load_layout", layout=STARLET_LAYOUT)
+    assert (await deck_check(starlet))["gate"]["state"] == "passed"
+
+  def disk_full(*args, **kwargs):
+    raise OSError("No space left on device")
+
+  monkeypatch.setattr(starlet.server.lab.ws, "save_layout", disk_full)  # fails once the device holds the new deck
+  assert await starlet.refused("load_layout", layout=other_layout()) == "device_refused"
+  for tool, args in ACTIONS:  # a deck nobody checked: nothing moves
+    assert await starlet.refused(tool, **args) == "gate_pending", tool
+  monkeypatch.undo()
+  assert (await deck_check(starlet))["gate"]["state"] == "passed"
+  await starlet.call("pick_up_tips", device=DEV)
+
+
+async def test_a_gate_belongs_to_the_layout_the_device_holds(starlet):
+  give_reference(starlet)
+  await starlet.call("load_layout", layout=STARLET_LAYOUT)
+  await deck_check(starlet)
+  lab = starlet.server.lab
+  gate, layout = lab.gate, lab.adapter.layout
+  lab.gate = None  # a loaded layout without a gate counts as not checked
+  assert "never started" in await starlet.call_text("pick_up_tips", device=DEV)
+  lab.gate, lab.adapter.layout = gate, copy.copy(layout)  # a gate of another layout than the device holds
+  assert "another layout" in await starlet.call_text("pick_up_tips", device=DEV)
+  lab.adapter.layout = layout
+  await starlet.call("pick_up_tips", device=DEV)
 
 
 async def test_the_emergency_stop_keeps_a_layout_waiting_for_the_person(starlet):

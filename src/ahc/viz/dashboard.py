@@ -4,45 +4,100 @@ It reads only the run log the MCP server writes, so it works the same whether a 
 is driving. Concentrations are the digital twin's estimate (liquid named by a `stock` alias is 1,
 everything else 0, complete mixing assumed); volumes match the server's trackers.
 
-    ahc-dashboard                       # in a task folder: follows the newest log in .ahc/runs
+    ahc-dashboard                       # in a task folder: follows the newest active log in .ahc/runs
     ahc-dashboard --workspace <folder>
     ahc-dashboard --log <folder>/.ahc/runs/X.jsonl
+
+Its stop button stops the server of the task folder the page names (in its title and stop bar); it
+answers only to its own page (Host and Origin checked, never framed).
 """
 
 from __future__ import annotations
 
 import argparse
+import functools
+import hmac
+import html
 import http.server
 import json
+import os
 import re
+import secrets
+import sys
 import threading
+import time
+import urllib.request
 import webbrowser
 from collections import Counter
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
+from ahc.core.errors import LabError
 from ahc.devices.spec import LIQUID_HANDLING_OPS
 from ahc.plan import PlanProgress
 from ahc.workspace import estop
 from ahc.workspace.store import Workspace, resolve_workspace
 
 ROWS = "ABCDEFGH"
+QUIET = {"run", "estop", "audit"}  # what any server on the folder logs for a stop, busy or idle
 
 
 def latest_log(runs_dir: Path) -> Path | None:
-  logs = sorted(runs_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime)
-  return logs[-1] if logs else None
+  """The log of the run going on: the newest with device or agent activity (a call, a report, a check, a
+  layout), not merely the newest file. Every server open on the folder logs a stop, and an idle one's
+  log must not take the page over while the person decides whether the deck is safe."""
+  logs = []
+  for p in runs_dir.glob("*.jsonl"):
+    try:
+      st = p.stat()
+    except OSError:  # removed meanwhile
+      continue
+    logs.append((st.st_mtime_ns, st.st_size, p))
+  logs.sort(reverse=True)
+  for mtime, size, p in logs:
+    if _active(str(p), mtime, size):
+      return p
+  return logs[0][2] if logs else None
 
 
-def _expand(target: str) -> list[str]:
-  """`plate:A1:H1` -> plate:A1 .. plate:H1 (column by column); `trough` -> trough."""
+@functools.lru_cache(maxsize=256)
+def _active(path: str, _mtime: int, _size: int) -> bool:
+  try:
+    with open(path, encoding="utf-8", errors="replace") as f:
+      for line in f:
+        try:
+          e = json.loads(line)
+        except ValueError:
+          continue
+        if isinstance(e, dict) and ("op" in e or e.get("type") not in QUIET):
+          return True
+  except OSError:
+    pass
+  return False
+
+
+def _expand(target: str, geometry: dict[str, Any] | None = None) -> list[str]:
+  """`plate:A1:H1` -> plate:A1 .. plate:H1 (column by column); `plate:col2` -> plate:A2 .. plate:H2;
+  `plate:rowB` -> plate:B1 .. plate:B12 (the plate's size from `geometry`); `trough` -> trough. A form
+  this cannot read stays as it is: the page never fails on a target."""
   name, _, wells = target.partition(":")
   if not wells:
     return [name]
-  first, _, last = wells.partition(":")
-  last = last or first
-  rows = ROWS[ROWS.index(first[0]): ROWS.index(last[0]) + 1]
-  return [f"{name}:{r}{c}" for c in range(int(first[1:]), int(last[1:]) + 1) for r in rows]
+  shape = (geometry or {}).get(name) or {}
+  rows = ROWS[: shape.get("rows") or len(ROWS)]
+  column = re.fullmatch(r"col(\d+)", wells, re.IGNORECASE)
+  if column:
+    return [f"{name}:{r}{int(column.group(1))}" for r in rows]
+  row = re.fullmatch(r"row([a-z])", wells, re.IGNORECASE)
+  if row:
+    return [f"{name}:{row.group(1).upper()}{c}" for c in range(1, (shape.get("cols") or 12) + 1)]
+  try:
+    first, _, last = wells.partition(":")
+    last = last or first
+    rows = ROWS[ROWS.index(first[0].upper()): ROWS.index(last[0].upper()) + 1]
+    return [f"{name}:{r}{c}" for c in range(int(first[1:]), int(last[1:]) + 1) for r in rows]
+  except (ValueError, IndexError):
+    return [target]
 
 
 class _Names:
@@ -86,6 +141,7 @@ def replay(path: Path | None, stock: list[str] | None = None, ahc_dir: Path | No
   vol: dict[str, float] = {}  # uL per container, keyed labware or labware:A1
   amt: dict[str, float] = {}  # of which stock, in uL
   used_tips: set[str] = set()
+  returned_tips: set[str] = set()  # back in their spots after use: never fresh again (next fresh skips them)
   last_pick: dict[str, list[str]] = {}
   tips_in_hand: dict[tuple[str, int], tuple[float, float]] = {}  # (device, channel) -> (uL, stock uL)
   events: list[dict[str, Any]] = []
@@ -94,6 +150,7 @@ def replay(path: Path | None, stock: list[str] | None = None, ahc_dir: Path | No
   gate: dict[str, Any] | None = None
   layout_info: dict[str, Any] | None = None
   stopped: dict[str, Any] | None = None  # the engaged emergency stop, as the server logged it
+  waiting: dict[str, dict[str, Any]] = {}  # the person's checks still without a verdict, by check id
 
   for i, e in enumerate(entries[1:], 1):
     progress.apply(e)
@@ -101,10 +158,18 @@ def replay(path: Path | None, stock: list[str] | None = None, ahc_dir: Path | No
       decisions.append({k: e[k] for k in ("t", "decision", "why", "current_step", "waiting_for", "plan_done") if k in e})
       continue
     if e.get("type") == "verification":
+      if e.get("verdict") == "pending":  # the person's verdict, on real hardware or for a layout without a reference
+        waiting[e.get("check_id")] = {"check_id": e.get("check_id"), "check": e.get("check"), "t": e.get("t"),
+                                      "what": _check_text(e, names)}
+      else:
+        waiting.pop(e.get("check_id"), None)
       events.append({"i": i, "t": e.get("t"), "op": "verify", "status": e.get("verdict"),
                      "detail": f"{e.get('check')} → {e.get('verdict')} ({e.get('judged_by')})"})
       continue
     if e.get("type") == "gate":
+      # A gate waits for its own deck check: an earlier one (before a reload, or a released stop) opens nothing.
+      for check_id in [k for k, c in waiting.items() if c["check"] == "deck_matches_layout" and k != e.get("check_id")]:
+        del waiting[check_id]
       gate = {"state": e.get("state"), "layout": e.get("layout"), "reason": e.get("reason"), "t": e.get("t"),
               "needs_person": bool(e.get("needs_person"))}
       if layout_info is not None and e.get("layout") == layout_info.get("name") and e.get("state") == "passed":
@@ -127,14 +192,15 @@ def replay(path: Path | None, stock: list[str] | None = None, ahc_dir: Path | No
       continue
     op, ok, eff = e["op"], e.get("status") == "ok", e.get("effective") or {}
     if ok and op == "load_layout":
+      waiting.clear()  # a new layout: what was checked before no longer describes the deck
       layout_info = {"name": eff.get("saved_as"), "kind": eff.get("kind"), "labware": eff.get("labware", {}),
                      "layout": (e.get("basic") or {}).get("layout"), "t": e.get("t"),
                      "needs_person": bool(eff.get("needs_person"))}
       geometry, aliases = eff.get("geometry", {}), eff.get("aliases", {})
       names = _Names(geometry)
-      vol, amt, used_tips, last_pick, tips_in_hand = {}, {}, set(), {}, {}
+      vol, amt, used_tips, returned_tips, last_pick, tips_in_hand = {}, {}, set(), set(), {}, {}
       stock_keys = {k for alias, target in aliases.items() if "stock" in alias or alias in (stock or [])
-                    for k in _expand(target)}
+                    for k in _expand(target, geometry)}
       stock_keys |= {n for n in geometry if "stock" in n or n in (stock or [])}
       for name, v in eff.get("liquids_ul", {}).items():
         key = names(name)
@@ -153,7 +219,7 @@ def replay(path: Path | None, stock: list[str] | None = None, ahc_dir: Path | No
           give = ta * v / tv if tv > 1e-9 else 0.0
           vol[c], amt[c] = vol.get(c, 0.0) + v, amt.get(c, 0.0) + give
           tips_in_hand[hand] = (max(tv - v, 0.0), ta - give)
-    elif e.get("status") == "refused" and e.get("partial"):
+    elif e.get("status") == "refused" and isinstance(e.get("partial"), dict):
       # Refused half-way: liquid that left containers is in the tips, one container per channel in order
       # (a shared container is split over the channels); liquid that arrived came out of them.
       dev = e.get("device")
@@ -175,11 +241,12 @@ def replay(path: Path | None, stock: list[str] | None = None, ahc_dir: Path | No
     elif ok and op == "pick_up_tips":
       spots = [names(s) for s in eff.get("tips", [])]
       used_tips.update(spots)
+      returned_tips.difference_update(spots)  # picked up again (named explicitly): in hand now
       last_pick[e.get("device", "")] = spots
     elif ok and op == "drop_tips":
       tips_in_hand = {k: v for k, v in tips_in_hand.items() if k[0] != e.get("device")}
-      if eff.get("mode") == "return":
-        used_tips.difference_update(last_pick.pop(e.get("device", ""), []))
+      if eff.get("mode") == "return":  # used tips, back in their spots: shown as returned, never as fresh
+        returned_tips.update(last_pick.pop(e.get("device", ""), []))
 
     basic = e.get("basic") or {}
     if op in ("aspirate", "dispense"):
@@ -195,6 +262,8 @@ def replay(path: Path | None, stock: list[str] | None = None, ahc_dir: Path | No
       detail = ", ".join(f"{k}={v}" for k, v in basic.items() if v is not None)
     events.append({"i": i, "t": e.get("t"), "op": op, "device": e.get("device"),
                    "status": e.get("status"), "error": e.get("error"), "message": e.get("message"),
+                   # a real robot's call cut short or failed after it was sent: the twin cannot tell what happened
+                   "unknown": e.get("partial") == "unknown",
                    "translated": bool(e.get("translated")), "note": e.get("note"),
                    "specialized": sorted((e.get("specialized") or {}).keys()),
                    "commands": e.get("commands"), "detail": detail})
@@ -212,7 +281,7 @@ def replay(path: Path | None, stock: list[str] | None = None, ahc_dir: Path | No
   for alias, target in aliases.items():
     g = geometry.get(target.partition(":")[0], {})
     if g.get("kind") == "plate" and target.partition(":")[0] != main_plate:
-      wells = _expand(target)
+      wells = _expand(target, geometry)
       v = sum(vol.get(w, 0.0) for w in wells)
       containers.append({"name": target, "alias": alias, "v": round(v, 3), "max": g["well_max_ul"] * len(wells),
                          "c": sum(amt.get(w, 0.0) for w in wells) / v if v > 1e-9 else 0.0})
@@ -226,7 +295,8 @@ def replay(path: Path | None, stock: list[str] | None = None, ahc_dir: Path | No
                          "max": g["max_ul"], "c": conc(name)})
     elif g["kind"] == "tip_rack":
       used = sorted(s.partition(":")[2] for s in used_tips if s.startswith(name + ":"))
-      racks.append({"name": name, "rows": g["rows"], "cols": g["cols"], "used": used})
+      returned = sorted(s.partition(":")[2] for s in returned_tips if s.startswith(name + ":"))
+      racks.append({"name": name, "rows": g["rows"], "cols": g["cols"], "used": used, "returned": returned})
 
   calls = [ev for ev in events if ev["op"] in LIQUID_HANDLING_OPS]
   ok_calls = [ev for ev in calls if ev["status"] == "ok"]
@@ -243,13 +313,32 @@ def replay(path: Path | None, stock: list[str] | None = None, ahc_dir: Path | No
           "workspace": header.get("workspace") or str(ahc_dir.parent), "summary": summary, "plates": plates,
           "containers": containers, "tip_racks": racks, "events": events[-200:], "gate": gate,
           "layout": layout_info, "estop": stopped,
-          "agent": agent_view(decisions, progress, gate, ahc_dir / "agent-feed.jsonl"),
+          "agent": agent_view(decisions, progress, gate, ahc_dir / "agent-feed.jsonl", list(waiting.values())),
           "config": workspace_config(ahc_dir / "config.yaml")}
 
 
-def current_state(ws: Workspace, log: Path | None) -> dict[str, Any] | None:
-  """What /state serves: the followed run log, else the agent alone once it has started, else nothing."""
-  path = log or latest_log(ws.runs_dir)
+def _check_text(entry: dict[str, Any], names: Callable[[str], str]) -> str:
+  """What a person check asks, in words, from its run-log entry."""
+  twin = ((entry.get("evidence") or {}).get("digital_twin")) or {}
+  check = entry.get("check")
+  if check == "deck_matches_layout":
+    return "the deck matches the loaded layout"
+  if check == "tips_mounted" and "pipettes" in twin:  # the check of every pipette at once
+    return f"every pipette is empty ({', '.join(twin['pipettes'])})"
+  if check == "tips_mounted":
+    return "no tips are left on the pipette" if twin.get("expect") == "none" else "the tips are on the pipette, seated straight"
+  if check == "liquid_present":
+    wells = [names(str(n)) for n in (twin.get("volumes_ul") or {})]
+    where = ", ".join(wells[:3]) + (f" and {len(wells) - 3} more" if len(wells) > 3 else "")
+    least = twin.get("min_volume_ul")
+    return f"liquid in {where or 'the targets'}" + (f", at least {least:g} uL each" if isinstance(least, (int, float)) and least else "")
+  return str(check)
+
+
+def current_state(ws: Workspace, log: Path | Callable[[], Path | None] | None) -> dict[str, Any] | None:
+  """What /state serves: the pinned run log (given as a function: once it exists), else the folder's
+  newest active log; without one the agent alone once it has started, else nothing."""
+  path = log() if callable(log) else (log or latest_log(ws.runs_dir))
   if path is not None and path.is_file():
     return replay(path)
   if (ws.dir / "agent-feed.jsonl").is_file():
@@ -258,30 +347,33 @@ def current_state(ws: Workspace, log: Path | None) -> dict[str, Any] | None:
 
 
 def agent_view(decisions: list[dict[str, Any]], progress: PlanProgress, gate: dict[str, Any] | None,
-               feed_path: Path) -> dict[str, Any]:
+               feed_path: Path, checks: list[dict[str, Any]] | None = None) -> dict[str, Any]:
   """The agent, live: its decisions and plan (any client: report_decision, and the plan step every call
-  names) and, in Claude Code, what it was asked, what it says, what it is calling and when its turn
-  ended (from the plugin's hooks). `state`: waiting (for the person), finished (the plan is done),
+  names) and, in Claude Code, what it was asked, what it says, what it is calling (or tried while the
+  emergency stop refused it) and when its turn ended (from the plugin's hooks). `checks`: the person's
+  checks still waiting for a verdict. `state`: waiting (for the person), finished (the plan is done),
   working, ended (the turn ended before the plan was done) or idle."""
   feed = [e for e in _read(feed_path) if isinstance(e, dict)] if feed_path.is_file() else []
-  if feed:
-    session = feed[-1].get("session")
+  if feed:  # the session that made the newest AHC call; another session in the folder does not take over
+    ahc_calls = [e for e in feed if e.get("ahc") and e.get("kind") in ("doing", "denied")]
+    session = (ahc_calls[-1] if ahc_calls else feed[-1]).get("session")
     feed = [e for e in feed if e.get("session") == session]
   said = [e for e in feed if e.get("kind") in ("said", "finished")]
   stream = sorted([{"kind": e["kind"], "t": e.get("t"), "text": e.get("text")} for e in said + [
                      e for e in feed if e.get("kind") == "request"]]
                   + [{"kind": "decision", "t": d.get("t"), "text": d.get("decision"), "why": d.get("why"),
                       "waiting_for": d.get("waiting_for")} for d in decisions], key=lambda e: e.get("t") or "")
-  doing = [e for e in feed if e.get("kind") == "doing"]
+  doing = [e for e in feed if e.get("kind") in ("doing", "denied")]
   last_doing = doing[-1] if doing else None
   now = next((e for e in reversed(stream) if e["kind"] != "request"), None)
   finished = bool(now and now["kind"] == "finished" and (not last_doing or (last_doing.get("t") or "") <= (now.get("t") or "")))
   requests = [e for e in stream if e["kind"] == "request"]
   plan = progress.public() or {}
   layout_waits = bool(gate and gate.get("needs_person") and gate.get("state") == "pending")
+  checks = checks or []
   last = decisions[-1] if decisions else None
   asked = bool(last and last.get("waiting_for") and not (last_doing and (last_doing.get("t") or "") > (last.get("t") or "")))
-  if layout_waits or asked:
+  if layout_waits or checks or asked:
     state = "waiting"
   elif plan.get("done"):
     state = "finished"
@@ -293,8 +385,9 @@ def agent_view(decisions: list[dict[str, Any]], progress: PlanProgress, gate: di
     state = "idle"
   return {"current": last, "plan": plan.get("steps"), "steps": plan.get("status"), "current_step": plan.get("current_step"),
           "plan_at": plan.get("at"), "plan_done": bool(plan.get("done")), "state": state, "layout_waits": layout_waits,
-          "history": decisions[-8:], "request": requests[-1] if requests else None, "now": now,
-          "doing": {k: last_doing.get(k) for k in ("t", "tool", "brief", "ahc")} if last_doing else None,
+          "checks_waiting": checks, "history": decisions[-8:], "request": requests[-1] if requests else None, "now": now,
+          "doing": {**{k: last_doing.get(k) for k in ("t", "tool", "brief", "ahc")},
+                    "denied": last_doing.get("kind") == "denied"} if last_doing else None,
           "finished": finished, "live": bool(feed), "stream": stream[-14:]}
 
 
@@ -317,7 +410,8 @@ def workspace_config(path: Path) -> dict[str, Any] | None:
 
 PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>AHC live run</title>
+<meta name="ahc-token" content="__AHC_TOKEN__">
+<title>AHC · __AHC_FOLDER__</title>
 <style>
 :root{color-scheme:light;--page:#f9f9f7;--surface:#fcfcfb;--ink:#0b0b0b;--ink2:#52514e;--muted:#898781;
 --grid:#e1e0d9;--axis:#c3c2b7;--border:rgba(11,11,11,.10);--blank:#c3c2b7;--good:#0ca30c;--warning:#fab219;
@@ -362,13 +456,14 @@ font-variant-numeric:tabular-nums;font-size:12px;min-width:150px;text-align:righ
 .st.refused::before{content:"✕ ";color:var(--critical)}.st.pass::before{content:"✓ ";color:var(--good)}
 .st.fail::before{content:"✕ ";color:var(--critical)}.st.pending::before{content:"◷ ";color:var(--warning)}
 .st.passed::before{content:"✓ ";color:var(--good)}.st.failed::before{content:"✕ ";color:var(--critical)}
-.st.audit::before{content:"⚠ ";color:var(--warning)}
+.st.audit::before{content:"⚠ ";color:var(--warning)}.st.superseded{color:var(--muted)}.st.superseded::before{content:"↷ "}
 code{font:12px ui-monospace,SFMono-Regular,Menlo,monospace}.dev{color:var(--muted);font-size:12px}
 .det{color:var(--ink2);font-size:12px;margin-top:2px}.msg{color:var(--ink2);font-size:12px;margin-top:3px}
 .tag{display:inline-block;font-size:11px;padding:0 6px;border-radius:8px;background:var(--chip);color:var(--ink2);margin-left:6px}
 .tag.tr::before{content:"↻ ";color:var(--warning)}
 .racks{display:flex;gap:18px;flex-wrap:wrap}.racks svg circle.free{fill:var(--axis)}
 .racks svg circle.used{fill:none;stroke:var(--axis);stroke-width:1}
+.racks svg circle.returned{fill:none;stroke:var(--ink2);stroke-width:1;stroke-dasharray:1.2 1}
 #tip{position:fixed;pointer-events:none;background:var(--surface);border:1px solid var(--border);border-radius:8px;
 padding:6px 9px;font-size:12px;box-shadow:0 2px 8px rgba(0,0,0,.12);display:none}#tip b{font-size:14px}
 button{font:inherit;font-size:12px;background:var(--chip);color:var(--ink2);border:1px solid var(--border);
@@ -386,6 +481,9 @@ background:var(--critical);color:#fff;border:2px solid var(--critical);cursor:po
 .stopbar.engaged .stopbtn{display:none}
 .releasebtn{float:none;font-size:13px;padding:6px 12px;border-radius:8px;background:#fff;color:var(--critical);
 border:2px solid #fff;cursor:pointer;display:none}.stopbar.engaged .releasebtn{display:inline-block}
+.stopbar .folder{margin-left:auto;color:var(--ink2);font-size:12px;overflow-wrap:anywhere}.stopbar.engaged .folder{color:#fff}
+.stopbar .note{flex-basis:100%;font-weight:700;color:var(--critical)}.stopbar .note:empty{display:none}
+.stopbar.engaged .note{color:#fff;text-decoration:underline}
 .st.stop::before{content:"■ ";color:var(--critical)}.st.released::before{content:"✓ ";color:var(--good)}
 .agent{grid-column:1/-1}.agent .label{color:var(--ink2);font-size:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 .agent .decision{font-size:20px;font-weight:600;margin:6px 0 2px}.agent .why{color:var(--ink2)}
@@ -401,7 +499,7 @@ border:2px solid #fff;cursor:pointer;display:none}.stopbar.engaged .releasebtn{d
 .badge.wait::before{content:"◷ ";color:var(--warning)}.badge.working::before{content:"● ";color:var(--good)}
 .badge.done::before{content:"✓ ";color:var(--good)}.badge.ended::before{content:"■ ";color:var(--muted)}
 .agent .request{margin-top:6px;color:var(--ink2);font-size:13px}.agent .request .k,.agent .calling .k{color:var(--muted)}
-.agent .calling{margin-top:6px;font-size:13px}
+.agent .calling{margin-top:6px;font-size:13px}.agent .calling.denied .k{color:var(--critical);font-weight:600}
 .agent .more{white-space:pre-line;color:var(--ink2);font-size:13px;line-height:1.5;max-height:12em;overflow:auto;margin-top:2px}
 .status{grid-column:1/-1;display:flex;flex-wrap:wrap;gap:8px}
 .status .chip2{display:flex;gap:6px;align-items:baseline;background:var(--surface);border:1px solid var(--border);
@@ -413,9 +511,11 @@ border-radius:8px;padding:6px 10px;font-size:12px;max-width:100%;overflow:hidden
 h3{font-size:12px;font-weight:600;color:var(--ink2);margin:12px 0 4px}
 #configcard td,#configcard th{text-align:left}
 </style></head><body>
-<div class="stopbar" id="stopbar"><button class="stopbtn" id="stopbtn" title="Stops every command of this task at once">EMERGENCY STOP</button>
-<span class="state" id="stopstate">Stops the hardware commands at once; only a person releases it.</span>
-<button class="releasebtn" id="releasebtn">Release…</button></div>
+<div class="stopbar" id="stopbar"><button class="stopbtn" id="stopbtn" title="Stops every command of this task folder's server at once">EMERGENCY STOP</button>
+<span class="state" id="stopstate">Stops the hardware commands of this task folder at once; only a person releases it.</span>
+<button class="releasebtn" id="releasebtn">Release…</button>
+<span class="folder" title="The task folder this button stops">Task folder <code>__AHC_FOLDER__</code></span>
+<span class="note" id="stopnote"></span></div>
 <header><h1>AHC · live run</h1><span class="sub" id="sub">waiting for a run log…</span>
 <span class="live"><span class="dot" id="dot"></span><span id="livetext">connecting</span></span></header>
 <main>
@@ -424,7 +524,7 @@ h3{font-size:12px;font-weight:600;color:var(--ink2);margin:12px 0 4px}
 <section class="kpis" id="kpis"></section>
 <div class="col"><section class="card" id="platecard"><div class="empty">No layout loaded yet.</div></section>
 <section class="card"><h2>Reservoirs</h2><div id="containers"></div></section>
-<section class="card"><h2>Tips <span class="sub">· hollow = used</span></h2><div class="racks" id="racks"></div></section>
+<section class="card"><h2>Tips <span class="sub">· hollow = used, dashed = returned after use</span></h2><div class="racks" id="racks"></div></section>
 <section class="card" id="configcard"></section></div>
 <div class="col"><section class="card"><h2>Hardware calls <span class="sub">· newest first</span></h2><ul id="timeline"></ul></section></div>
 </main><div id="tip"></div>
@@ -495,27 +595,28 @@ function reservoirs(cs){const box=document.getElementById("containers");box.repl
     r.append(n,m,el("span",{class:"num"},`${fmt(c.v)} / ${fmt(c.max)} uL${c.c>0?" · conc "+frac(c.c):""}`));box.append(r)})}
 
 function racks(rs){const box=document.getElementById("racks");box.replaceChildren();
-  rs.forEach(r=>{const used=new Set(r.used),d=8,W=r.cols*d+4,H=r.rows*d+4;const w=el("div");
-    w.append(el("div",{class:"dev"},`${r.name} · ${r.rows*r.cols-used.size} / ${r.rows*r.cols} left`));
+  rs.forEach(r=>{const used=new Set(r.used),back=new Set(r.returned||[]),d=8,W=r.cols*d+4,H=r.rows*d+4;const w=el("div");
+    w.append(el("div",{class:"dev"},`${r.name} · ${r.rows*r.cols-used.size} / ${r.rows*r.cols} left`+(back.size?` · ${back.size} returned`:"")));
     const s=sv("svg",{width:W*1.5,height:H*1.5,viewBox:`0 0 ${W} ${H}`});
     for(let c=1;c<=r.cols;c++)"ABCDEFGH".slice(0,r.rows).split("").forEach((row,ri)=>{
-      s.append(sv("circle",{cx:2+(c-1)*d+d/2,cy:2+ri*d+d/2,r:2.6,class:used.has(row+c)?"used":"free"}))});
+      s.append(sv("circle",{cx:2+(c-1)*d+d/2,cy:2+ri*d+d/2,r:2.6,class:back.has(row+c)?"returned":used.has(row+c)?"used":"free"}))});
     w.append(s);box.append(w)})}
 
 function timeline(evs){const ul=document.getElementById("timeline");ul.replaceChildren();
   [...evs].reverse().forEach((e,k)=>{const li=el("li",{class:(e.status==="refused"?"refused ":"")+(k===0?"newest":"")});
-    const st=["ok","refused","pass","fail","pending","passed","failed","audit","stop","released"].includes(e.status)?e.status:"ok";
+    const st=["ok","refused","pass","fail","pending","passed","failed","audit","stop","released","superseded"].includes(e.status)?e.status:"ok";
     const top=el("div");top.append(el("span",{class:`st ${st}`},st),el("code",{},e.op));if(e.device)top.append(el("span",{class:"dev"},"  "+e.device));
     if(e.translated)top.append(el("span",{class:"tag tr"},"translated"));
     if(e.specialized&&e.specialized.length)top.append(el("span",{class:"tag"},"specialized: "+e.specialized.join(", ")));
-    if(e.commands)top.append(el("span",{class:"tag"},`${e.commands} cmds`));li.append(top);
+    if(e.commands)top.append(el("span",{class:"tag"},`${e.commands} cmds`));
+    if(e.unknown)top.append(el("span",{class:"tag"},"outcome on the robot unknown: check tips and wells"));li.append(top);
     if(e.detail)li.append(el("div",{class:"det"},e.detail));
     if(e.status==="refused"&&e.message)li.append(el("div",{class:"msg"},e.message.replace(/^Error executing tool \w+: /,"")));
     else if(e.note)li.append(el("div",{class:"msg"},e.note));ul.append(li)})}
 
 function agentPanel(a){const box=document.getElementById("agent");box.replaceChildren();
   const head=el("div",{class:"label"});head.append(el("span",{},"Agent"));box.append(head);
-  const nothing=!a||(!a.now&&!a.current&&!a.request&&!a.doing);
+  const nothing=!a||(!a.now&&!a.current&&!a.request&&!a.doing&&!(a.checks_waiting||[]).length);
   if(nothing){box.append(el("div",{class:"why"},"Nothing from the agent yet. In Claude Code the plugin shows what it is asked, says and calls as it happens; any agent can report decisions with report_decision."));return}
   const badge={working:["working","working"],waiting:["wait","waiting for you"],finished:["done","finished"],ended:["ended","turn ended"],idle:["","idle"]}[a.state]||["","idle"];
   head.append(el("span",{class:"badge "+badge[0]},badge[1]));
@@ -526,10 +627,15 @@ function agentPanel(a){const box=document.getElementById("agent");box.replaceChi
     if(lines.length>1)box.append(el("div",{class:"more"},lines.slice(1).join("\n")));
     if(now.why)box.append(el("div",{class:"why"},"Why: "+now.why));
     if(now.waiting_for)box.append(el("span",{class:"badge wait"},"waiting for the "+now.waiting_for))}
-  if(a.doing&&!a.finished&&a.state!=="finished"){const c=el("div",{class:"calling"});c.append(el("span",{class:"k"},"Calling "),el("code",{},a.doing.tool),
+  if(a.doing&&!a.finished&&a.state!=="finished"){const c=el("div",{class:"calling"+(a.doing.denied?" denied":"")});
+    c.append(el("span",{class:"k"},a.doing.denied?"Refused by the emergency stop ":"Calling "),el("code",{},a.doing.tool),
     el("span",{class:"dev"},a.doing.brief?"  "+a.doing.brief:""),el("span",{class:"dev"},"  "+(a.doing.t||"").slice(11)));box.append(c)}
-  if(a.layout_waits){const b=el("div",{class:"banner"});b.append(el("span",{},"The agent proposes a layout this folder has no reference for. Check its labware, positions and liquids in "),
+  if(a.layout_waits){const b=el("div",{class:"banner"});b.append(el("span",{},"The agent proposes a layout no reference in this folder matches. Check its labware, positions and liquids in "),
     el("a",{href:"#layoutsec"},"Configuration › Layout"),el("span",{},", then tell the agent to go on, or what to change. Nothing moves until you do."));box.append(b)}
+  // Every check that waits for the person's verdict (on real hardware all of them), from the run log.
+  (a.checks_waiting||[]).filter(c=>!(a.layout_waits&&c.check==="deck_matches_layout")).forEach(c=>{const b=el("div",{class:"banner"});
+    b.append(el("span",{},`Waiting for your check: ${c.what} (${c.check}, asked ${(c.t||"").slice(11)}). Look, then answer where you were asked (the agent, or the ahc-smoke terminal)`
+      +(c.check==="deck_matches_layout"?"; nothing moves until you do.":".")));box.append(b)})
   if(a.plan&&a.plan.length){const ol=el("ol",{class:"plan"}),n=a.plan.length,st=a.steps||[];
     // Each call names its step: a step is ticked once the agent moves on, and the plan ends when it reports it done.
     const where=a.plan_done?"finished":a.current_step?`step ${a.current_step} of ${n}`:`${n} steps, not started`;
@@ -555,6 +661,7 @@ function statusRow(st){const box=document.getElementById("status");box.replaceCh
   const g=st.gate;
   if(st.estop)box.append(chip("Motion gate","blocked · emergency stop",`pressed ${(st.estop.at||"").replace("T"," ")} (${st.estop.by})`,"gate-failed"));
   else if(g&&g.needs_person&&g.state==="pending")box.append(chip("Motion gate","pending · waiting for you to confirm the layout",g.reason,"gate-pending"));
+  else if(g&&g.state==="pending"&&((st.agent||{}).checks_waiting||[]).some(c=>c.check==="deck_matches_layout"))box.append(chip("Motion gate","pending · waiting for your deck check",g.reason,"gate-pending"));
   else box.append(chip("Motion gate",g?g.state:"no layout",g?g.reason:"",g?"gate-"+g.state:""));
   const now=(st.events||[]).at(-1);box.append(chip("Last hardware event",now?`${now.op} ${now.detail||""}`.trim():"none yet",now?now.t:""))}
 
@@ -581,15 +688,36 @@ function configCard(st){const card=document.getElementById("configcard");card.re
   const wrap=el("div",{class:"tablewrap"});wrap.append(tb);card.append(wrap);
   const liq=(L.layout||{}).liquids;if(liq&&Object.keys(liq).length)card.append(el("div",{class:"legend"},"Starting liquids: "+Object.entries(liq).map(([k,v])=>`${k} ${fmt(v)} uL`).join(", ")))}
 
-async function control(path,body){return fetch(path,{method:"POST",headers:{"X-AHC-Control":"1","Content-Type":"application/json"},body:JSON.stringify(body||{})})}
+const TOKEN=document.querySelector('meta[name="ahc-token"]').content;
+const ELSEWHERE="Use the robot's own stop or its power switch, or ahc-estop in the task folder.";
+// A press that did not arrive is said at once and stays until a stop shows engaged; never silent.
+function note(text){const n=document.getElementById("stopnote");n.textContent=text;clearTimeout(note.t);
+  if(text&&!text.startsWith("STOP NOT SENT"))note.t=setTimeout(()=>{n.textContent=""},20000)}
+async function control(path,body){const stop=path==="/estop";
+  const headers={"X-AHC-Control":"1","Content-Type":"application/json"};if(!stop)headers["X-AHC-Token"]=TOKEN;
+  let r;try{r=await fetch(path,{method:"POST",headers,body:JSON.stringify(body||{})})}
+  catch(err){note(stop?"STOP NOT SENT: the dashboard did not answer. "+ELSEWHERE:"Release not sent: the dashboard did not answer.");return false}
+  if(r.ok){note("");return true}
+  let why="";try{why=(await r.json()).error||""}catch(err){}
+  note(stop?`STOP NOT SENT (${r.status} ${why}). `+ELSEWHERE:`Not released (${r.status}): ${why}`);return false}
 document.getElementById("stopbtn").onclick=async()=>{await control("/estop",{reason:"pressed on the dashboard"});pollStop()};
 document.getElementById("releasebtn").onclick=async()=>{
   if(!confirm("Release the emergency stop?\n\nOnly when the deck is safe. The agent must check the deck again before anything moves."))return;
   await control("/estop/release",{confirm:true});pollStop()};
-async function pollStop(){try{const r=await fetch("/estop",{cache:"no-store"});const e=await r.json();
-  const bar=document.getElementById("stopbar"),state=document.getElementById("stopstate");
-  if(e.engaged){bar.className="stopbar engaged";state.textContent=`■ EMERGENCY STOP ENGAGED · ${(e.at||"").replace("T"," ")} · ${e.by} · nothing runs until a person releases it`}
-  else{bar.className="stopbar";state.textContent=e.released_at?`Released ${(e.released_at||"").replace("T"," ")} by ${e.released_by}; the deck must be checked again before anything moves.`:"Stops the hardware commands at once; only a person releases it."}}catch(err){}
+const HALT={halted:"the device's run is stopped",not_halted:"the device reported nothing running, or it has no device-level stop",
+  failed:"the device's stop FAILED: the robot may still be executing its last command; the power switch is the immediate stop"};
+async function pollStop(){const bar=document.getElementById("stopbar"),state=document.getElementById("stopstate");
+  try{const r=await fetch("/estop",{cache:"no-store"});const e=await r.json();
+  if(e.engaged){const a=e.acknowledged;bar.className="stopbar engaged";
+    let text=`■ EMERGENCY STOP ENGAGED · pressed ${(e.at||"").replace("T"," ")} (${e.by})`;
+    if(e.unreadable)text+=` · the stop file is not one AHC wrote (${e.unreadable}), so it counts as pressed`;
+    // Acknowledged: the server's run log holds this stop (its id). Until then, say so plainly.
+    text+=a?` · the AHC server${a.server||""} took it at ${(a.at||"").slice(11)}; ${a.halt?HALT[a.halt]:"no device stop reported (yet)"}`
+      :` · NOT acknowledged by any AHC server yet (${e.pressed_s??"?"} s): if the robot is moving, stop it with its own controls or the power switch`;
+    state.textContent=text+" · nothing runs until a person releases it";
+    if(document.getElementById("stopnote").textContent.startsWith("STOP NOT SENT"))note("")}
+  else{bar.className="stopbar";state.textContent=e.released_at?`Released ${(e.released_at||"").replace("T"," ")} by ${e.released_by}; the deck must be checked again before anything moves.`:"Stops the hardware commands of this task folder at once; only a person releases it."}}
+  catch(err){state.textContent="The dashboard does not answer: this button cannot stop anything now. "+ELSEWHERE}
   clearTimeout(pollStop.t);pollStop.t=setTimeout(pollStop,500)}
 pollStop();
 
@@ -612,81 +740,202 @@ let resizeTimer;addEventListener("resize",()=>{clearTimeout(resizeTimer);resizeT
 </script></body></html>"""
 
 
-def serve(runs_dir: Path, log: Path | None, port: int, open_browser: bool) -> http.server.ThreadingHTTPServer:
-  ws = Workspace((log.parent if log else runs_dir).parent.parent)  # <task>/.ahc/runs -> <task>
-  own_origins = {f"http://127.0.0.1:{port}", f"http://localhost:{port}"}
+def stop_status(ws: Workspace) -> dict[str, Any]:
+  """What the stop bar shows: the folder's stop as every reader sees it (estop.read), and for an engaged
+  stop whether an AHC server acknowledged it in a run log, with what the device reported."""
+  record = estop.read(ws)
+  out: dict[str, Any] = {**(record or {"engaged": False}), "folder": str(ws.root)}
+  if record and record.get("engaged"):
+    ack = estop.acknowledgement(ws, record)
+    out["acknowledged"] = {**ack, "server": estop.server_text(ack)} if ack else None
+    try:
+      out["pressed_s"] = max(0, round(time.time() - estop.path(ws).stat().st_mtime))
+    except OSError:
+      out["pressed_s"] = None
+  return out
+
+
+def serve(ws: Workspace, log: Path | Callable[[], Path | None] | None, port: int,
+          open_browser: bool) -> http.server.ThreadingHTTPServer:
+  """The dashboard of one task folder on 127.0.0.1:<port> (0: a free port; the one bound is
+  httpd.server_address[1]). Its stop button writes that folder's estop.json. `log` pins a run log, or a
+  function that gives one once it exists; without it the page follows the folder's newest active log."""
+  token = secrets.token_hex(16)  # per process: the release comes from this page, not a stray request
+  hosts: set[str] = set()
+  own_origins: set[str] = set()
 
   class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *args):  # keep the terminal for the demo narration
       pass
 
-    def _json(self, status: int, data: Any) -> None:
-      body = json.dumps(data).encode()
+    def _send(self, status: int, body: bytes = b"", ctype: str | None = None) -> None:
       self.send_response(status)
-      self.send_header("Content-Type", "application/json")
+      if ctype:
+        self.send_header("Content-Type", ctype)
       self.send_header("Cache-Control", "no-store")
+      self.send_header("X-Frame-Options", "DENY")  # never inside another page: no clicks steered onto the buttons
+      self.send_header("Content-Security-Policy", "frame-ancestors 'none'")
+      self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+      if status != 204:
+        self.send_header("Content-Length", str(len(body)))
       self.end_headers()
       self.wfile.write(body)
+
+    def _json(self, status: int, data: Any) -> None:
+      self._send(status, json.dumps(data).encode(), "application/json")
+
+    def _ours(self) -> bool:
+      """Asked for by our own name and port (no DNS rebinding), and from our own page or no page at all."""
+      origin = self.headers.get("Origin")
+      return self.headers.get("Host") in hosts and (origin is None or origin in own_origins)
 
     def do_POST(self):  # noqa: N802 - the emergency stop and its release
       # Only this page's own fetch: a custom header and our origin. Another site cannot set the
       # header without a preflight, which this server never answers.
-      origin = self.headers.get("Origin")
-      if self.headers.get("X-AHC-Control") != "1" or (origin is not None and origin not in own_origins):
+      if not self._ours() or self.headers.get("X-AHC-Control") != "1":
         return self._json(403, {"error": "forbidden"})
       length = int(self.headers.get("Content-Length") or 0)
       try:
         payload = json.loads(self.rfile.read(length) or b"{}")
       except ValueError:
         payload = {}
+      if not isinstance(payload, dict):
+        payload = {}
       if self.path == "/estop":
-        return self._json(200, estop.engage(ws, by="dashboard", reason=str(payload.get("reason") or "")))
+        try:
+          return self._json(200, {**estop.engage(ws, by="dashboard", reason=str(payload.get("reason") or "")),
+                                  "folder": str(ws.root)})
+        except OSError as exc:
+          return self._json(500, {"error": f"could not write the stop: {exc}"})
       if self.path == "/estop/release":
+        # Only from this page: its origin and its token. Any local process could forge both, but
+        # not by accident, and a release is the person's (estop.py).
+        if self.headers.get("Origin") not in own_origins or \
+            not hmac.compare_digest(self.headers.get("X-AHC-Token") or "", token):
+          return self._json(403, {"error": "release on the dashboard page, or with ahc-estop --release at a terminal"})
         if payload.get("confirm") is not True:
           return self._json(400, {"error": "confirm the release"})
-        return self._json(200, estop.release(ws, by="dashboard") or {"engaged": False})
+        try:
+          released = estop.release(ws, by="dashboard")
+        except OSError as exc:
+          return self._json(500, {"error": f"could not write the release: {exc}"})
+        if released is None:
+          return self._json(409, {"error": "no emergency stop is engaged: nothing to release", **stop_status(ws)})
+        return self._json(200, released)
       return self._json(404, {"error": "not found"})
 
     def do_GET(self):  # noqa: N802
-      if self.path.startswith("/estop"):
-        return self._json(200, estop.read(ws) or {"engaged": False})
-      if self.path.startswith("/state"):
+      if not self._ours():
+        return self._json(403, {"error": "forbidden"})
+      route = self.path.split("?", 1)[0]
+      if route == "/whoami":
+        return self._json(200, {"app": "ahc-dashboard", "folder": str(ws.root), "pid": os.getpid()})
+      if route == "/estop":
+        return self._json(200, stop_status(ws))
+      if route == "/state":
         state = current_state(ws, log)
         if state is None:
-          self.send_response(204)
-          self.end_headers()
-          return
-        body = json.dumps(state).encode()
-        ctype = "application/json"
-      elif self.path in ("/", "/index.html"):
-        body, ctype = PAGE.encode(), "text/html; charset=utf-8"
-      else:
-        self.send_response(404)
-        self.end_headers()
-        return
-      self.send_response(200)
-      self.send_header("Content-Type", ctype)
-      self.send_header("Cache-Control", "no-store")
-      self.end_headers()
-      self.wfile.write(body)
+          return self._send(204)
+        return self._json(200, state)
+      if route in ("/", "/index.html"):
+        page = PAGE.replace("__AHC_FOLDER__", html.escape(str(ws.root))).replace("__AHC_TOKEN__", token)
+        return self._send(200, page.encode(), "text/html; charset=utf-8")
+      return self._send(404)
 
   httpd = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
+  bound = httpd.server_address[1]
+  hosts.update({f"127.0.0.1:{bound}", f"localhost:{bound}"})
+  own_origins.update({f"http://127.0.0.1:{bound}", f"http://localhost:{bound}"})
   threading.Thread(target=httpd.serve_forever, daemon=True).start()
   if open_browser:
-    webbrowser.open(f"http://127.0.0.1:{port}/")
+    webbrowser.open(f"http://127.0.0.1:{bound}/")
   return httpd
+
+
+def whoami(port: int, timeout: float = 1.0) -> dict[str, Any] | None:
+  """What serves 127.0.0.1:<port>: an AHC dashboard answers with its task folder; None for anything else."""
+  try:
+    with urllib.request.urlopen(f"http://127.0.0.1:{port}/whoami", timeout=timeout) as response:
+      data = json.load(response)
+  except (OSError, ValueError):
+    return None
+  return data if isinstance(data, dict) and data.get("app") == "ahc-dashboard" else None
+
+
+def open_dashboard(ws: Workspace, log: Path | Callable[[], Path | None] | None, port: int,
+                   open_browser: bool, reuse: bool = True) -> tuple[http.server.ThreadingHTTPServer | None, str]:
+  """For ahc-smoke, ahc-demo and ahc-dashboard: this folder's dashboard, never another folder's. A
+  dashboard for this folder already on `port` follows the run too (unless `reuse` is off); anything
+  else there is left alone, and the next free port serves this folder. Returns the server started
+  (None when one was already there) and a line for the person."""
+  try:
+    httpd = serve(ws, log, port, open_browser)
+    return httpd, f"http://127.0.0.1:{httpd.server_address[1]}/"
+  except OSError:
+    pass
+  other = whoami(port)
+  if reuse and other is not None and _same_folder(other.get("folder"), ws.root):
+    return None, f"http://127.0.0.1:{port}/ (the ahc-dashboard already running for this folder)"
+  taken = (f"port {port} serves the dashboard of {other.get('folder')}"
+           + ("" if _same_folder(other.get("folder"), ws.root) else "; its stop button does NOT stop this run")
+           if other is not None else f"port {port} is taken by something that is not this folder's dashboard")
+  for candidate in [*range(port + 1, port + 21), 0]:
+    try:
+      httpd = serve(ws, log, candidate, open_browser)
+    except OSError:
+      continue
+    return httpd, f"http://127.0.0.1:{httpd.server_address[1]}/ ({taken})"
+  raise OSError("no free port for the dashboard")
+
+
+def log_folder(log: Path) -> str | None:
+  """The task folder a run log belongs to: the workspace its header names, else <task>/.ahc/runs/X.jsonl."""
+  try:
+    with log.open(encoding="utf-8", errors="replace") as f:
+      header = json.loads(f.readline() or "{}")
+  except (OSError, ValueError):
+    header = {}
+  if isinstance(header, dict) and header.get("type") == "run" and header.get("workspace"):
+    return str(header["workspace"])
+  if log.parent.name == "runs" and log.parent.parent.name == ".ahc":
+    return str(log.parent.parent.parent)
+  return None
+
+
+def _same_folder(a: Any, b: Path) -> bool:
+  try:
+    return a is not None and Path(a).resolve() == Path(b).resolve()
+  except (OSError, TypeError, ValueError):
+    return False
 
 
 def main() -> None:
   parser = argparse.ArgumentParser(description="Live dashboard for AHC run logs.")
   parser.add_argument("--workspace", default=None, help="task folder (default: AHC_WORKSPACE, else the current folder)")
-  parser.add_argument("--log", default=None, help="a specific run log; default follows the newest in the workspace")
+  parser.add_argument("--log", default=None, help="a specific run log; default follows the newest active one in the workspace")
   parser.add_argument("--port", type=int, default=8770)
   parser.add_argument("--no-browser", action="store_true")
   args = parser.parse_args()
-  runs = Workspace(resolve_workspace(args.workspace)).runs_dir
-  serve(runs, Path(args.log) if args.log else None, args.port, not args.no_browser)
-  print(f"dashboard on http://127.0.0.1:{args.port}/ for {runs}  (Ctrl-C to stop)")
+  log = Path(args.log).expanduser().resolve() if args.log else None
+  folder = args.workspace or (log_folder(log) if log else None)
+  if log is not None and folder is None:
+    sys.exit(f"ahc-dashboard: {log} is not in a task folder's .ahc/runs and names no workspace: pass --workspace, "
+             "the folder whose server the stop button stops.")
+  ws = Workspace(resolve_workspace(folder))
+  try:
+    ws.require_task_folder()  # AHC's own data folder: no server works there, so its stop button would stop nothing
+  except LabError as exc:
+    sys.exit(f"ahc-dashboard: {exc.message} {exc.hint}")
+  try:  # a port held by another folder's dashboard is never taken for this one's
+    httpd, where = open_dashboard(ws, log, args.port, not args.no_browser, reuse=log is None)
+  except OSError as exc:
+    sys.exit(f"ahc-dashboard: {exc}")
+  if httpd is None:
+    if not args.no_browser:
+      webbrowser.open(f"http://127.0.0.1:{args.port}/")
+    print(f"ahc-dashboard: {where}")
+    return
+  print(f"dashboard on {where} for {ws.root}; its stop button stops this folder's server  (Ctrl-C to stop)")
   try:
     threading.Event().wait()
   except KeyboardInterrupt:

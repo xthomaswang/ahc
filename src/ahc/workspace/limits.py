@@ -83,8 +83,10 @@ def apply_limits(spec: DeviceSpec, limits: dict[str, Any]) -> DeviceSpec:
           raise _refuse("config_invalid", f"{where}: {address} has no limit named {pname!r}.",
                         f"Basic limits: {', '.join(basic)}; specialized: <op>.<name>.")
         basic[pname] = tighten_param(base, bound, where)
-    # Parameters that move liquid through the tip (a native mix, a pre-wet) stay within a tightened
-    # volume cap. Leaving them out still means "none", so they are capped, not marked as needing a value.
+    # Specialized parameters that follow a basic limit (a native mix's volume and cycles, a pre-wet's
+    # volume) stay within that limit once the task tightens it. They are capped, not marked as needing a
+    # value: left out, a native mix does not run, and a pre-wet takes its liquid class's own volume (0 to
+    # 10 uL on the STAR), which this cap does not check.
     for op, ps in specialized.items():
       for pname, param in ps.items():
         cap = basic.get(param.follows) if param.follows else None

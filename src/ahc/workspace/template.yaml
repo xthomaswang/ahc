@@ -1,5 +1,5 @@
 # AHC workspace config for this task folder (template, not confirmed).
-# 1. The agent lists the device models from lab_overview and the person chooses one.
+# 1. The agent asks the person: simulation or a real robot, and which model (lab_overview lists them).
 # 2. The agent fills `devices` (and optional stricter `limits`) with configure_devices.
 # 3. The person confirms with confirm_config. Nothing moves until then.
 devices: []

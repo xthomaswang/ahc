@@ -1,12 +1,13 @@
-"""The Claude Code hook that feeds the dashboard live: what was asked, said, called, and when it ended."""
+"""The Claude Code hook that feeds the dashboard live: what was asked, said, called, and when it ended.
+Run as Claude Code runs it: /bin/sh, and the system python3 (hookenv)."""
 
 import json
-import os
 import subprocess
-import sys
 from pathlib import Path
 
-HOOK = Path(__file__).resolve().parents[1] / "hooks" / "agent-feed.sh"
+from hookenv import HAS_SYSTEM_PYTHON, HOOKS, SYSTEM_PYTHON, hook_env
+
+HOOK = HOOKS / "agent-feed.sh"
 AHC = "mcp__plugin_ahc_ahc__"
 
 
@@ -26,10 +27,14 @@ def assistant(uid, blocks):
 
 
 def run(task: Path, event: str, tool: str, tool_input: dict, tx: Path, tmp: Path, **env) -> None:
+  """One hook event as Claude Code sends it. A tool call fires the hook for every tool ('pre') and, for an
+  AHC tool, the AHC tools' own one ('start') too."""
   payload = {"session_id": "s1", "transcript_path": str(tx), "cwd": str(task), "tool_name": tool,
              "tool_input": tool_input, "hook_event_name": "PreToolUse" if event == "pre" else "Stop"}
-  subprocess.run(["sh", str(HOOK), event], input=json.dumps(payload), text=True, check=True,
-                 env={**os.environ, "CLAUDE_PROJECT_DIR": str(task), **env})
+  events = [event] + (["start"] if event == "pre" and tool.startswith(AHC) else [])
+  for e in events:
+    subprocess.run(["/bin/sh", str(HOOK), e], input=json.dumps(payload), text=True, check=True, timeout=30,
+                   env=hook_env(**{"CLAUDE_PROJECT_DIR": str(task), **env}))
 
 
 def feed(task: Path) -> list[dict]:
@@ -66,8 +71,8 @@ def test_the_final_answer_comes_from_the_stop_input(tmp_path):
   (task / ".ahc").mkdir(parents=True)
   tx = transcript(tmp_path / "t.jsonl", [human("u1", "Dilute"), assistant("a1", [{"type": "text", "text": "Mixing now."}])])
   payload = {"session_id": "s1", "transcript_path": str(tx), "last_assistant_message": "All 96 wells hold 100 uL."}
-  subprocess.run(["sh", str(HOOK), "stop"], input=json.dumps(payload), text=True, check=True,
-                 env={**os.environ, "CLAUDE_PROJECT_DIR": str(task)})
+  subprocess.run(["/bin/sh", str(HOOK), "stop"], input=json.dumps(payload), text=True, check=True,
+                 env=hook_env(CLAUDE_PROJECT_DIR=str(task)))
   assert feed(task)[-1] == {**feed(task)[-1], "kind": "finished", "text": "All 96 wells hold 100 uL."}
 
 
@@ -81,6 +86,8 @@ def test_the_first_ahc_call_starts_the_feed(tmp_path):
   run(task, "pre", AHC + "lab_overview", {}, tx, tmp_path)  # before the server writes anything
   assert [(e["kind"], e.get("text") or e.get("tool")) for e in feed(task)] == [
     ("request", "Dilute on the STARlet"), ("said", "Loading the AHC tools."), ("doing", "lab_overview")]
+  run(task, "pre", AHC + "get_state", {}, tx, tmp_path)  # a task now: recorded once, by the hook for every tool
+  assert [e.get("tool") for e in feed(task) if e["kind"] == "doing"] == ["lab_overview", "get_state"]
 
 
 def test_other_folders_and_the_switch_cost_nothing(tmp_path):
@@ -93,3 +100,91 @@ def test_other_folders_and_the_switch_cost_nothing(tmp_path):
   (task / ".ahc").mkdir()
   run(task, "pre", AHC + "lab_overview", {}, tx, tmp_path, AHC_FEED="0")
   assert feed(task) == []
+
+
+def test_outside_a_task_the_hook_never_reads_its_input(tmp_path):
+  """The folder decides before the input is read: a session elsewhere never waits on a large tool result."""
+  task, plain = tmp_path / "task", tmp_path / "plain"
+  (task / ".ahc").mkdir(parents=True)
+  plain.mkdir()
+  for folder, event in ((plain, "pre"), (plain, "post"), (plain, "stop"), (task, "start")):
+    proc = subprocess.Popen(["/bin/sh", str(HOOK), event], stdin=subprocess.PIPE,
+                            env=hook_env(CLAUDE_PROJECT_DIR=str(folder)))
+    try:
+      assert proc.wait(timeout=10) == 0, (folder.name, event)  # the input is never closed: it was not read
+    finally:
+      proc.kill()
+      proc.stdin.close()
+  assert not (plain / ".ahc").exists() and feed(task) == []
+
+
+def test_the_feed_goes_to_the_servers_folder(tmp_path):
+  """AHC_WORKSPACE (as the server reads it) names the task folder, else the project folder."""
+  project = tmp_path / "project"
+  task = project / "tasks" / "dilution"
+  task.mkdir(parents=True)
+  tx = transcript(tmp_path / "t.jsonl", [human("u1", "Dilute in the task folder")])
+  for chosen in (str(task), "tasks/dilution"):
+    run(project, "pre", AHC + "lab_overview", {}, tx, tmp_path, AHC_WORKSPACE=chosen)
+    assert not (project / ".ahc").exists()
+  assert [e["kind"] for e in feed(task)] == ["request", "doing", "doing"]
+
+
+def test_the_home_folder_is_no_task(tmp_path):
+  home = tmp_path / "home"
+  (home / ".ahc" / "sim").mkdir(parents=True)  # AHC's own data folder (~/.ahc holds the simulator base)
+  tx = transcript(tmp_path / "t.jsonl", [human("u1", "Plan my week")])
+  python = SYSTEM_PYTHON if HAS_SYSTEM_PYTHON else "python3"
+  for env in ({"AHC_HOME": str(home / ".ahc")}, {"AHC_HOME": "", "HOME": str(home)}):
+    run(home, "pre", "Bash", {"command": "ls"}, tx, tmp_path, **env)
+    run(home, "pre", AHC + "lab_overview", {}, tx, tmp_path, **env)
+    run(home, "stop", "", {}, tx, tmp_path, **env)
+    payload = {"session_id": "s1", "transcript_path": str(tx), "tool_name": AHC + "lab_overview"}
+    subprocess.run([python, str(HOOK.parent / "agent_feed.py"), "pre"], input=json.dumps(payload),
+                   text=True, check=True, env=hook_env(CLAUDE_PROJECT_DIR=str(home), **env))
+  assert not (home / ".ahc" / "agent-feed.jsonl").exists()
+
+
+def _pre(task: Path, tx: Path, tool: str, call_id: str, event: str = "pre") -> subprocess.Popen:
+  payload = {"session_id": "s1", "transcript_path": str(tx), "cwd": str(task), "tool_name": tool, "tool_input": {},
+             "tool_use_id": call_id, "hook_event_name": "PreToolUse"}
+  proc = subprocess.Popen(["/bin/sh", str(HOOK), event], stdin=subprocess.PIPE, text=True,
+                          env=hook_env(CLAUDE_PROJECT_DIR=str(task)))
+  proc.stdin.write(json.dumps(payload))
+  proc.stdin.close()
+  return proc
+
+
+def test_a_call_the_stop_refuses_shows_as_denied(tmp_path):
+  from ahc.workspace import estop
+  from ahc.workspace.store import Workspace
+
+  task = tmp_path / "task"
+  (task / ".ahc").mkdir(parents=True)
+  tx = transcript(tmp_path / "t.jsonl", [human("u1", "Dilute")])
+  estop.engage(Workspace(task), by="dashboard")
+  assert _pre(task, tx, AHC + "aspirate", "toolu_1").wait(timeout=30) == 0
+  estop.release(Workspace(task), by="person")
+  assert _pre(task, tx, AHC + "verify", "toolu_2").wait(timeout=30) == 0
+  calls = [(e["kind"], e["tool"], e["id"]) for e in feed(task) if e["kind"] != "request"]
+  assert calls == [("denied", "aspirate", "call:toolu_1"), ("doing", "verify", "call:toolu_2")]
+
+
+def test_parallel_calls_write_every_entry_once(tmp_path):
+  tx = transcript(tmp_path / "t.jsonl", [human("u1", "Dilute"), assistant("a1", [{"type": "text", "text": "Two reads at once."}])])
+  for trial in range(5):  # Claude Code runs the hooks of parallel tool calls at the same time
+    task = tmp_path / f"task{trial}"
+    (task / ".ahc").mkdir(parents=True)
+    procs = [_pre(task, tx, AHC + tool, f"toolu_{tool}") for tool in ("lab_overview", "find_layout_references", "get_state")]
+    assert [p.wait(timeout=30) for p in procs] == [0, 0, 0]
+    ids = [e.get("id") for e in feed(task)]
+    assert len(ids) == len(set(ids)) == 5, feed(task)  # the request, the text, three calls
+
+
+def test_the_first_ahc_call_is_recorded_once_whichever_hook_runs_first(tmp_path):
+  task = tmp_path / "task"
+  task.mkdir()
+  tx = transcript(tmp_path / "t.jsonl", [human("u1", "Dilute")])
+  assert _pre(task, tx, AHC + "lab_overview", "toolu_1", "start").wait(timeout=30) == 0  # starts the feed
+  assert _pre(task, tx, AHC + "lab_overview", "toolu_1", "pre").wait(timeout=30) == 0  # then sees the task
+  assert [e["kind"] for e in feed(task)] == ["request", "doing"]

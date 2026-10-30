@@ -5,6 +5,7 @@ import copy
 import pytest
 import yaml
 
+from ahc.core.errors import LabError
 from ahc.examples import STARLET_LAYOUT
 from conftest import load_verified
 
@@ -63,3 +64,61 @@ async def test_references_come_from_this_workspace_only(tmp_path, open_lab):
   assert [l["name"] for l in refs["layouts"]] == ["deck"]
   assert len(refs["run_layouts"]) == 1 and len(refs["run_layouts"][0]["runs"]) == 2
   assert refs["run_layouts"][0]["device"] == "hamilton.starlet"
+
+
+# -- addressing ---------------------------------------------------------------------------------
+
+def ids(items) -> list[str]:
+  return [i.parent.get_child_identifier(i) for i in items]
+
+
+async def test_columns_and_rows_can_be_named(starlet):
+  await load_verified(starlet, layout=STARLET_LAYOUT)
+  layout = starlet.server.lab.adapter.layout
+  assert ids(layout.resolve_targets(["plate:col2"])) == [f"{r}2" for r in "ABCDEFGH"]  # top to bottom
+  assert ids(layout.resolve_targets(["plate:rowB"])) == [f"B{c}" for c in range(1, 13)]  # left to right
+  assert ids(layout.resolve_targets(["plate:COL12"])) == ids(layout.resolve_targets(["plate:A12:H12"]))
+  assert ids(layout.resolve_targets(["plate:Rowh"])) == ids(layout.resolve_targets(["plate:H1:H12"]))
+  assert ids(layout.resolve_tips(["tips:col1"])) == ids(layout.resolve_tips(["tips:A1:H1"]))
+  for bad in ("plate:col0", "plate:col13", "plate:col 2", "plate:rowI", "plate:column2", "plate:A13"):
+    with pytest.raises(LabError) as refused:
+      layout.resolve_targets([bad])
+    assert refused.value.code == "bad_wells" and "'labware:col2'" in refused.value.hint  # every form, listed
+  with pytest.raises(LabError) as refused:
+    layout.resolve_tips(["tips:col13"])
+  assert refused.value.code == "bad_tips" and "tips:col1" in refused.value.hint
+
+
+async def test_results_say_where_the_liquid_went(starlet):
+  layout = copy.deepcopy(STARLET_LAYOUT)
+  layout["aliases"]["buffer"] = "plate:col3"  # an alias may name a column
+  layout["liquids"]["plate:col3"] = 200
+  await load_verified(starlet, layout=layout)
+  picked = await starlet.call("pick_up_tips", device="starlet.pip")
+  assert picked["effective"]["where"] == "tips: column 1 (A1-H1)"
+  drawn = await starlet.call("aspirate", device="starlet.pip", targets=["buffer"], volumes=50)
+  assert drawn["effective"]["where"] == "plate: column 3 (A3-H3)"
+  shared = await starlet.call("dispense", device="starlet.pip", targets=["waste"], volumes=50)
+  assert shared["effective"]["where"] == "waste_trough"  # one container for all eight channels
+  mixed = await starlet.call("mix", device="starlet.pip", targets=["plate:col3"], volume=50, repetitions=2)
+  assert mixed["effective"]["where"] == "plate: column 3 (A3-H3)"
+  logged = [e for e in starlet.server.lab.runlog.entries if e.get("op") == "aspirate"][-1]
+  assert logged["effective"]["where"] == "plate: column 3 (A3-H3)"
+  live = starlet.server.lab.adapter.layout
+  assert live.where(live.resolve_targets(["plate:rowB"])) == "plate: row B (B1-B12)"
+  assert live.where(live.resolve_targets(["plate:A1", "plate:A3", "plate:B2"])) == "plate: A1, A3, B2"
+  assert live.where(live.resolve_targets(["diluent", "plate:A1"])) == "diluent_trough; plate: A1"
+
+
+async def test_returned_tips_are_never_the_next_fresh_ones(starlet):
+  await load_verified(starlet, layout=STARLET_LAYOUT)
+  first = await starlet.call("pick_up_tips", device="starlet.pip")
+  await starlet.call("aspirate", device="starlet.pip", targets=["stock"], volumes=50)
+  await starlet.call("dispense", device="starlet.pip", targets=["waste"], volumes=50)
+  await starlet.call("drop_tips", device="starlet.pip", mode="return")  # back in column 1, wet with stock
+  second = await starlet.call("pick_up_tips", device="starlet.pip")
+  assert first["effective"]["where"] == "tips: column 1 (A1-H1)"
+  assert second["effective"]["where"] == "tips: column 2 (A2-H2)"
+  await starlet.call("drop_tips", device="starlet.pip")
+  again = await starlet.call("pick_up_tips", device="starlet.pip", tips=["tips:col1"])  # named: the agent's choice
+  assert again["effective"]["tips"] == first["effective"]["tips"]

@@ -107,13 +107,17 @@ async def test_the_base_version_is_recorded_without_unconfirming(home, tmp_path,
 
 
 async def test_a_missing_simulator_says_what_to_do(home, tmp_path, open_lab):
-  port = closed_port()
+  port = closed_port()  # named at server level (--port, AHC_OT2_PORT): the server stays on it
   async with open_lab(tmp_path, "sim", "opentrons.ot2", {"port": port}) as lab:
     message = await lab.call_text("load_layout", layout=OT2_LAYOUT)
     assert "[sim_not_installed]" in message and "--setup" in message and "270 MB" in message
+    assert f"stays on port {port}" in message and "without --port and with AHC_OT2_PORT unset" in message
     ot2.setup(fake_checkout(tmp_path / "checkout"), out=lambda _: None)
     message = await lab.call_text("load_layout", layout=OT2_LAYOUT)
     assert "[sim_not_running]" in message and "ot2 --workspace" in message
+    hint = message.partition("Hint:")[2]
+    assert f"Start the simulator that serves port {port} again" in hint and "ot2 --workspace" in hint
+    assert f"stays on port {port}" in hint and "without --port and with AHC_OT2_PORT unset" in hint
 
 
 CHECKOUT = os.environ.get("AHC_TEST_OT2_CHECKOUT")

@@ -5,8 +5,8 @@ wells fill) and the run dashboard (concentration heatmap and every call from the
 script is an MCP client, so the server sees exactly what an agent would send.
 
 Everything goes to the task folder it runs in (or --workspace): .ahc/config.yaml, layouts/, runs/.
-It reports its plan first and names the plan step on every call, as an agent must. In a folder with
-no reference for its example layout, the person confirms the layout: asked on the terminal, or, with
+It reports its plan first and names the plan step on every call, as an agent must. In a folder where
+no reference matches its example layout, the person confirms the layout: asked on the terminal, or, with
 no terminal (a background run), the demo answers for them and says so.
 
     ahc-demo --backend sim                          # STARlet simulation in the current folder
@@ -26,7 +26,7 @@ from typing import Any
 
 from mcp import Client
 
-from ahc.viz.dashboard import serve
+from ahc.viz.dashboard import open_dashboard
 from ahc.examples import OT2_LAYOUT, STARLET_LAYOUT, serial_dilution
 from ahc.server import DEFAULT_SIM_MODEL, create_server
 
@@ -133,9 +133,9 @@ def _brief(tool: str, args: dict[str, Any], out: dict[str, Any] | None) -> str:
 
 
 async def confirm_layout(lab: PacedLab, check: dict[str, Any]) -> dict[str, Any]:
-  """The person confirms a layout this folder has no reference for: asked on the terminal, or, with no
+  """The person confirms a layout no reference in this folder matches: asked on the terminal, or, with no
   terminal to ask, the demo answers for them and says so (simulation only)."""
-  await lab.decide("Wait for the person to confirm the layout", "This folder has no reference for it",
+  await lab.decide("Wait for the person to confirm the layout", "No reference in this folder matches it",
                    waiting_for="person")
   if sys.stdin.isatty():
     answer = await asyncio.to_thread(input, "           Confirm this layout (it is on the dashboard)? Type 'yes' to go on: ")
@@ -176,7 +176,7 @@ async def script(lab: PacedLab, server, args: argparse.Namespace) -> None:
         print("           (no browser yet; carrying on)")
   print(f"           labware {', '.join(loaded['labware'])}; aliases {loaded['aliases']}")
   if loaded.get("needs_person"):
-    print(f"           no reference for it in this folder: the person confirms it, then it is saved as "
+    print(f"           no reference in this folder matches it: the person confirms it, then it is saved as "
           f".ahc/layouts/{loaded['saved_as']}.yaml; motion gate {loaded['gate']['state']}")
   else:
     print(f"           saved as .ahc/layouts/{loaded['saved_as']}.yaml; motion gate {loaded['gate']['state']}")
@@ -237,11 +237,13 @@ async def run(args: argparse.Namespace) -> None:
   if view is not None:
     view.open_browser = not args.no_browser
     view.port = args.view_port
+  lab = server.lab  # the page follows this run's own log once it exists
   try:
-    serve(server.lab.ws.runs_dir, None, args.dashboard_port, not args.no_browser)
-    print(f"dashboard  http://127.0.0.1:{args.dashboard_port}/")
-  except OSError:
-    print(f"dashboard  port {args.dashboard_port} is taken; a running ahc-dashboard follows this run too")
+    _, where = open_dashboard(lab.ws, lambda: lab.runlog.path if lab.runlog else None, args.dashboard_port,
+                              not args.no_browser)
+    print(f"dashboard  {where}")
+  except OSError as exc:
+    print(f"dashboard  not started ({exc}); ahc-dashboard --workspace {lab.ws.root} shows the run")
 
   stopped = None
   async with Client(server) as client:

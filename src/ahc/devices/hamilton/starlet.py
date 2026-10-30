@@ -6,8 +6,10 @@ import re
 from typing import Any
 
 import pylabrobot.resources as plr
+from pylabrobot.hamilton.star.liquid_classes.mapping import get_star_liquid_class
 from pylabrobot.lib.liquid_handling.mix import Mix
 from pylabrobot.resources import Container, TipSpot
+from pylabrobot.resources.liquid import Liquid
 
 from ahc.core.errors import LabError
 from ahc.core.layout import Layout
@@ -47,7 +49,23 @@ _PER_CHANNEL = {
 class STARletAdapter(HamiltonAdapter):
   """A STARlet driven through PyLabRobot 1.0 (simulation only in this prototype)."""
 
+  OPTIONS = {"sim": frozenset()}
+  MIX_FLOW_RATE = 100.0  # uL/s: PyLabRobot's mix needs one, so AHC chooses it when a call gives none
+
+  @classmethod
+  def _refuse_real(cls, backend: str) -> None:
+    # The driver below is always PyLabRobot's simulator: a real backend lands together with its USB branch.
+    if backend != "sim":
+      raise LabError("backend_not_implemented", f"the STARlet's {backend!r} backend is not implemented yet.",
+                     "Use backend 'sim'. A real STARlet needs the USB backend, which this prototype does not have yet.")
+
+  @classmethod
+  def check_options(cls, backend: str, options: dict[str, Any]) -> None:
+    cls._refuse_real(backend)
+    super().check_options(backend, options)
+
   async def start(self) -> None:
+    self._refuse_real(self.backend)
     await super().start()
     self.device = None
 
@@ -65,8 +83,19 @@ class STARletAdapter(HamiltonAdapter):
     deck = plr.STARLetDeck()
     new_layout = self._build_deck(deck, layout)
     await self.stop()
-    self.device = STARlet(deck=deck, simulation=True)
-    await self.device.setup()
+    self.layout = None  # the old deck is gone
+    device = STARlet(deck=deck, simulation=True)
+    self._count_commands(device.driver)
+    try:
+      await device.setup()
+    except Exception:
+      try:  # release what setup opened; the setup error is the one to report
+        await device.stop()
+      except Exception:  # noqa: BLE001
+        pass
+      raise
+    self.device = device  # only a device that set up: a failed load leaves none behind
+    self.outcome_unknown = None
     self.layout = new_layout
     return new_layout
 
@@ -95,6 +124,21 @@ class STARletAdapter(HamiltonAdapter):
     await self._pip(comp).pick_up_tips(spots)
     return None
 
+  def transport_air(self, op: str, comp: Component, tips: list[Any], specialized: dict[str, Any]) -> list[float]:
+    """The transport air each channel draws after this call's liquid: the one given, else its liquid class's,
+    looked up as PyLabRobot does (the tip, water, jet and blow-out)."""
+    given = specialized.get("transport_air_volume_ul")
+    if given is not None:
+      return [float(given)] * len(tips)
+    attribute = "dispense_air_transport_volume" if op == "dispense" else "aspiration_air_transport_volume"
+    out = []
+    for tip in tips:
+      found = get_star_liquid_class(tip_volume=tip.maximal_volume, is_core=False, is_tip=True,
+                                    has_filter=tip.has_filter, liquid=Liquid.WATER,
+                                    jet=bool(specialized.get("jet")), blow_out=bool(specialized.get("blow_out")))
+      out.append(getattr(found, attribute) if found is not None else 0.0)  # no class: PyLabRobot refuses the call
+    return out
+
   def _options(self, n: int, flow_rate, liquid_height, specialized: dict[str, Any]) -> dict[str, Any]:
     kw: dict[str, Any] = {}
     if flow_rate is not None:
@@ -122,9 +166,11 @@ class STARletAdapter(HamiltonAdapter):
                      "Pass both, or neither.")
     note = None
     if mix_volume is not None:
-      kw["post_mixes"] = [Mix(volume=mix_volume, repetitions=mix_reps,
-                              flow_rate=flow_rate or 100.0)] * len(containers)
-      note = f"native post-dispense mix: {mix_reps} x {mix_volume:g} uL in the same firmware command"
+      mix_flow = flow_rate if flow_rate is not None else self.MIX_FLOW_RATE
+      kw["post_mixes"] = [Mix(volume=mix_volume, repetitions=mix_reps, flow_rate=mix_flow)] * len(containers)
+      source = "the dispense's flow rate" if flow_rate is not None else "AHC's mix speed: no flow_rate given"
+      note = (f"native post-dispense mix: {mix_reps} x {mix_volume:g} uL at {mix_flow:g} uL/s ({source}) in the "
+              "same firmware command")
     await _piston_checked(self._pip(comp).dispense(containers, volumes=volumes, **kw))
     return note
 
@@ -135,10 +181,11 @@ class STARletAdapter(HamiltonAdapter):
     # the two directions), leaving liquid in the tips.
     n = len(containers)
     kw = self._options(n, None, liquid_height, {})
-    cycles = Mix(volume=volume, repetitions=repetitions, flow_rate=flow_rate or 100.0)
+    flow = flow_rate if flow_rate is not None else self.MIX_FLOW_RATE
+    cycles = Mix(volume=volume, repetitions=repetitions, flow_rate=flow)
     await _piston_checked(self._pip(comp).aspirate(containers, volumes=[0.0] * n, pre_mixes=[cycles] * n, **kw))
-    return (f"STAR channels have no standalone mix: ran {repetitions} x {volume:g} uL as the pre-mix of a 0 uL "
-            "aspirate, one firmware command; dispense.post_mix_* mixes right after a dispense")
+    return (f"STAR channels have no standalone mix: ran {repetitions} x {volume:g} uL at {flow:g} uL/s as the "
+            "pre-mix of a 0 uL aspirate, one firmware command; dispense.post_mix_* mixes right after a dispense")
 
   async def drop_tips(self, comp: Component, mode: str) -> str | None:
     pip = self._pip(comp)

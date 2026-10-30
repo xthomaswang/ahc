@@ -1,8 +1,10 @@
 [project]
 name = "ahc"
-version = "0.5.0"
+version = "0.6.0"
 description = "Agentic Hardware Control (AHC): agent-agnostic MCP hardware layer for lab robots (prototype: Hamilton STARlet, Opentrons OT-2)"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.12"
 dependencies = [
   "mcp==2.2.0",
@@ -23,7 +25,7 @@ ahc-smoke = "ahc.smoke:main"
 dev = ["pytest>=8", "anyio>=4.5"]
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [tool.hatch.metadata]

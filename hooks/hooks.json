@@ -7,6 +7,10 @@
           {"type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/estop-guard.sh\"", "timeout": 5},
           {"type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/agent-feed.sh\" pre", "timeout": 5}
         ]
+      },
+      {
+        "matcher": "mcp__plugin_ahc_ahc__.*",
+        "hooks": [{"type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/agent-feed.sh\" start", "timeout": 5}]
       }
     ],
     "PostToolUse": [

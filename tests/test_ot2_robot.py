@@ -11,7 +11,7 @@ import pytest
 from ahc.examples import OT2_LAYOUT
 from ahc.workspace import estop
 from ahc.workspace.store import Workspace
-from conftest import OT2_HOST, OT2_PORT, load_verified, robot_server_up
+from conftest import OT2_HOST, OT2_PORT, confirm_as_person, confirm_pipettes_empty, load_verified, robot_server_up
 
 pytestmark = pytest.mark.anyio
 
@@ -32,7 +32,7 @@ async def confirmed_robot(lab, **options):
   """The config for a real OT-2 (here the simulator's address), written by the agent, confirmed by the person."""
   written = await lab.call("configure_devices", devices=robot(host=OT2_HOST, port=OT2_PORT, **options))
   assert written["config"]["status"] == "pending"  # a real backend always waits for the person
-  confirmed = await lab.call("confirm_config")  # the test plays the person
+  confirmed = await confirm_as_person(lab)  # the test plays the person
   assert confirmed["config"]["status"] == "confirmed" and confirmed["config"]["confirmed_by"] == "human"
 
 
@@ -53,9 +53,10 @@ async def test_a_robot_needs_its_address_and_the_person(tmp_path, open_lab):
 
 
 async def test_forced_simulation_still_wins(tmp_path, open_lab):
-  async with open_lab(tmp_path, "sim") as lab:  # the plugin's server
-    await lab.call("configure_devices", devices=robot(host=OT2_HOST, port=OT2_PORT))
-    await lab.call("confirm_config")
+  async with open_lab(tmp_path, backend=None) as lab:  # the person confirms a robot config
+    await confirmed_robot(lab)
+  async with open_lab(tmp_path, "sim") as lab:  # the plugin's server, later, in the same folder
+    await lab.call("lab_overview")
     assert lab.server.lab.adapter.backend == "sim"  # a confirmed robot config still runs in simulation here
 
 
@@ -83,8 +84,13 @@ async def test_a_rehearsal_of_the_real_run(tmp_path, open_lab):
 
 async def test_another_robot_at_that_address_is_refused(tmp_path, open_lab):
   async with open_lab(tmp_path, backend=None) as lab:
-    await confirmed_robot(lab, robot_name="lab-ot2-7")
-    text = await lab.call_text("load_layout", layout=OT2_LAYOUT)
+    written = await lab.client.call_tool("configure_devices",
+                                         {"devices": robot(host=OT2_HOST, port=OT2_PORT, robot_name="lab-ot2-7")})
+    if written.is_error:  # the robot is probed when the config is written
+      text = written.content[0].text
+    else:  # or at the latest when the layout loads, before anything moves
+      await confirm_as_person(lab)
+      text = await lab.call_text("load_layout", layout=OT2_LAYOUT)
   assert "[wrong_robot]" in text and "lab-ot2-7" in text
 
 
@@ -105,6 +111,8 @@ async def test_the_emergency_stop_stops_the_robots_run(tmp_path, open_lab):
     assert check["state"] == "pending"
     overview = await lab.call("lab_overview")
     assert "load_layout again" in overview["next"]
+    assert await lab.refused("load_layout", layout=OT2_LAYOUT) == "tips_unconfirmed"  # the person checks first
+    await confirm_pipettes_empty(lab)
     await load_verified(lab, layout=OT2_LAYOUT)  # a new run: the reload works after a stop
     assert lab.server.lab.adapter.device._run.id != run_id
     await lab.call("pick_up_tips", device=DEV)

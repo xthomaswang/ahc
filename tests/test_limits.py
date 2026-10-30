@@ -4,7 +4,7 @@ import pytest
 import yaml
 
 from ahc.examples import STARLET_LAYOUT
-from conftest import load_verified
+from conftest import confirm_as_person, load_verified
 
 pytestmark = pytest.mark.anyio
 
@@ -79,7 +79,7 @@ async def test_dropping_a_task_limit_waits_for_the_person(tmp_path, open_lab):
     dropped = await lab.call("configure_devices", devices=STARLET_SIM)  # the agent removes the person's limit
     assert dropped["config"]["status"] == "pending" and "confirm_config" in dropped["next"]
     assert await lab.refused("load_layout", layout=STARLET_LAYOUT) == "config_pending"
-    await lab.call("confirm_config")  # the person agrees
+    await confirm_as_person(lab)  # the person agrees
     await load_verified(lab, layout=STARLET_LAYOUT)
 
 
@@ -93,3 +93,16 @@ async def test_a_volume_cap_also_caps_the_native_mix(tmp_path, open_lab):
     assert await lab.refused("dispense", device=DEV, targets=["plate:A1:H1"], volumes=100,
                              specialized={"post_mix_volume_ul": 200, "post_mix_repetitions": 3}) == "out_of_range"
     await lab.call("dispense", device=DEV, targets=["plate:A1:H1"], volumes=100)  # no mix: still fine
+
+
+async def test_a_mix_cycle_cap_also_caps_the_native_mix(tmp_path, open_lab):
+  # Following the description file's advice (prefer the native mix) must not bypass the person's limit.
+  async with open_lab(tmp_path, "sim") as lab:
+    await with_limits(lab, {DEV: {"mix_repetitions": {"max": 3}}})
+    params = await lab.call("get_params", device=DEV, op="dispense")
+    assert params["specialized"]["post_mix_repetitions"]["max"] == 3
+    await lab.call("aspirate", device=DEV, targets=["diluent"], volumes=100)
+    assert await lab.refused("dispense", device=DEV, targets=["plate:A1:H1"], volumes=100,
+                             specialized={"post_mix_volume_ul": 50, "post_mix_repetitions": 20}) == "out_of_range"
+    await lab.call("dispense", device=DEV, targets=["plate:A1:H1"], volumes=100,
+                   specialized={"post_mix_volume_ul": 50, "post_mix_repetitions": 3})

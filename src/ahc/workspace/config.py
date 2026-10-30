@@ -32,6 +32,8 @@ from ahc.devices.spec import known_models, load_device
 
 KEYS = {"devices", "limits", "confirmation", "sim"}
 DEVICE_KEYS = {"id", "model", "backend", "options"}
+# Where a device is: a 'sim' entry never names one, because simulation runs only on this task's own simulator.
+ENDPOINT_OPTIONS = ("host", "port", "robot_name")
 ID = re.compile(r"[a-z][a-z0-9_]{0,31}")
 HEADER = """\
 # AHC workspace config for this task folder.
@@ -42,7 +44,9 @@ HEADER = """\
 
 
 def invalid(message: str, hint: str | None = None) -> LabError:
-  return LabError("config_invalid", message, hint or "Fix .ahc/config.yaml, or rewrite it with configure_devices.")
+  return LabError("config_invalid", message, hint or (
+    "Tell the person what is wrong: they fix .ahc/config.yaml, or you write it again with configure_devices once "
+    "they say what it should hold; that rewrite waits for their confirmation."))
 
 
 @dataclass(frozen=True)
@@ -125,6 +129,11 @@ def parse_devices(raw: Any) -> list[DeviceEntry]:
     options = item.get("options") or {}
     if not isinstance(options, dict):
       raise invalid(f"devices[{i}]: options must be a mapping.")
+    named = [k for k in ENDPOINT_OPTIONS if k in options]
+    if backend == "sim" and named:
+      raise invalid(f"devices[{i}]: a sim entry takes no host, port or robot_name (it names {', '.join(named)}): "
+                    "the simulator is this task's own.",
+                    "Drop those options from the sim entry; a real robot is the 'robot' backend, which the person confirms.")
     out.append(DeviceEntry(dev_id, model, backend, dict(options)))
   ids = [d.id for d in out]
   if len(set(ids)) != len(ids):

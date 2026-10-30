@@ -35,7 +35,9 @@ class Param:
   doc: str = ""
   source: str | None = None
   tightened: bool = False  # a workspace task limit narrowed min/max
-  follows: str | None = None  # liquid moved through the tip: a task limit on this basic limit caps it too
+  # A task limit on this basic limit caps it too: volume_ul for liquid drawn through the tip (a pre-wet,
+  # a native mix), mix_repetitions for a native mix's cycles.
+  follows: str | None = None
 
   def public(self) -> dict[str, Any]:
     out: dict[str, Any] = {"type": self.type}

@@ -49,6 +49,20 @@ def test_the_run_log_replays_to_the_same_progress():
   assert p.statuses() == ["done", "done", "done", "now", "next", "next"] and p.at == "2026-10-02T12:00:00"
 
 
+def test_a_refused_call_starts_its_step_only_once_something_moved():
+  p = PlanProgress()
+  p.report(plan=STEPS)
+  p.apply({"op": "pick_up_tips", "status": "ok", "plan_step": 3})
+  p.apply({"op": "aspirate", "status": "refused", "error": "out_of_range", "plan_step": 4})  # checked, nothing moved
+  assert p.statuses()[2:4] == ["now", "next"]
+  p.apply({"op": "dispense", "status": "refused", "error": "emergency_stop", "plan_step": 4,
+           "partial": {"done": ["plate:A2"]}})  # stopped half-way: the step began
+  assert p.statuses()[2:4] == ["done", "now"]
+  p.apply({"op": "drop_tips", "status": "refused", "error": "emergency_stop", "plan_step": 5, "partial": "unknown"})
+  p.apply({"type": "verification", "check": "volumes_match", "verdict": "fail", "plan_step": 6})  # a check is a step's work
+  assert p.statuses()[3:] == ["done", "done", "now"]
+
+
 # -- through the server ------------------------------------------------------------------------
 
 from pathlib import Path  # noqa: E402
@@ -105,6 +119,23 @@ async def test_steps_tick_from_the_calls_and_the_dashboard_agrees(tmp_path, open
   assert "plan_step" not in refused  # a refused call never started its step
   shown = replay(Path(lab.server.lab.runlog.path))["agent"]
   assert shown["plan"] == DILUTION and shown["steps"] == server["status"] and shown["plan_done"]
+
+
+@pytest.mark.anyio
+async def test_a_call_refused_by_its_checks_leaves_the_step_unstarted(tmp_path, open_lab):
+  async with open_lab(tmp_path, "sim", auto_plan=False) as lab:
+    give_reference(lab)
+    await lab.call("report_decision", decision="Dilute column 2", plan=DILUTION)
+    await lab.call("load_layout", layout=STARLET_LAYOUT, plan_step=1)
+    await lab.call("verify", check="deck_matches_layout", plan_step=2)
+    await lab.call("pick_up_tips", device=DEV, plan_step=3)
+    for tool, args in (("aspirate", {"device": DEV, "targets": ["diluent"], "volumes": 5000}),  # over the limit
+                       ("aspirate", {"device": "starlet.nope", "targets": ["diluent"], "volumes": 100}),
+                       ("verify", {"check": "volumes_match"})):
+      await lab.refused(tool, plan_step=4, **args)
+    assert lab.server.lab.plan.statuses() == ["done", "done", "now", "next", "next", "next"]
+    shown = replay(Path(lab.server.lab.runlog.path))["agent"]
+  assert shown["steps"] == ["done", "done", "now", "next", "next", "next"]
 
 
 @pytest.mark.anyio

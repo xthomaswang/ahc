@@ -23,7 +23,7 @@ async def test_same_protocol_calls_as_the_starlet(ot2, starlet):
   assert run["basic_only"] == run["liquid_handling_calls"] == 80
   assert run["translated"]["calls"] == 0 and run["with_specialized"]["calls"] == 0
   assert run["refused"] == {} and run["layout_kind"] == "slots"
-  assert run["commands_sent"] > 0  # counted by the robot-server, not by this client
+  assert run["commands_sent"] > 0  # counted in this process as the adapter submits them, not asked of the robot
 
 
 async def test_eight_channel_constraints(ot2):

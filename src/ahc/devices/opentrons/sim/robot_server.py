@@ -25,7 +25,7 @@ from typing import Any, Callable
 import yaml
 
 from ahc.core.errors import LabError
-from ahc.workspace.store import Workspace
+from ahc.workspace.store import Workspace, ahc_home, write_atomic
 
 REPO = "https://github.com/Opentrons/opentrons-ot2.git"
 # Validated with AHC on 2026-10-01: the opentrons-ot2 HEAD of 2026-09-17, "feat(robot-server): Make
@@ -40,10 +40,6 @@ HOST = "127.0.0.1"
 
 class SimError(Exception):
   """Something the person or agent must fix before the simulator can run."""
-
-
-def ahc_home() -> Path:
-  return Path(os.environ.get("AHC_HOME") or "~/.ahc").expanduser()
 
 
 def base_dir() -> Path:
@@ -218,7 +214,7 @@ def record_base_version(ws: Workspace, commit: str | None) -> None:
     return  # a broken config is the server's to report, not ours to rewrite
   if config.sim.get("opentrons-ot2") != commit:
     config.sim["opentrons-ot2"] = commit
-    ws.write_config(config.data(), HEADER)
+    ws.write_config(config.data(), HEADER)  # atomic: a server reading it meanwhile never sees half a file
 
 
 def base_versions(ws: Workspace) -> dict[str, str]:
@@ -249,8 +245,9 @@ def prepare_instance(ws: Workspace, base: Base) -> tuple[list[str], dict[str, st
               "opentrons_config": str(d / "opentrons"),
               "base": {"robot_server": str(base.robot_server), "commit": base.commit},
               "started_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
-  settings_path(ws).write_text("# Written by ahc-sim each time this task's OT-2 simulator starts.\n"
-                               + yaml.safe_dump(settings, sort_keys=False))
+  # Atomic: a server reads the simulator's port from here on every call, and must never see half a file.
+  write_atomic(settings_path(ws), "# Written by ahc-sim each time this task's OT-2 simulator starts.\n"
+               + yaml.safe_dump(settings, sort_keys=False))
   record_base_version(ws, base.commit)
   return argv, env, base.robot_server, port
 
@@ -286,6 +283,30 @@ def check_endpoint(ws: Workspace, host: str, port: int) -> None:
   if answer.get("name") != robot_name(ws):
     raise LabError("sim_not_running", f"port {port} answers, but it is another task's simulator ({answer.get('name')}).",
                    f"Start this task's own simulator in a background shell: {start_command(ws)}; then load the layout again.")
+
+
+# What a simulator started by ahc-sim reports in /health; a real OT-2 reports its own name, serial and firmware.
+DEV_FIRMWARE = "Virtual Smoothie"
+DEV_SERIAL = "simulator"
+
+
+def check_dev_simulator(host: str, port: int) -> None:
+  """Before connecting to a port named at server level (tests, ahc-demo): it must be an AHC OT-2 simulator.
+
+  Simulation never drives a robot: the instance must call itself ahc-..., run a virtual Smoothie and
+  report the simulator's serial. Nothing answering is refused too, so a slow robot never slips through.
+  """
+  answer = health(port, host)
+  if answer is None:
+    raise LabError("sim_not_running", f"no OT-2 simulator answers at {host}:{port}.",
+                   "Start one with ahc-sim ot2 in a background shell, or drop the port to use this task's own simulator.")
+  name = answer.get("name")
+  if not (isinstance(name, str) and name.startswith("ahc-") and answer.get("fw_version") == DEV_FIRMWARE
+          and answer.get("robot_serial") == DEV_SERIAL):
+    raise LabError("not_a_simulator",
+                   f"{host}:{port} is not an AHC OT-2 simulator (name {name!r}, firmware {answer.get('fw_version')!r}, "
+                   f"serial {answer.get('robot_serial')!r}): simulation never drives a robot.",
+                   "Give the port of a simulator started with ahc-sim ot2, or drop the port to use this task's own simulator.")
 
 
 def diagnose(ws: Workspace, host: str, port: int, exc: Exception | str) -> LabError:

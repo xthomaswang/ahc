@@ -22,7 +22,7 @@ components:
     limits:
       volume_ul: {min: 0.1, max: 1000, source: "channel drive 0-1250 uL in 0.1 uL steps (simulated frame config); the mounted tip caps it further"}
       flow_rate_ul_s: {min: 0.4, max: 500, source: "pipetting speed range 4-5000 x 0.1 uL/s (simulated frame config)"}
-      liquid_height_mm: {min: 0, max: 40, source: "prototype bound above the cavity bottom; also capped by the container depth"}
+      liquid_height_mm: {min: 0, max: 40, default: 0, doc: "Omitted: the cavity bottom, PyLabRobot's STAR default (liquid-level detection off).", source: "prototype bound above the cavity bottom; also capped by the container depth and, for aspirate and mix, the liquid surface"}
       mix_repetitions: {min: 1, max: 99, source: "mix cycles range 0-99 (simulated frame config)"}
     specialized:
       aspirate:
@@ -39,7 +39,7 @@ components:
         transport_air_volume_ul: {type: number, min: 0, max: 50, doc: "Transport air. Liquid-class value when omitted.", source: "transport air range 0-500 x 0.1 uL"}
         swap_speed_mm_s: {type: number, min: 0.3, max: 160, doc: "Speed of leaving the liquid. Liquid-class value when omitted.", source: "swap speed range 3-1600 x 0.1 mm/s"}
         post_mix_volume_ul: {type: number, min: 1, max: 1000, follows: volume_ul, doc: "Native mix right after this dispense, in the same firmware command. Needs post_mix_repetitions. Prefer it over a separate mix call."}
-        post_mix_repetitions: {type: integer, min: 1, max: 99, doc: "Cycles for the native post-dispense mix. Needs post_mix_volume_ul.", source: "mix cycles range 0-99"}
+        post_mix_repetitions: {type: integer, min: 1, max: 99, follows: mix_repetitions, doc: "Cycles for the native post-dispense mix. Needs post_mix_volume_ul.", source: "mix cycles range 0-99"}
     translations:
       mix: "STAR channels have no standalone mix. A separate mix call runs as one aspirate of 0 uL whose pre-mix does the cycles (one firmware command); post_mix_* on the dispense mixes right after a dispense."
   head96:
@@ -51,8 +51,13 @@ components:
 # Hamilton STARlet
 
 Eight independent channels on one arm. Each channel can take its own volume, and several channels may
-draw from one container (a trough), so `targets: ["diluent"]` with eight tips mounted sends all eight
+draw from one container (a trough), so `targets: ["buffer"]` with eight tips mounted sends all eight
 channels into the trough.
+
+Simulated only: PyLabRobot's firmware-level simulator of a recorded 2021 STARlet. The volume, flow
+rate and mix limits come from that frame's firmware ranges, not from Hamilton's pipetting
+specification: 0.1 uL is the drive's step, not a volume a tip delivers. A real STARlet is planned
+over USB, direct from the Mac, as the optional extra `ahc[usb]`, after the OT-2's bring-up.
 
 ## Layout
 
@@ -63,10 +68,16 @@ site, for example a `TIP_CAR_480_A00` on track 1 holding a tip rack at site 0. P
 ## Liquid handling
 
 - `volumes` are per target; one number is broadcast to every target.
+- `pick_up_tips` takes 1 to 8 tips, one per channel in use (`tips:col1`, `tips:A1:D1`); omitted, the
+  next fresh column.
+- `liquid_height` is in mm above the cavity bottom; omitted, the cavity bottom (PyLabRobot's STAR
+  default, liquid-level detection off), and the result records it. An aspirate or mix whose tips
+  would end above the liquid is refused (`above_liquid`).
 - Liquid classes are looked up from the tip, `jet` and `blow_out`; the other specialized parameters
   override single liquid-class values.
 - Mixing: pass `post_mix_volume_ul` and `post_mix_repetitions` on the dispense to mix right after
-  it. A separate `mix` call runs as a 0 uL aspirate with a pre-mix, also a single command.
+  it. A separate `mix` call runs as a 0 uL aspirate with a pre-mix, also a single command. Either
+  runs at 100 uL/s when the call gives no flow rate, and the result says so.
 - One aspiration feeding several dispenses: each dispense also pushes out the tip's transport air
   and a liquid-class volume correction, so the last one can run out of piston travel (refused as
   `piston_travel`). Aspirate about 10 uL more than the dispenses add up to and dispense the rest to
@@ -74,10 +85,12 @@ site, for example a `TIP_CAR_480_A00` on track 1 holding a tip rack at site 0. P
 
 ## Sensors usable for verification
 
-Tip presence per channel (`invoke` op `sense_tip_presence`). Liquid-level detection and TADM pressure
-curves exist on the device but are not wired in this prototype.
+Tip presence per channel (`invoke` op `sense_tip_presence`; `verify(check="tips_mounted")` reads it
+too). Liquid-level detection and TADM pressure curves exist on the device but are not wired in this
+prototype.
 
 ## Cannot
 
+- Drive a real STARlet: its USB backend (`ahc[usb]`) is not implemented yet.
 - Use the 96-head through this server yet.
 - Move plates (iSWAP and CoRe grippers are not wired in this prototype).

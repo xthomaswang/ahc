@@ -47,13 +47,16 @@ class PlanProgress:
     self.done = False  # a call after plan_done means the agent went on working
 
   def apply(self, entry: dict[str, Any]) -> None:
-    """One run log entry: a report changes the plan, a call names its step."""
+    """One run log entry: a report changes the plan, a call names its step. A call refused before anything
+    moved never starts its step; one refused half-way (a partial, or an outcome nobody knows) has."""
     if entry.get("type") == "agent":
       self.report(entry.get("plan"), entry.get("current_step"), bool(entry.get("plan_done")), entry.get("t"))
       for step in entry.get("visited") or []:  # a plan carried into a new run log keeps its progress
         if isinstance(step, int) and self.steps and 1 <= step <= len(self.steps):
           self.visited.add(step)
     elif isinstance(entry.get("plan_step"), int):
+      if entry.get("status") == "refused" and not entry.get("partial"):
+        return
       self.enter(entry["plan_step"])
 
   def check(self, step: int | None) -> None:

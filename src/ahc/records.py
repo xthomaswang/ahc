@@ -1,8 +1,7 @@
 """The run log: every call with what took effect, plus the departure count the prototype measures.
 
-A departure is anything a serial dilution could not express with basic parameters alone:
-specialized parameters, an operation the adapter had to translate, a refusal, a device-specific
-layout.
+A departure is anything the basic parameters alone could not express: specialized parameters, an
+operation the adapter had to translate, a refusal, a device-specific layout.
 """
 
 from __future__ import annotations
@@ -10,6 +9,7 @@ from __future__ import annotations
 import json
 import platform
 import subprocess
+import sys
 import time
 import uuid
 from collections import Counter
@@ -27,17 +27,52 @@ def _sh(cmd: list[str]) -> str:
     return f"unavailable ({exc})"
 
 
-def environment() -> dict[str, str]:
+def _git(root: Path, *args: str) -> str | None:
+  try:
+    out = subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True, timeout=10)
+  except (OSError, subprocess.SubprocessError):
+    return None
+  return out.stdout.strip() if out.returncode == 0 else None
+
+
+def ahc_checkout() -> dict[str, Any] | None:
+  """The git checkout AHC runs from (the plugin's folder, an editable install): its commit, and whether
+  tracked files differ from it. None when AHC runs from an installed package."""
+  root = Path(__file__).resolve().parents[2]
+  if not (root / ".git").exists():
+    return None
+  commit = _git(root, "rev-parse", "HEAD")
+  if commit is None:
+    return None
+  changes = _git(root, "status", "--porcelain", "--untracked-files=no")
+  return {"path": str(root), "commit": commit, "dirty": None if changes is None else bool(changes)}
+
+
+def resolved_commit(pkg: str) -> str | None:
+  """The commit a package installed from git resolved to (its direct_url.json), e.g. PyLabRobot's pin."""
+  try:
+    info = json.loads(metadata.distribution(pkg).read_text("direct_url.json") or "{}")
+  except (metadata.PackageNotFoundError, ValueError):
+    return None
+  return (info.get("vcs_info") or {}).get("commit_id") if isinstance(info, dict) else None
+
+
+def environment() -> dict[str, Any]:
   def version(pkg: str) -> str:
     try:
       return metadata.version(pkg)
     except metadata.PackageNotFoundError:
       return "not installed"
 
-  return {"python": platform.python_version(), "pylabrobot": version("pylabrobot"),
-          "mcp": version("mcp"), "ahc": version("ahc"),
-          "macos_build": _sh(["sw_vers", "-buildVersion"]),
-          "xcodebuild": " / ".join(_sh(["xcodebuild", "-version"]).splitlines())}
+  out: dict[str, Any] = {"python": platform.python_version(), "pylabrobot": version("pylabrobot"),
+                         "pylabrobot_commit": resolved_commit("pylabrobot"),
+                         "mcp": version("mcp"), "ahc": version("ahc"),
+                         "macos_build": _sh(["sw_vers", "-buildVersion"]),
+                         "xcodebuild": " / ".join(_sh(["xcodebuild", "-version"]).splitlines())}
+  checkout = ahc_checkout()
+  if checkout is not None:
+    out["ahc_checkout"] = checkout
+  return out
 
 
 class RunLog:
@@ -61,9 +96,15 @@ class RunLog:
                  **self.extra, "environment": environment()})
 
   def _write(self, entry: dict[str, Any]) -> None:
-    entry = {"t": time.strftime("%Y-%m-%dT%H:%M:%S"), **entry}
-    with self.path.open("a") as f:
-      f.write(json.dumps(entry, default=str) + "\n")
+    """Append one entry. The folder is made again if someone removed it; if the file still cannot be
+    written (a full disk), the entry goes to stderr, so a log failure never hides what happened."""
+    line = json.dumps({"t": time.strftime("%Y-%m-%dT%H:%M:%S"), **entry}, default=str) + "\n"
+    try:
+      self.runs_dir.mkdir(parents=True, exist_ok=True)
+      with self.path.open("a") as f:
+        f.write(line)
+    except OSError as exc:
+      print(f"ahc: run log {self.path} not writable ({exc}); entry: {line}", end="", file=sys.stderr)
 
   def record(self, entry: dict[str, Any]) -> None:
     if not self.started:

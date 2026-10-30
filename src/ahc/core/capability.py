@@ -7,13 +7,14 @@ file declares them. Each call, refused or not, lands in the run log with what ac
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Awaitable, Callable
 
 from pylabrobot.resources import Container, Plate
 
 from ahc.devices.base import Adapter
 from ahc.devices.spec import Component, DeviceSpec
-from ahc.core.errors import LabError
+from ahc.core.errors import LabError, at_most
 from ahc.records import RunLog
 
 Number = float | int
@@ -81,8 +82,7 @@ class LiquidHandling:
       raise LabError("distinct_wells_required", f"{address} needs a different well for each channel.")
     return containers
 
-  def _volumes(self, comp: Component, address: str, volumes: Number | list[Number], n: int,
-               tips: list[Any]) -> list[float]:
+  def _volumes(self, comp: Component, address: str, volumes: Number | list[Number], n: int) -> list[float]:
     values = [volumes] * n if isinstance(volumes, (int, float)) else list(volumes)
     if len(values) != n:
       raise LabError("volume_count", f"{len(values)} volumes for {n} targets.",
@@ -92,26 +92,92 @@ class LiquidHandling:
       raise LabError("equal_volumes_required",
                      f"{address} moves one volume on every channel; got {sorted(set(values))}.",
                      "Use one volume for all targets, or a component with independent channels.")
-    tip_max = min(t.maximal_volume for t in tips)
-    if max(values) > tip_max:
-      raise LabError("exceeds_tip", f"{max(values):g} uL exceeds the mounted {tip_max:g} uL tips.",
-                     "Split the transfer or mount larger tips.")
     return values
 
+  @staticmethod
+  def _held(tip) -> float | None:
+    return None if tip.tracker.is_disabled else tip.tracker.get_used_volume()
+
+  def _tip_room(self, op: str, address: str, tips: list[Any], volumes: list[float]) -> None:
+    """Aspirate and mix: what the tips already hold plus this draw must fit them. Dispense: no more than
+    they hold. The device model checks again behind this (the STAR adds air and liquid-class volumes)."""
+    for tip, volume in zip(tips, volumes):
+      held = self._held(tip)
+      if op == "dispense":
+        if held is not None and volume > held + 1e-6:
+          raise LabError("insufficient_in_tips", f"{address}'s tips hold {held:g} uL; {volume:g} uL requested.",
+                         "Dispense at most what the tips hold, or aspirate first.")
+        if volume > tip.maximal_volume:
+          raise LabError("exceeds_tip", f"{volume:g} uL exceeds the mounted {tip.maximal_volume:g} uL tips.",
+                         "Split the transfer or mount larger tips.")
+        continue
+      if (held or 0.0) + volume > tip.maximal_volume + 1e-9:
+        already = f" on top of the {held:g} uL they hold" if held else ""
+        raise LabError("exceeds_tip", f"{volume:g} uL{already} exceeds the mounted {tip.maximal_volume:g} uL tips.",
+                       "Dispense first, split the transfer, or mount larger tips.")
+
+  @staticmethod
+  def _per_container(containers: list[Container], volumes: list[float]) -> dict[int, float]:
+    out: dict[int, float] = {}
+    for container, volume in zip(containers, volumes):
+      out[id(container)] = out.get(id(container), 0.0) + volume
+    return out
+
+  def _through_tips(self, op: str, comp: Component, address: str, extra: dict[str, Any],
+                    containers: list[Container], volumes: list[float], tips: list[Any]) -> float:
+    """A specialized volume that follows volume_ul is drawn through the tips from the call's own targets:
+    before an aspirate (pre-wetting), after a dispense (a native post-dispense mix). It must fit the tips
+    then, after a dispense with the transport air the device draws as well (PyLabRobot's own aspirate check
+    counts it; nothing checks a post-dispense mix but this), and find that much liquid, summed per
+    container when channels share one. Returns the largest such volume, 0.0 for none."""
+    params = comp.specialized.get(op, {})
+    named = [(key, value) for key, value in extra.items()
+             if key in params and params[key].follows == "volume_ul" and value]
+    if not named:
+      return 0.0
+    key, draw = max(named, key=lambda kv: kv[1])
+    air = self.adapter.transport_air(op, comp, tips, extra) if op == "dispense" else [0.0] * len(tips)
+    for tip, volume, drawn_air in zip(tips, volumes, air):
+      inside = max((self._held(tip) or 0.0) - (volume if op == "dispense" else 0.0), 0.0)
+      if inside + draw + drawn_air > tip.maximal_volume + 1e-9:
+        with_air = f" and {drawn_air:g} uL of transport air" if drawn_air else ""
+        raise LabError("exceeds_tip",
+                       f"{key} {draw:g} uL with {inside:g} uL in the tips{with_air} exceeds the mounted "
+                       f"{tip.maximal_volume:g} uL tips.",
+                       f"Use at most {at_most(tip.maximal_volume - inside - drawn_air, 2)} uL, or leave it out.")
+    arrived = self._per_container(containers, volumes) if op == "dispense" else {}
+    need = self._per_container(containers, [draw] * len(containers))
+    for container in {id(c): c for c in containers}.values():
+      if container.tracker.is_disabled:
+        continue
+      there = container.tracker.get_used_volume() + arrived.get(id(container), 0.0)
+      if need[id(container)] > there + 1e-9:
+        when = " after this dispense" if op == "dispense" else ""
+        raise LabError("insufficient_liquid",
+                       f"{key} draws {need[id(container)]:g} uL from {container.name}, which holds {there:g} uL{when}.",
+                       f"Use a smaller {key}, or leave it out.")
+    return draw
+
   def _height(self, comp: Component, height: Number | None, containers: list[Container]) -> float | None:
+    param = comp.limits["liquid_height_mm"]
     if height is None:
-      if not comp.limits["liquid_height_mm"].tightened:
+      if param.tightened:
+        height = self._task_default(param, "liquid_height")
+      elif param.default is not None:  # where the tip goes is never left to an unrecorded device default
+        height = param.default
+      else:
         return None
-      height = self._task_default(comp.limits["liquid_height_mm"], "liquid_height")
-    value = comp.limits["liquid_height_mm"].check(height)
+    value = param.check(height)
     depth = min(c.get_size_z() for c in containers)
     if value > depth:
-      raise LabError("exceeds_container", f"liquid_height {value:g} mm is above the {depth:.1f} mm cavity.",
-                     f"Use at most {depth:.1f} mm.")
+      raise LabError("exceeds_container", f"liquid_height {value:g} mm is above the {depth:g} mm cavity.",
+                     f"Use at most {at_most(depth, 1)} mm.")
     return value
 
   def _flow(self, comp: Component, flow_rate: Number | None) -> float | None:
     param = comp.limits["flow_rate_ul_s"]
+    # The description's flow default is documentation only: the device's own default can differ by
+    # direction (the P20 aspirates at 3.78 uL/s and dispenses at 7.56), so an omitted flow stays the device's.
     if flow_rate is None:
       return self._task_default(param, "flow_rate") if param.tightened else None
     return param.check(flow_rate)
@@ -138,6 +204,38 @@ class LiquidHandling:
         raise LabError("overfill",
                        f"{container.name} has room for {tracker.get_free_volume():g} uL; {need[id(container)]:g} uL requested.",
                        "Dispense less or into another container.")
+
+  SURFACE_MARGIN_MM = 0.5  # the twin's volumes and the labware geometry are estimates
+
+  def _surface(self, what: str, height: float | None, containers: list[Container], removed: dict[int, float],
+               added: dict[int, float] | None = None) -> None:
+    """Refuse a liquid height above the surface at the lowest point of a draw: the tips would draw air
+    while the twin records liquid. The level comes from the twin's volume and the labware geometry, both
+    estimates, so the tips stay SURFACE_MARGIN_MM under it. A container PyLabRobot has no level for is
+    not checked rather than guessed."""
+    if height is None:
+      return
+    for container in {id(c): c for c in containers}.values():
+      if container.tracker.is_disabled:
+        continue
+      left = container.tracker.get_used_volume() + (added or {}).get(id(container), 0.0) - removed.get(id(container), 0.0)
+      left = max(left, 0.0)
+      try:
+        level = container.compute_height_from_volume(left)
+      except Exception:  # noqa: BLE001 - no level for this container (or none PyLabRobot can compute)
+        continue
+      highest = max(level - self.SURFACE_MARGIN_MM, 0.0)
+      if height > highest + 1e-9:
+        # Never point at the well floor itself: a tip sent to 0 mm can seal against it or press into it.
+        shown = at_most(highest, 1)  # rounded down: the height suggested passes this check
+        hint = (f"Use at most {shown} mm ({self.SURFACE_MARGIN_MM:g} mm under that surface, which comes from "
+                "the twin's volume, an estimate), or draw less." if float(shown) > 0 else
+                "Draw less, so that liquid stays above the tips: with this much drawn, only the well floor itself "
+                "would be under the surface.")
+        raise LabError("above_liquid",
+                       f"liquid_height {height:g} mm is above the liquid in {container.name}: {left:g} uL is left "
+                       f"there at the lowest point of this {what}, about {level:.1f} mm deep by the labware geometry.",
+                       hint)
 
   # -- execution ------------------------------------------------------------------------------
 
@@ -167,31 +265,117 @@ class LiquidHandling:
     self.runlog.record(record)
     return exc
 
+  async def _count(self) -> int | None:
+    """Commands sent so far, best effort and off the event loop; None when the adapter cannot say."""
+    try:
+      return await asyncio.to_thread(self.adapter.command_count)
+    except Exception:  # noqa: BLE001 - a count never decides or hides an operation
+      return None
+
+  async def _robot_record(self, sent: int | None) -> list[dict[str, Any]] | None:
+    """The robot's own record of this call's commands, read back best effort (off the event loop)."""
+    try:
+      return await asyncio.to_thread(self.adapter.robot_record, sent if sent is not None else 1)
+    except Exception:  # noqa: BLE001 - evidence only
+      return None
+
+  async def _device_error(self, op: str, address: str, entry: dict[str, Any], exc: Exception, sent: int | None,
+                          volumes_before: dict[str, float]) -> LabError:
+    """A non-LabError from the device step. Nothing sent: a refusal. Sent to a simulator: a refusal the twin
+    agrees with. Sent to real hardware (or not countable there): the outcome is unknown, and motion stays
+    refused until the person has checked and the layout is loaded again. The robot's own record of the
+    call's commands goes with it, as evidence for the person; the twin is not changed on it."""
+    what = f"{type(exc).__name__}: {exc}"
+    target = "simulator" if self.adapter.simulated else "robot"
+    if sent == 0:
+      error = LabError("device_refused", what,
+                       f"Nothing was sent to the {target}: the device model refused it first. Change what the "
+                       "message says.")
+      return self._refusal(entry, error, volumes_before)
+    if self.adapter.simulated:
+      error = LabError("device_refused", what,
+                       (f"The simulator stopped it after {sent} command(s)" if sent else "The simulator stopped it")
+                       + "; the digital twin keeps what completed. Check get_state before going on.")
+      return self._refusal(entry, error, volumes_before)
+    self.adapter.mark_outcome_unknown(op, what, entry.get("basic"))
+    record = await self._robot_record(sent)
+    told = ""
+    if record:
+      told = " The robot's own record of its last commands: " + "; ".join(
+        f"{r['command']} {r['status']}" + (f" ({r['error']})" if r.get("error") else "") for r in record) + "."
+    sent_text = f"{sent} command(s)" if sent is not None else "commands"
+    error = LabError("completion_unknown",
+                     f"{op} on {address} failed after {sent_text} went to the robot ({what}). What the robot did "
+                     f"is unknown, and the digital twin cannot tell.{told}",
+                     "Do not retry. Stop and tell the person: they check the tips and wells; nothing moves until "
+                     "load_layout loads the layout again with the volumes they report.")
+    logged = {**entry, "status": "refused", "error": error.code, "message": str(error), "partial": "unknown"}
+    if record is not None:
+      logged["robot_record"] = record
+    self.runlog.record(logged)
+    return error
+
   async def _run(self, op: str, address: str, basic: dict[str, Any], specialized: dict[str, Any] | None,
                  body: Callable[[], Awaitable[tuple[dict[str, Any], str | None, bool]]]) -> dict[str, Any]:
     """Run one operation and log it, refused or not."""
-    before = self.adapter.command_count()
+    before = await self._count()
     volumes_before = self._twin_volumes()
     entry: dict[str, Any] = {"op": op, "device": address, "basic": basic, "specialized": specialized or {}}
     try:
+      self.adapter.require_motion()
       effective, note, translated = await body()
     except LabError as exc:
       error = self._refusal(entry, exc, volumes_before)
       if error is exc:
         raise
       raise error from exc
-    except Exception as exc:  # noqa: BLE001 - the device model's own refusals (no tip, too little liquid)
-      error = LabError("device_refused", f"{type(exc).__name__}: {exc}",
-                       "The device model refused it; nothing past the refusal was sent.")
-      raise self._refusal(entry, error, volumes_before) from exc
-    commands = self.adapter.command_count() - before
-    self.runlog.record({**entry, "status": "ok", "effective": effective, "note": note,
-                        "translated": translated, "commands": commands})
+    except Exception as exc:  # noqa: BLE001 - the device model's refusals, or the device's own errors
+      after = await self._count()
+      sent = None if before is None or after is None else after - before
+      raise await self._device_error(op, address, entry, exc, sent, volumes_before) from exc
+    after = await self._count()
+    commands = None if before is None or after is None else after - before
+    record = {**entry, "status": "ok", "effective": effective, "note": note, "translated": translated}
+    if commands is not None:  # unknown: left out rather than guessed
+      record["commands"] = commands
+    self.runlog.record(record)
     return {"ok": True, "op": op, "device": address, "effective": effective, "note": note,
             "translated": translated, "commands_sent": commands, "simulated": self.adapter.simulated}
 
   def _defaults(self, comp: Component, op: str, given: dict[str, Any]) -> list[str]:
     return sorted(set(comp.specialized.get(op, {})) - set(given))
+
+  @staticmethod
+  def _one_column(comp: Component) -> bool:
+    """Channels that share one plunger (the OT-2's 8-channel head) move as one: they take a full column."""
+    return comp.channels > 1 and comp.equal_volumes
+
+  def _tip_spots(self, comp: Component, address: str, layout, tips: list[str] | None) -> list[Any]:
+    """The spots to pick up from: exactly one for a single channel, one full column for a head that moves
+    as one, 1 to n for independent channels."""
+    # Omitted: the next fresh ones from a rack whose tips this component takes (the OT-2's P20 never gets 300 uL tips).
+    spots = layout.resolve_tips(tips) if tips else layout.next_tips(
+      comp.channels, fits=lambda rack: self.adapter.tip_fits(comp, rack), wanted=self.adapter.tip_sizes(comp))
+    n, given = comp.channels, len(spots)
+    rack = next((name for name, res in layout.labware.items() if spots and res is spots[0].parent), "tips")
+    if len({id(s) for s in spots}) != given:
+      raise LabError("bad_tips", f"{tips} names a tip spot twice.", "Name each tip spot once.")
+    if n == 1:
+      if given != 1:
+        raise LabError("tip_count", f"{given} tip spots for the single-channel {address}: pass one spot, e.g. "
+                                    f"{rack}:A1.", "It takes one tip at a time.")
+    elif self._one_column(comp):
+      if given != n:
+        raise LabError("tip_count", f"{given} tip spots for the {n}-channel {address}: pass one column, e.g. "
+                                    f"{rack}:col1 or {rack}:A1:H1.",
+                       "Its nozzles move together, so it picks up one full column, top to bottom.")
+      if layout.column_of(spots) is None:
+        raise LabError("tips_not_a_column", f"{tips} is not one full column of a rack for the {n}-channel {address}.",
+                       f"Pass one column, top to bottom, e.g. {rack}:col1 or {rack}:A1:H1.")
+    elif not 1 <= given <= n:
+      raise LabError("tip_count", f"{given} tip spots for the {n} channels of {address}: pass 1 to {n}, e.g. "
+                                  f"{rack}:col1 or {rack}:A1:H1.", "One tip per channel in use.")
+    return spots
 
   async def pick_up_tips(self, device: str, tips: list[str] | None) -> dict[str, Any]:
     comp = self.component(device)
@@ -200,9 +384,10 @@ class LiquidHandling:
       if self.adapter.mounted_tips(comp):
         raise LabError("tips_already_mounted", f"{device} already carries tips.", "Call drop_tips first.")
       layout = self.adapter.require_layout()
-      spots = layout.resolve_tips(tips) if tips else layout.next_tips(comp.channels)
+      spots = self._tip_spots(comp, device, layout, tips)
       note = await self.adapter.pick_up_tips(comp, spots)
-      return {"tips": [s.name for s in spots]}, note, False
+      layout.picked[comp.name] = spots
+      return {"tips": [s.name for s in spots], "where": layout.where(spots)}, note, False
 
     return await self._run("pick_up_tips", device, {"tips": tips or "next fresh"}, None, body)
 
@@ -212,17 +397,25 @@ class LiquidHandling:
     comp = self.component(device)
 
     async def body():
-      self.adapter.require_layout()
+      layout = self.adapter.require_layout()
       extra = self.specialized(comp, op, specialized)
       tips = self._tips(comp, device)
       containers = self._containers(comp, device, targets, len(tips))
-      vols = self._volumes(comp, device, volumes, len(tips), tips)
+      vols = self._volumes(comp, device, volumes, len(tips))
       height = self._height(comp, liquid_height, containers)
       flow = self._flow(comp, flow_rate)
       self._liquid(op, containers, vols)
+      self._tip_room(op, device, tips, vols)
+      draw = self._through_tips(op, comp, device, extra, containers, vols, tips)
+      if op == "aspirate":  # the lowest surface: after the draw, or during a larger pre-wetting
+        drawn = self._per_container(containers, [max(v, draw) for v in vols])
+        self._surface("aspirate", height, containers, drawn)
+      elif draw:  # a native post-dispense mix runs at the dispense height, in what the dispense left
+        self._surface("post-dispense mix", height, containers, self._per_container(containers, [draw] * len(vols)),
+                      added=self._per_container(containers, vols))
       fn = self.adapter.aspirate if op == "aspirate" else self.adapter.dispense
       note = await fn(comp, containers, vols, flow, height, extra)
-      effective = {"containers": [c.name for c in containers], "volumes_ul": vols,
+      effective = {"containers": [c.name for c in containers], "where": layout.where(containers), "volumes_ul": vols,
                    "flow_rate_ul_s": flow if flow is not None else "device default",
                    "liquid_height_mm": height if height is not None else "device default",
                    "specialized": extra, "left_to_device": self._defaults(comp, op, extra)}
@@ -243,18 +436,23 @@ class LiquidHandling:
     comp = self.component(device)
 
     async def body():
-      self.adapter.require_layout()
+      layout = self.adapter.require_layout()
       extra = self.specialized(comp, "mix", specialized)
       tips = self._tips(comp, device)
       containers = self._containers(comp, device, targets, len(tips))
-      vol = self._volumes(comp, device, volume, len(tips), tips)[0]
+      vol = self._volumes(comp, device, volume, len(tips))[0]
       reps = comp.limits["mix_repetitions"].check(repetitions)
       height = self._height(comp, liquid_height, containers)
       flow = self._flow(comp, flow_rate)
-      self._liquid("aspirate", containers, [vol] * len(containers))  # each cycle draws this much
+      if flow is None and self.adapter.MIX_FLOW_RATE is not None:  # the adapter's choice: recorded as such
+        flow = comp.limits["flow_rate_ul_s"].check(self.adapter.MIX_FLOW_RATE)
+      cycle = [vol] * len(containers)  # each cycle draws this much
+      self._liquid("aspirate", containers, cycle)
+      self._tip_room("mix", device, tips, cycle)
+      self._surface("mix", height, containers, self._per_container(containers, cycle))
       note = await self.adapter.mix(comp, containers, vol, int(reps), flow, height, extra)
-      effective = {"containers": [c.name for c in containers], "volume_ul": vol, "repetitions": int(reps),
-                   "flow_rate_ul_s": flow if flow is not None else "device default",
+      effective = {"containers": [c.name for c in containers], "where": layout.where(containers), "volume_ul": vol,
+                   "repetitions": int(reps), "flow_rate_ul_s": flow if flow is not None else "device default",
                    "liquid_height_mm": height if height is not None else "device default"}
       return effective, note, "mix" in comp.translations
 
@@ -270,6 +468,10 @@ class LiquidHandling:
         raise LabError("bad_mode", f"mode {mode!r} is not discard or return.")
       self._tips(comp, device)
       note = await self.adapter.drop_tips(comp, mode)
+      layout = self.adapter.layout
+      picked = layout.picked.pop(comp.name, []) if layout is not None else []
+      if mode == "return":  # back in their spots, used: named explicitly they can be picked up again
+        layout.returned.update(s.name for s in picked)
       return {"mode": mode}, note, False
 
     return await self._run("drop_tips", device, {"mode": mode}, None, body)

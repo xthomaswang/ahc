@@ -1,12 +1,20 @@
 """What the run dashboard shows: the agent's reported decisions, the task's config and layout, the gate."""
 
+import http.client
 import json
+import os
+import re
+import subprocess
+import sys
 from pathlib import Path
 
+import anyio
 import pytest
 
 from ahc.examples import STARLET_LAYOUT
-from ahc.viz.dashboard import current_state, replay
+from ahc.viz.dashboard import (_expand, current_state, latest_log, log_folder, open_dashboard, replay, serve,
+                               stop_status, whoami)
+from ahc.workspace import estop
 from ahc.workspace.store import Workspace
 from conftest import load_verified
 
@@ -94,6 +102,22 @@ def test_the_live_feed_and_reported_decisions_merge(tmp_path):
   assert agent["state"] == "finished" and agent["plan_done"] and agent["steps"] == ["skipped", "done", "done"]
 
 
+async def test_returned_tips_show_as_returned_never_as_fresh(tmp_path, open_lab):
+  async with open_lab(tmp_path, "sim") as lab:
+    await load_verified(lab, layout=STARLET_LAYOUT)
+    await lab.call("pick_up_tips", device="starlet.pip")
+    await lab.call("drop_tips", device="starlet.pip", mode="return")
+    picked = await lab.call("pick_up_tips", device="starlet.pip")  # next fresh: the server skips returned tips
+    twin = await lab.call("get_state")
+    state = replay(log_of(lab))
+  assert twin["tips_left"]["tips"] == 80 and twin["tips_returned"] == {"tips": 8}  # what the agent reads agrees
+  assert picked["effective"]["where"] == "tips: column 2 (A2-H2)"
+  rack = next(r for r in state["tip_racks"] if r["name"] == "tips")
+  first, second = [f"{r}1" for r in "ABCDEFGH"], [f"{r}2" for r in "ABCDEFGH"]
+  assert sorted(rack["used"]) == sorted(first + second)  # 80 of 96 left, as the server would pick them
+  assert rack["returned"] == first  # back in their spots after use: shown as returned, never as fresh
+
+
 def test_a_layout_waiting_for_the_person_shows_as_waiting(tmp_path):
   runs = tmp_path / ".ahc" / "runs"
   runs.mkdir(parents=True)
@@ -122,3 +146,308 @@ def test_the_agent_shows_before_any_run(tmp_path):
   assert state["agent"]["request"]["text"] == "Dilute on the STARlet" and state["agent"]["doing"]["tool"] == "lab_overview"
   assert state["agent"]["state"] == "working"
   assert state["config"] is None and state["events"] == [] and state["plates"] == []
+
+
+# -- the page's server: which folder it stops, and only for its own page ------------------------------
+
+def _http(port: int, path: str, method: str = "GET", body=None, **headers):
+  """status, headers, body of one request; `Host` can be set to what a rebinding page would send."""
+  conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+  try:
+    conn.request(method, path, body=None if body is None else json.dumps(body).encode(),
+                 headers={"Content-Type": "application/json", **{k.replace("_", "-"): v for k, v in headers.items()}})
+    response = conn.getresponse()
+    return response.status, {k.lower(): v for k, v in response.getheaders()}, response.read()
+  finally:
+    conn.close()
+
+
+@pytest.fixture
+def dashboard(tmp_path):
+  """A dashboard for a task folder on a free port: (workspace, port, page token)."""
+  ws = Workspace(tmp_path / "task")
+  ws.root.mkdir()
+  httpd = serve(ws, None, 0, open_browser=False)
+  port = httpd.server_address[1]
+  page = _http(port, "/")[2].decode()
+  token = re.search(r'name="ahc-token" content="([0-9a-f]+)"', page).group(1)
+  try:
+    yield ws, port, token
+  finally:
+    httpd.shutdown()
+
+
+def test_the_page_names_the_folder_it_stops(dashboard):
+  ws, port, token = dashboard
+  status, _, body = _http(port, "/whoami")
+  assert status == 200 and json.loads(body) == {"app": "ahc-dashboard", "folder": str(ws.root), "pid": os.getpid()}
+  page = _http(port, "/")[2].decode()
+  assert f"<title>AHC · {ws.root}</title>" in page  # the absolute folder, in the tab and in the stop bar
+  assert f"Task folder <code>{ws.root}</code>" in page and len(token) == 32
+  assert whoami(port)["folder"] == str(ws.root)
+  stop = json.loads(_http(port, "/estop")[2])
+  assert stop == {"engaged": False, "folder": str(ws.root)}
+
+
+def test_the_page_answers_only_its_own_name_and_is_never_framed(dashboard):
+  ws, port, _ = dashboard
+  for path in ("/", "/state", "/estop", "/whoami"):
+    assert _http(port, path, Host=f"rebind.attacker.example:{port}")[0] == 403, path  # DNS rebinding
+    assert _http(port, path, Origin="http://evil.example")[0] == 403, path
+    assert _http(port, path, Host=f"localhost:{port}")[0] in (200, 204), path
+  for path in ("/", "/state", "/estop", "/nothing"):
+    _, headers, _ = _http(port, path)
+    assert headers["x-frame-options"] == "DENY" and headers["content-security-policy"] == "frame-ancestors 'none'"
+    assert headers["cross-origin-resource-policy"] == "same-origin"
+
+
+def test_the_dashboard_button_needs_its_own_page(dashboard):
+  ws, port, token = dashboard
+  mine = {"X_AHC_Control": "1", "Origin": f"http://127.0.0.1:{port}"}  # built from the port bound (here: 0 asked)
+  assert _http(port, "/estop", "POST", {})[0] == 403  # no header: a cross-site form
+  assert _http(port, "/estop", "POST", {}, **{**mine, "Origin": "http://evil.example"})[0] == 403
+  assert _http(port, "/estop", "POST", {}, **mine, Host=f"rebind.attacker.example:{port}")[0] == 403
+  status, _, body = _http(port, "/estop", "POST", {"reason": "test"}, **mine)
+  data = json.loads(body)
+  assert status == 200 and data["engaged"] and data["by"] == "dashboard" and data["folder"] == str(ws.root)
+  assert _http(port, "/estop", "POST", {}, X_AHC_Control="1")[0] == 200  # pressing needs no page: a script may stop
+  # Releasing does: this page's origin and its token, then the person's confirmation.
+  assert _http(port, "/estop/release", "POST", {"confirm": True}, X_AHC_Control="1")[0] == 403
+  assert _http(port, "/estop/release", "POST", {"confirm": True}, **mine)[0] == 403
+  assert _http(port, "/estop/release", "POST", {"confirm": True}, **mine, X_AHC_Token="0" * 32)[0] == 403
+  assert _http(port, "/estop/release", "POST", {}, **mine, X_AHC_Token=token)[0] == 400  # not confirmed
+  assert estop.read(ws)["engaged"]
+  status, _, body = _http(port, "/estop/release", "POST", {"confirm": True}, **mine, X_AHC_Token=token)
+  assert status == 200 and json.loads(body)["engaged"] is False and json.loads(body)["released_by"] == "dashboard"
+  status, _, body = _http(port, "/estop/release", "POST", {"confirm": True}, **mine, X_AHC_Token=token)
+  assert status == 409 and "nothing to release" in json.loads(body)["error"]
+
+
+def test_the_stop_bar_says_whether_a_server_took_the_stop(dashboard):
+  ws, port, _ = dashboard
+  pressed = estop.engage(ws, by="terminal")
+  stop = json.loads(_http(port, "/estop")[2])
+  assert stop["engaged"] and stop["acknowledged"] is None and stop["pressed_s"] >= 0  # said plainly on the page
+  ws.runs_dir.mkdir(parents=True)
+  (ws.runs_dir / "r.jsonl").write_text("".join(json.dumps(e) + "\n" for e in [
+    {"type": "run", "run_id": "r"},
+    {"type": "estop", "state": "engaged", "id": pressed["id"], "t": "2026-10-22T10:00:01"},
+    {"type": "audit", "event": "device_halted", "detail": "the device stopped its run"}]))
+  stop = json.loads(_http(port, "/estop")[2])
+  assert stop["acknowledged"]["at"] == "2026-10-22T10:00:01" and stop["acknowledged"]["halt"] == "halted"
+  estop.path(ws).write_text("stop")
+  stop = json.loads(_http(port, "/estop")[2])
+  assert stop["engaged"] and stop["unreadable"] == "not JSON" and stop["acknowledged"] is None
+
+
+def test_smoke_and_demo_never_claim_another_folders_dashboard(tmp_path, dashboard):
+  other, port, _ = dashboard  # an ahc-dashboard left running for another folder holds the port
+  ws = Workspace(tmp_path / "this-task")
+  ws.root.mkdir()
+  httpd, where = open_dashboard(ws, None, port, open_browser=False)
+  try:
+    assert httpd is not None and httpd.server_address[1] != port
+    assert f"port {port} serves the dashboard of {other.root}" in where and "does NOT stop this run" in where
+    assert whoami(httpd.server_address[1])["folder"] == str(ws.root)
+  finally:
+    httpd.shutdown()
+  again, where = open_dashboard(other, None, port, open_browser=False)  # this folder's own: it follows the run
+  assert again is None and "already running for this folder" in where
+
+
+def test_a_log_names_its_folder(tmp_path):
+  runs = tmp_path / "task" / ".ahc" / "runs"
+  runs.mkdir(parents=True)
+  (runs / "a.jsonl").write_text(json.dumps({"type": "run", "run_id": "a"}) + "\n")
+  assert log_folder(runs / "a.jsonl") == str(tmp_path / "task")
+  copied = tmp_path / "b.jsonl"
+  copied.write_text(json.dumps({"type": "run", "run_id": "b", "workspace": "/lab/task"}) + "\n")
+  assert log_folder(copied) == "/lab/task"
+  (tmp_path / "c.jsonl").write_text("{}\n")
+  assert log_folder(tmp_path / "c.jsonl") is None
+
+
+def test_ahc_dashboard_refuses_ahcs_own_data_folder(tmp_path):
+  home = tmp_path / "home"
+  (home / ".ahc" / "sim").mkdir(parents=True)
+  cli = Path(sys.executable).parent / "ahc-dashboard"
+  out = subprocess.run([str(cli), "--workspace", str(home), "--no-browser", "--port", "0"], capture_output=True,
+                       text=True, timeout=60, env={**os.environ, "AHC_HOME": str(home / ".ahc")})
+  assert out.returncode != 0 and "AHC's own data folder" in out.stderr
+
+
+def test_ahc_dashboard_never_takes_another_folders_port(tmp_path, dashboard):
+  other, port, _ = dashboard  # a dashboard left running for another folder holds the port asked for
+  task = tmp_path / "this-task"
+  task.mkdir()
+  cli = Path(sys.executable).parent / "ahc-dashboard"
+  env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+  proc = subprocess.Popen([str(cli), "--workspace", str(task), "--no-browser", "--port", str(port)],
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+  try:
+    line = proc.stdout.readline()
+  finally:
+    proc.kill()
+    proc.communicate(timeout=30)
+  assert f"port {port} serves the dashboard of {other.root}; its stop button does NOT stop this run" in line, line
+  assert f"for {task}" in line and f"127.0.0.1:{port}/" not in line.split(" (")[0]
+  same = subprocess.run([str(cli), "--workspace", str(other.root), "--no-browser", "--port", str(port)],
+                        capture_output=True, text=True, timeout=60, env=env)  # this folder's own: shown, not doubled
+  assert same.returncode == 0 and "already running for this folder" in same.stdout
+
+
+def test_the_page_survives_robot_outcomes_nobody_knows_and_every_target_form(tmp_path):
+  geometry = {"reagents": {"kind": "plate", "rows": 8, "cols": 12, "well_max_ul": 2000},
+              "plate": {"kind": "plate", "rows": 8, "cols": 12, "well_max_ul": 360}}
+  assert _expand("plate:col2", geometry) == [f"plate:{r}2" for r in "ABCDEFGH"]
+  assert _expand("plate:ROWb", geometry) == [f"plate:B{c}" for c in range(1, 13)]
+  assert _expand("plate:A1:B2") == ["plate:A1", "plate:B1", "plate:A2", "plate:B2"]
+  assert _expand("plate:middle") == ["plate:middle"] and _expand("trough") == ["trough"]  # never raises
+  liquids = {f"reagents_well_{r}2": 1000 for r in "ABCDEFGH"}
+  log = _log(tmp_path / ".ahc" / "runs" / "r.jsonl",
+             {"op": "load_layout", "status": "ok", "effective": {
+               "saved_as": "deck", "kind": "slots", "labware": {}, "geometry": geometry, "liquids_ul": liquids,
+               "aliases": {"water": "reagents:col2", "stock": "reagents:rowA", "odd": "reagents:middle"}}},
+             {"op": "aspirate", "device": "ot2.right", "status": "refused", "error": "completion_unknown",
+              "partial": "unknown", "basic": {"targets": ["water"], "volumes": 100},
+              "message": "[completion_unknown] aspirate on ot2.right failed after 1 command(s) went to the robot"})
+  state = replay(log)  # an unknown outcome on the robot (W2, and the stop cutting a call short) and C7 aliases
+  water = next(c for c in state["containers"] if c["alias"] == "water")
+  assert water["v"] == 8000 and water["max"] == 16000
+  event = state["events"][-1]
+  assert event["unknown"] and event["status"] == "refused" and state["summary"]["refused"] == 1
+
+
+def test_the_stop_bar_names_the_server_that_took_the_stop(dashboard):
+  ws, port, _ = dashboard
+  pressed = estop.engage(ws, by="dashboard")
+  ws.runs_dir.mkdir(parents=True)
+  (ws.runs_dir / "demo.jsonl").write_text("".join(json.dumps(e) + "\n" for e in [
+    {"type": "run", "run_id": "demo", "device": "opentrons.ot2", "backend": "sim"},  # e.g. an ahc-demo still up
+    {"type": "estop", "state": "engaged", "id": pressed["id"], "at": pressed["at"], "t": pressed["at"]}]))
+  ack = json.loads(_http(port, "/estop")[2])["acknowledged"]
+  assert ack["server"] == " for opentrons.ot2 (simulated)"  # a simulator's server is never taken for the robot's
+  assert estop.describe_ack(ack, 0).startswith("Acknowledged by the AHC server for opentrons.ot2 (simulated) at")
+  assert stop_status(ws)["acknowledged"]["backend"] == "sim"
+
+
+# -- which run the page follows, and when it waits for the person ------------------------------------
+
+def _log(path: Path, *entries: dict) -> Path:
+  path.parent.mkdir(parents=True, exist_ok=True)
+  path.write_text("".join(json.dumps(e) + "\n" for e in [{"type": "run", "run_id": path.stem}, *entries]))
+  return path
+
+
+def test_the_page_follows_the_run_with_activity_not_the_newest_file(tmp_path):
+  runs = tmp_path / ".ahc" / "runs"
+  active = _log(runs / "a.jsonl", {"type": "agent", "decision": "Dilute", "plan": PLAN},
+                {"op": "load_layout", "status": "ok", "t": "2026-10-22T10:00:00"})
+  idle = _log(runs / "b.jsonl", {"type": "estop", "state": "engaged", "id": "x"},
+              {"type": "estop", "state": "released", "id": "x"})  # another server on the folder, which only took the stop
+  os.utime(active, (1_000_000, 1_000_000))
+  assert latest_log(runs) == active
+  assert current_state(Workspace(tmp_path), None)["log"] == str(active)
+  os.utime(active, (1_000_000, 1_000_000))
+  os.utime(idle, (500_000, 500_000))
+  assert latest_log(runs) == active
+  only_idle = tmp_path / "other" / ".ahc" / "runs"
+  _log(only_idle / "c.jsonl", {"type": "estop", "state": "engaged", "id": "y"})
+  assert latest_log(only_idle) == only_idle / "c.jsonl"  # nothing active: the newest still shows
+
+
+async def test_an_idle_server_on_the_folder_does_not_take_the_page_over(tmp_path, open_lab):
+  ws = Workspace(tmp_path)
+  async with open_lab(tmp_path, "sim") as lab, open_lab(tmp_path, "sim"):  # a second session open in the folder
+    await load_verified(lab, layout=STARLET_LAYOUT)
+    active = Path(lab.server.lab.runlog.path)
+    estop.engage(ws, by="test")
+    await anyio.sleep(0.6)  # both servers' watchers take the stop
+    assert await lab.refused("pick_up_tips", device="starlet.pip") == "emergency_stop"
+    estop.release(ws, by="person")
+    await anyio.sleep(0.6)
+    assert await lab.refused("pick_up_tips", device="starlet.pip") == "gate_pending"
+  for log in ws.runs_dir.glob("*.jsonl"):  # whatever the idle server logged, it logged last
+    if log != active:
+      os.utime(log)
+  assert latest_log(ws.runs_dir) == active and current_state(ws, None)["layout"]["name"]
+
+
+def test_waiting_for_you_comes_from_every_check_the_person_owes(tmp_path):
+  def verification(check_id, check, verdict, **twin):
+    return {"type": "verification", "check_id": check_id, "check": check, "verdict": verdict, "t": "2026-10-22T10:00:0" + check_id[-1],
+            "judged_by": "human (placeholder)" if verdict == "pending" else "human",
+            "evidence": {"digital_twin": twin}}
+
+  log = tmp_path / ".ahc" / "runs" / "r.jsonl"
+  base = [{"type": "agent", "t": "2026-10-22T09:59:00", "decision": "Dilute", "plan": PLAN},
+          {"op": "load_layout", "status": "ok", "t": "2026-10-22T10:00:00", "effective": {"saved_as": "deck"}},
+          {"type": "gate", "layout": "deck", "state": "pending", "check_id": None}]
+  _log(log, *base, verification("c1", "tips_mounted", "pending", expect="none", tips_mounted=0))
+  agent = replay(log)["agent"]
+  assert agent["state"] == "waiting" and [c["check"] for c in agent["checks_waiting"]] == ["tips_mounted"]
+  assert agent["checks_waiting"][0]["what"] == "no tips are left on the pipette"
+  _log(log, *base, verification("c1", "tips_mounted", "pending"), verification("c1", "tips_mounted", "pass"))
+  assert replay(log)["agent"]["checks_waiting"] == [] and replay(log)["agent"]["state"] == "working"
+  deck = [verification("c2", "deck_matches_layout", "pending"),
+          {"type": "gate", "layout": "deck", "state": "pending", "check_id": "c2"}]
+  _log(log, *base, *deck)
+  assert [c["what"] for c in replay(log)["agent"]["checks_waiting"]] == ["the deck matches the loaded layout"]
+  released = {"type": "gate", "layout": "deck", "state": "pending", "check_id": None, "reason": "emergency stop released"}
+  _log(log, *base, *deck, released)  # the stop was released: that deck check opens nothing any more
+  assert replay(log)["agent"]["checks_waiting"] == []
+  liquid = verification("c3", "liquid_present", "pending", min_volume_ul=90,
+                        volumes_ul={f"plate_well_{r}12": 100 for r in "ABCDEFGH"})
+  _log(log, *base, liquid, {"op": "load_layout", "status": "ok", "effective": {"saved_as": "deck"}})
+  assert replay(log)["agent"]["checks_waiting"] == []  # a new layout: earlier checks are moot
+  _log(log, *base, liquid)
+  assert replay(log)["agent"]["checks_waiting"][0]["what"].startswith("liquid in plate_well_A12")
+  every = verification("c4", "tips_mounted", "pending", expect="none", pipettes={"ot2.right": "unknown", "ot2.left": 0})
+  _log(log, *base, every)  # the check of every pipette at once
+  assert replay(log)["agent"]["checks_waiting"][0]["what"] == "every pipette is empty (ot2.right, ot2.left)"
+
+
+def test_a_check_a_newer_one_replaced_is_shown_as_replaced_not_as_done(tmp_path):
+  from ahc.viz.dashboard import PAGE
+
+  log = _log(tmp_path / ".ahc" / "runs" / "r.jsonl",
+             {"type": "verification", "check_id": "c1", "check": "tips_mounted", "verdict": "superseded",
+              "judged_by": "nobody: check c2 replaced it"})
+  assert replay(log)["events"][-1]["status"] == "superseded"
+  shown = re.search(r'const st=\[([^\]]*)\]', PAGE).group(1)  # the statuses the timeline styles; others show as ok
+  assert '"superseded"' in shown and ".st.superseded::before" in PAGE
+
+
+async def test_the_page_waits_for_the_person_during_a_robot_check(tmp_path, fake_robot):
+  from ahc.smoke import smoke
+
+  seen = []
+
+  def ask(question):  # while the person is asked, the dashboard says so
+    state = current_state(Workspace(tmp_path), None)
+    if state is not None:
+      seen.append((question.splitlines()[0], state["agent"]["state"],
+                   [c["check"] for c in state["agent"]["checks_waiting"]]))
+    return True
+
+  assert await smoke(tmp_path, "tips", "127.0.0.1", fake_robot.port, ask, out=lambda line: None, scripted=True) == 0
+  waits = {question: (agent_state, checks) for question, agent_state, checks in seen}
+  assert waits["Check the deck against the layout (lids off; A1 at the back left of each slot):"] == (
+    "waiting", ["deck_matches_layout"])
+  assert waits["Tips back in rack column 1, none left on the pipette? [yes/no] "] == ("waiting", ["tips_mounted"])
+  final = current_state(Workspace(tmp_path), None)["agent"]
+  assert final["checks_waiting"] == [] and final["state"] == "finished"
+
+
+def test_the_panel_follows_the_session_making_ahc_calls(tmp_path):
+  runs = tmp_path / ".ahc" / "runs"
+  log = _log(runs / "r.jsonl")
+  (tmp_path / ".ahc" / "agent-feed.jsonl").write_text("".join(json.dumps(e) + "\n" for e in [
+    {"kind": "request", "t": "2026-10-22T10:00:00", "text": "Dilute", "session": "lab", "id": "u1"},
+    {"kind": "doing", "t": "2026-10-22T10:00:05", "tool": "aspirate", "ahc": True, "session": "lab"},
+    {"kind": "request", "t": "2026-10-22T10:01:00", "text": "Read the logs", "session": "reader", "id": "u2"},
+    {"kind": "doing", "t": "2026-10-22T10:01:05", "tool": "Bash", "ahc": False, "session": "reader"},
+    {"kind": "denied", "t": "2026-10-22T10:01:06", "tool": "dispense", "ahc": True, "session": "lab"}]))
+  agent = replay(log)["agent"]
+  assert agent["request"]["text"] == "Dilute"  # another session in the folder does not take the panel over
+  assert agent["doing"]["tool"] == "dispense" and agent["doing"]["denied"]  # shown as refused, not as calling

@@ -397,27 +397,36 @@ def test_the_identity_probe_reads_the_robot_without_moving_it(fake_robot):
   assert found["name"] == "fake-ot2" and found["robot_serial"] == "OT2FAKE" and found["robot_model"] == "OT-2 Standard"
   assert {"api_version", "fw_version", "system_version"} <= set(found)
   assert found["pipettes"]["right"] == {"name": "p300_multi_gen2", "model": "p300_multi_v2.1", "serial": "R1"}
-  assert found["mounts"] == {"ok": True, "problems": []}
+  assert "mounts" not in found  # no mounts stated: only what the robot carries is reported
+  stated = {"left": "p20_single_gen2", "right": "p300_multi_gen2"}
+  assert OT2Adapter.probe_identity("robot", {"host": "127.0.0.1", "port": fake_robot.port, "mounts": stated})["mounts"] == {
+    "ok": True, "problems": []}
   assert not any(method == "POST" for _, method, _, _ in fake_robot.log)  # no run, no motion
   assert OT2Adapter.probe_identity("sim", {}) == {}
   assert STARletAdapter.probe_identity("sim", {}) == {}
 
 
-def test_the_probe_reports_mounts_that_differ(fake_robot):
+def test_the_probe_reports_the_pipettes_and_checks_the_mounts_it_is_given(fake_robot):
   fake_robot.pipettes["right"] = {"name": "p300_single_gen2", "model": "p300_single_v2.1", "id": "R2"}
   fake_robot.pipettes["left"] = None
   fake_robot.instruments_status = 404  # older robot software: the pipettes endpoint answers instead
-  found = OT2Adapter.probe_identity("robot", {"host": "127.0.0.1", "port": fake_robot.port})
+  options = {"host": "127.0.0.1", "port": fake_robot.port}
+  found = OT2Adapter.probe_identity("robot", options)
   assert found["pipettes"]["left"] is None and found["pipettes"]["right"]["name"] == "p300_single_gen2"
-  assert not found["mounts"]["ok"]
-  assert any("right mount has 'p300_single_gen2'" in p for p in found["mounts"]["problems"])
-  assert any("left mount is empty" in p for p in found["mounts"]["problems"])
+  assert "mounts" not in found
+  checked = OT2Adapter.probe_identity("robot", {**options, "mounts": {"left": "p20_single_gen2", "right": "p300_multi_gen2"}})
+  assert not checked["mounts"]["ok"]
+  assert ("right mount has 'p300_single_gen2', the confirmed config names 'p300_multi_gen2'"
+          in checked["mounts"]["problems"])
+  assert "left mount is empty, the confirmed config names 'p20_single_gen2'" in checked["mounts"]["problems"]
+  same = OT2Adapter.probe_identity("robot", {**options, "mounts": {"right": "p300_single_gen2"}})
+  assert same["mounts"] == {"ok": True, "problems": []}  # a mount left out is empty
 
 
 def test_an_instruments_list_without_pipettes_falls_back_to_the_mounts(fake_robot):
   fake_robot.instruments_listed = False  # the robot-server answers, but its OT-2 list is empty
   found = OT2Adapter.probe_identity("robot", {"host": "127.0.0.1", "port": fake_robot.port})
-  assert found["pipettes"]["left"]["name"] == "p20_single_gen2" and found["mounts"]["ok"]
+  assert found["pipettes"]["left"]["name"] == "p20_single_gen2" and found["pipettes"]["right"]["name"] == "p300_multi_gen2"
 
 
 def test_nothing_answering_is_refused():
@@ -431,6 +440,8 @@ async def test_wrong_mounts_are_refused_before_the_robot_homes(tmp_path, open_la
     fake_robot.pipettes["right"] = {"name": "p300_single_gen2", "model": "p300_single_v2.1", "id": "R2"}
     text = await lab.call_text("load_layout", layout=OT2_LAYOUT)
   assert "[mount_mismatch]" in text and "nothing was moved" in text
+  assert "right mount has 'p300_single_gen2', the confirmed config names 'p300_multi_gen2'" in text
+  assert "configure_devices" in text and "person confirms" in text
   assert not any(method == "POST" for _, method, _, _ in fake_robot.log)  # no run created, no home
 
 
@@ -446,6 +457,9 @@ OPTION_REFUSALS = [
   (OT2Adapter, "sim", {"port": 31950}, "sim_options_refused"),
   (OT2Adapter, "sim", {"robot_name": "lab-ot2"}, "sim_options_refused"),
   (OT2Adapter, "sim", {"speed": 2}, "bad_option"),
+  (OT2Adapter, "sim", {"mounts": ["p300_single_gen2"]}, "bad_option"),
+  (OT2Adapter, "sim", {"mounts": {"middle": "p300_single_gen2"}}, "bad_option"),
+  (OT2Adapter, "robot", {"host": "10.0.0.5", "mounts": {"left": 300}}, "bad_option"),
   (STARletAdapter, "usb", {}, "backend_not_implemented"),
   (STARletAdapter, "sim", {"host": "10.0.0.5"}, "sim_options_refused"),
 ]

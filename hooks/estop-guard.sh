@@ -34,5 +34,15 @@ case $? in
   3) ;;
   *) grep -Eq '"engaged"[[:space:]]*:[[:space:]]*false' "$f" 2>/dev/null && exit 0 ;;
 esac
+# The cameras still record the deck after a stop: AHC's capture runs, and so does open_dashboard (the stop button's
+# page), and ToolSearch, which loads their schemas (MCP tools are deferred). Every other call is denied. Without python3, every call is.
+tool=$(/usr/bin/env python3 -I -c '
+import json, sys
+try:
+  print(json.load(sys.stdin).get("tool_name") or "")
+except Exception:
+  pass
+' 2>/dev/null)
+case "$tool" in mcp__plugin_ahc_ahc__capture|mcp__plugin_ahc_ahc__open_dashboard|ToolSearch) exit 0 ;; esac
 # Deny this call (and any others sent with it in parallel), then end the turn.
 printf '%s\n' '{"continue": false, "stopReason": "AHC emergency stop engaged in this task folder: the agent is stopped. A person releases it on the run dashboard or with ahc-estop --release; the deck is checked again before anything moves.", "hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": "AHC emergency stop engaged: no tool runs until a person releases it."}}'

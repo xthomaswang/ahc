@@ -451,3 +451,127 @@ def test_the_panel_follows_the_session_making_ahc_calls(tmp_path):
   agent = replay(log)["agent"]
   assert agent["request"]["text"] == "Dilute"  # another session in the folder does not take the panel over
   assert agent["doing"]["tool"] == "dispense" and agent["doing"]["denied"]  # shown as refused, not as calling
+
+
+# -- open_dashboard: the agent starts the page from inside the MCP server -------------------------------
+
+def _get(url: str, path: str = "") -> tuple[int, bytes]:
+  import urllib.request
+  with urllib.request.urlopen(url.rstrip("/") + (path or "/"), timeout=10) as response:
+    return response.status, response.read()
+
+
+def _dashboard_threads() -> list:
+  import threading
+  return [t for t in threading.enumerate() if getattr(getattr(t, "_target", None), "__name__", "") == "serve_forever"]
+
+
+@pytest.fixture
+def opened(monkeypatch):
+  """webbrowser.open is replaced: the URLs it was asked for."""
+  urls: list[str] = []
+  monkeypatch.setattr("ahc.server.webbrowser.open", lambda url: urls.append(url) or True)
+  return urls
+
+
+async def test_open_dashboard_serves_this_folders_page_and_follows_the_run(tmp_path, open_lab, opened):
+  async with open_lab(tmp_path, "sim") as lab:
+    tools = {t.name: t for t in (await lab.client.list_tools()).tools}
+    assert tools["open_dashboard"].annotations.read_only_hint is False
+    assert tools["open_dashboard"].annotations.destructive_hint is False
+    got = await lab.call("open_dashboard", open_browser=False)
+    assert got["started"] is True and got["browser_opened"] is False and opened == []
+    assert got["how_to_stop"] == "the stop button on this page"
+    assert re.fullmatch(r"http://127\.0\.0\.1:\d+/", got["url"])
+    status, body = await anyio.to_thread.run_sync(_get, got["url"], "/whoami")
+    assert status == 200 and json.loads(body)["folder"] == str(lab.server.lab.ws.root)
+    status, page = await anyio.to_thread.run_sync(_get, got["url"])
+    assert status == 200 and b"<title>AHC" in page
+    await load_verified(lab, layout=STARLET_LAYOUT, name="deck")  # a run starts after the page is up
+    status, body = await anyio.to_thread.run_sync(_get, got["url"], "/state")
+    state = json.loads(body)
+    assert state["run"]["run_id"] == lab.server.lab.runlog.run_id and state["layout"]["name"] == "deck"
+    again = await lab.call("open_dashboard", open_browser=False)
+    assert again["url"] == got["url"] and again["started"] is False  # the same one
+    assert (await lab.call("lab_overview"))["dashboard"] == {"url": got["url"]}
+
+
+async def test_open_dashboard_opens_the_browser_and_survives_a_browser_that_fails(tmp_path, open_lab, opened, monkeypatch):
+  async with open_lab(tmp_path, "sim") as lab:
+    got = await lab.call("open_dashboard")  # open_browser defaults to true
+    assert got["browser_opened"] is True and opened == [got["url"]]
+    def broken(url):
+      raise RuntimeError("no browser here")
+    monkeypatch.setattr("ahc.server.webbrowser.open", broken)
+    again = await lab.call("open_dashboard")
+    assert again["url"] == got["url"] and again["browser_opened"] is False
+
+
+async def test_the_servers_shutdown_stops_its_dashboard(tmp_path, open_lab, opened):
+  before = set(_dashboard_threads())
+  async with open_lab(tmp_path, "sim") as lab:
+    got = await lab.call("open_dashboard", open_browser=False)
+    ours = set(_dashboard_threads()) - before
+    assert len(ours) == 1 and all(t.is_alive() for t in ours)
+  assert not any(t.is_alive() for t in ours)  # joined, not left behind
+  with pytest.raises(OSError):
+    _get(got["url"], "/whoami")
+
+
+async def test_open_dashboard_takes_the_next_free_port_and_keeps_the_stop_protections(tmp_path, open_lab, opened):
+  other = Workspace(tmp_path / "other")
+  other.root.mkdir()
+  try:  # another folder's page on 8770, unless something already holds it
+    held = serve(other, None, 8770, open_browser=False)
+  except OSError:
+    held = None
+  try:
+    async with open_lab(tmp_path / "task", "sim") as lab:
+      got = await lab.call("open_dashboard", open_browser=False)
+      port = int(got["url"].rsplit(":", 1)[1].strip("/"))
+      assert whoami(port)["folder"] == str(lab.server.lab.ws.root)
+      if held is not None:
+        assert port != 8770
+      conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)  # a POST without the page's header is refused
+      conn.request("POST", "/estop", body="{}")
+      assert conn.getresponse().status == 403
+      conn.close()
+      assert not estop.path(lab.server.lab.ws).exists()
+  finally:
+    if held is not None:
+      held.shutdown()
+      held.server_close()
+
+
+async def test_open_dashboard_returns_this_folders_dashboard_a_person_already_runs(tmp_path, open_lab, opened, monkeypatch):
+  theirs = serve(Workspace(tmp_path), None, 0, open_browser=False)
+  port = theirs.server_address[1]
+  monkeypatch.setattr("ahc.server.DASHBOARD_PORT", port)  # where the person's ahc-dashboard sits
+  try:
+    async with open_lab(tmp_path, "sim") as lab:
+      got = await lab.call("open_dashboard", open_browser=False)
+      assert got["url"] == f"http://127.0.0.1:{port}/" and got["started"] is False
+      assert (await lab.call("lab_overview"))["dashboard"] == {"url": got["url"]}
+  finally:
+    theirs.shutdown()
+    theirs.server_close()
+
+
+async def test_overview_hints_at_the_dashboard_and_names_the_stop_commands(tmp_path, open_lab, opened):
+  import ahc.server as server_module
+  async with open_lab(tmp_path, "sim") as lab:
+    before = await lab.call("lab_overview")
+    assert before["dashboard"]["url"] is None and "open_dashboard" in before["dashboard"]["hint"]
+    how = before["emergency_stop"]["how"]
+    assert f"uv run --project {server_module.REPO} ahc-estop --workspace" in how and "open_dashboard" in how
+    got = await lab.call("open_dashboard", open_browser=False)
+    after = (await lab.call("lab_overview"))["emergency_stop"]["how"]
+    assert got["url"] in after and f"uv run --project {server_module.REPO} ahc-estop" in after
+
+
+async def test_open_dashboard_runs_while_the_emergency_stop_is_engaged(tmp_path, open_lab, opened):
+  async with open_lab(tmp_path, "sim") as lab:
+    estop.engage(lab.server.lab.ws, by="test")
+    got = await lab.call("open_dashboard", open_browser=False)
+    status, body = await anyio.to_thread.run_sync(_get, got["url"], "/estop")
+    assert status == 200 and json.loads(body)["engaged"] is True

@@ -56,7 +56,8 @@ async def test_while_a_tips_check_waits_for_the_person_nothing_moves(tmp_path, o
       text = await lab.call_text(tool, **args)
       assert "[check_pending]" in text, (tool, text)
       assert f"tips_mounted check {check['check_id']}" in text and "a tip on every channel in use, seated straight" in text
-      assert "record_verdict(check_id=...)" in text.partition("Hint:")[2]
+      hint = text.partition("Hint:")[2]
+      assert f"record_verdict(check_id='{check['check_id']}', verdict='pass', note=<ask_person>) now" in hint
     assert len(posts(fake_robot)) == sent  # nothing reached the robot
     await lab.call("get_state")  # reading, checking and reporting go on
     await lab.call("report_decision", decision="Waiting for the person's tips check", waiting_for="person")
@@ -79,6 +80,44 @@ async def test_a_liquid_check_waiting_for_the_person_holds_motion_too(tmp_path, 
       assert "[check_pending]" in text and "each container of plate:col1 holds at least 50 uL" in text, tool
     await lab.call("record_verdict", check_id=check["check_id"], verdict="pass")
     await lab.call("drop_tips", device=DEV)
+
+
+async def test_a_pending_check_carries_what_the_person_confirms(tmp_path, open_lab, fake_robot):
+  """verify gives ask_person, one plain sentence that is the note of record_verdict(verdict='pass'): the person's
+  approval of that call in the client's dialog is the confirmation."""
+  async with robot_lab(open_lab, tmp_path, fake_robot) as lab:
+    await lab.call("load_layout", layout=OT2_LAYOUT)
+    deck = await asked(lab, "deck_matches_layout")
+    assert deck["ask_person"] == (
+      "The deck matches the loaded layout: slot 1: tips (opentrons_96_tiprack_300ul); "
+      "slot 4: tips2 (opentrons_96_tiprack_300ul); "
+      "slot 2: reagents (cor_96_wellplate_2mL_Vb) holding A1-H1 1800 uL, A2-H2 500 uL; "
+      "slot 3: plate (Cor_96_wellplate_360ul_Fb); "
+      "lids off, A1 at the back left of each slot, the liquids and their volumes, nothing else on the deck, "
+      "and no tips on either pipette.")
+    again = await lab.call("verify", check="deck_matches_layout")  # still waiting: the same check, the same note
+    assert again["check_id"] == deck["check_id"] and again["ask_person"] == deck["ask_person"]
+    assert f"call record_verdict(check_id='{deck['check_id']}', verdict='pass', note=<ask_person>) now" in deck["next"]
+    none = await asked(lab, "tips_mounted", expect="none")  # no device: every pipette
+    assert none["ask_person"] == "No tip on either pipette (ot2.left, ot2.right)."
+    assert "hands and deck are clear" in none["next"]  # the dialog before load_layout carries the homing go-ahead
+    assert "hands and deck are clear" not in deck["next"]  # the deck check follows the homing
+    liquid = await asked(lab, "liquid_present", targets=["diluent", "stock"], min_volume_ul=200)
+    assert liquid["ask_person"] == "Each container of diluent, stock holds at least 200 uL."
+    mounted = await asked(lab, "tips_mounted", device=DEV, expect="mounted")
+    assert mounted["ask_person"] == "A tip on every channel in use of ot2.right, seated straight."  # none picked up yet
+    passed = await lab.call("record_verdict", check_id=deck["check_id"], verdict="pass", note=deck["ask_person"])
+    assert "ask_person" not in passed and passed["note"] == deck["ask_person"]
+
+
+async def test_ask_person_counts_the_tips_on_a_pipette(tmp_path, open_lab, fake_robot):
+  async with robot_lab(open_lab, tmp_path, fake_robot) as lab:
+    await ready(lab)  # the 8-channel head carries column 1
+    check = await asked(lab, "tips_mounted", device=DEV, expect="mounted")
+    assert check["ask_person"] == "8 tips seated straight on ot2.right."
+    await lab.call("record_verdict", check_id=check["check_id"], verdict="pass", note=check["ask_person"])
+    gone = await asked(lab, "tips_mounted", device=DEV, expect="none")
+    assert gone["ask_person"] == "No tip on ot2.right."
 
 
 async def test_a_new_check_of_the_same_subject_replaces_the_one_waiting(tmp_path, open_lab, fake_robot):
@@ -163,7 +202,7 @@ async def test_a_failed_check_of_every_pipette_holds_each_until_it_is_cleared(tm
     check = await asked(lab, "tips_mounted", expect="none")  # every pipette, at once
     await lab.call("record_verdict", check_id=check["check_id"], verdict="fail")
     text = await lab.call_text("pick_up_tips", device=DEV, tips=["tips:col2"])
-    assert "[check_failed]" in text and f"each of {DEV}, ot2.left" in text
+    assert "[check_failed]" in text and f"each of ot2.left, {DEV}" in text
     assert "expect='none') without device again" in text.partition("Hint:")[2]
     right = await asked(lab, "tips_mounted", device=DEV, expect="none")  # the head is clear now, the P20 is not
     await lab.call("record_verdict", check_id=right["check_id"], verdict="pass")
@@ -195,7 +234,7 @@ async def test_while_the_check_of_every_pipette_waits_nothing_moves(tmp_path, op
     check = await asked(lab, "tips_mounted", expect="none")
     for tool, args in MOTION:
       text = await lab.call_text(tool, **args)
-      assert "[check_pending]" in text and "every pipette (ot2.right, ot2.left)" in text, tool
+      assert "[check_pending]" in text and "every pipette (ot2.left, ot2.right)" in text, tool
     await lab.call("record_verdict", check_id=check["check_id"], verdict="pass")
     await lab.call("pick_up_tips", device=DEV, tips=["tips:col2"])
 

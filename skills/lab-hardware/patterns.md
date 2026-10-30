@@ -2,8 +2,9 @@
 
 General patterns for liquid-handling work on any AHC device. Fit each one to the component facts
 that `lab_overview` and `get_params` give. Numbers marked "e.g." are examples from one device, not
-rules: on the OT-2, `ot2.right` is a P300 8-channel head and `ot2.left` a P20 single channel; on the
-STARlet, `starlet.pip` is 8 independent channels.
+rules. On the OT-2 each mount carries the robot's own GEN2 pipette. Without anything else (and in the
+simulator) `ot2.right` is a P300 8-channel head and `ot2.left` a P20 single channel. On the STARlet,
+`starlet.pip` is 8 independent channels.
 
 Each pattern says when to use it, the calls, and the pitfalls with the refusal they produce.
 
@@ -18,11 +19,12 @@ Each pattern says when to use it, the calls, and the pitfalls with the refusal t
 | The mounted tip's size | What the tips can hold at once (`exceeds_tip`). |
 | `liquid_height_mm` default | Where the tips go when a call gives no height. |
 
-Each pipette takes its own tip size: on the OT-2, `ot2.right` 300 uL tips and `ot2.left` 20 uL tips
-(`opentrons_96_tiprack_20ul`). A plan that uses a pipette needs a rack of its tips on the deck (ask
-the person; the built-in OT-2 example layout has both). An omitted pick-up takes the next fresh
-tips, in layout order, from the racks whose tips fit that pipette; name the tips to take them from
-another rack.
+Each pipette takes its own tip size: a P20 10 or 20 uL, a P300 200 or 300 uL, a P1000 1000 uL. The
+OT-2's tip racks are `opentrons_96_tiprack_10ul`, `_20ul`, `_300ul` and `_1000ul`, and its filter racks
+`opentrons_96_filtertiprack_10ul`, `_20ul`, `_200ul` and `_1000ul`. A plan that uses a pipette needs a
+rack of its tips on the deck (ask the person; the built-in OT-2 example layout has racks for the
+default pair). An omitted pick-up takes the next fresh tips, in layout order, from the racks whose
+tips fit that pipette; name the tips to take them from another rack.
 
 Count the sources too. A draw may not take more than a container holds (`insufficient_liquid`), and
 it must leave the liquid surface above the tips (`above_liquid`). Plan a reserve in every source
@@ -36,9 +38,10 @@ Calls:
 - A component that may share a container (`shared_container: true`, e.g. the STARlet with a
   trough): `aspirate(targets=["buffer"], volumes=V)` draws with every mounted tip; then `dispense`
   into one well per tip.
-- A head that may not (e.g. `ot2.right`): keep the reagent in one column of a deep-well plate and
-  alias it (`"buffer": "reagents:col1"`). `aspirate(targets=["buffer"], volumes=V)` draws one well
-  per channel; `dispense(targets=["plate:col2"], volumes=V)`, then `plate:col3`, and so on.
+- A head that may not (e.g. an 8-channel head such as the default `ot2.right`): keep the reagent in
+  one column of a deep-well plate and alias it (`"buffer": "reagents:col1"`).
+  `aspirate(targets=["buffer"], volumes=V)` draws one well per channel;
+  `dispense(targets=["plate:col2"], volumes=V)`, then `plate:col3`, and so on.
 - `pick_up_tips` once, the aspirate/dispense pairs, then `drop_tips`.
 
 Pitfalls:
@@ -48,6 +51,9 @@ Pitfalls:
   container the layout names. On the STARlet the last dispense otherwise runs out of piston travel
   (`piston_travel`).
 - The same tips serve every dispense only while they touch nothing but this reagent (pattern 8).
+- A reservoir well serves one channel at a time: an 8-channel head draws from a column of 8 wells,
+  a single channel from any well. The OT-2's 1-well reservoir (`nest_1_troughplate_195000uL_Vb`)
+  therefore serves a single channel only; its 12-well one is `nest_12_troughplate_15000uL_Vb`.
 
 ## 2. Per-well volumes from a table
 
@@ -57,10 +63,10 @@ Calls:
 - Independent channels (`equal_volumes: false`, e.g. the STARlet): one call serves one well per
   mounted tip, one volume per target: `dispense(targets=["plate:A1", "plate:B1"], volumes=[12.5, 30])`
   with two tips. An aspirate from a shared trough takes the same per-channel volumes.
-- A head with equal volumes plus a single channel (e.g. the OT-2): the single channel, one well per
-  call, with its own tips (see "Read the components first"). Or the head first adds a common base to
-  a whole column (that column's smallest volume, if it is at least the head's minimum), and the
-  single channel adds each well's difference.
+- A head with equal volumes plus a single channel (e.g. the OT-2's default pair): the single channel,
+  one well per call, with its own tips (see "Read the components first"). Or the head first adds a
+  common base to a whole column (that column's smallest volume, if it is at least the head's minimum),
+  and the single channel adds each well's difference.
 
 Pitfalls:
 - Check every volume in the table against each component's min and max before the first call. A
@@ -81,9 +87,10 @@ Calls:
   container; an 8-channel head column by column into the same 8 wells.
 
 Pitfalls:
-- A head whose channels move together (e.g. `ot2.right`) serves one full column per call, top to
-  bottom: part of a column, or a row (`plate:rowB`, 12 wells), is refused. Fill those wells one by
-  one with a single channel, or turn the plan so the work runs along columns.
+- A head whose channels move together (e.g. an 8-channel head such as the default `ot2.right`) serves
+  one full column per call, top to bottom: part of a column, or a row (`plate:rowB`, 12 wells), is
+  refused. Fill those wells one by one with a single channel, or turn the plan so the work runs along
+  columns.
 - Fresh tips for each source column whose liquids differ.
 - Tip budget: a whole 96-well plate, column by column, takes 12 columns of tips.
 

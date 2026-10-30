@@ -7,7 +7,7 @@ returns the same numbers next to each parameter, so documentation and enforcemen
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from importlib import resources
 from typing import Any
 
@@ -90,9 +90,14 @@ class Component:
   specialized: dict[str, dict[str, Param]]
   translations: dict[str, str]
   note: str = ""
+  # The hardware this component must be (an Opentrons pipette name), for a component built from what a mount
+  # carries: checked against the device before anything moves. "" for a fixed component.
+  instrument: str = ""
 
   def public(self) -> dict[str, Any]:
     out: dict[str, Any] = {"title": self.title, "capabilities": list(self.capabilities)}
+    if self.instrument:
+      out["instrument"] = self.instrument
     if self.capabilities:
       out.update(
         channels=self.channels,
@@ -119,6 +124,18 @@ class DeviceSpec:
   path: Any  # pathlib.Path or importlib.resources Traversable; both have read_text()
   raw: dict[str, Any] = field(repr=False, default_factory=dict)
   id: str | None = None  # the workspace config's device id; addresses are <id>.<component>
+  # A device whose description file lists mounts: what each mount carries (None: empty), driven or not. Its
+  # components are the mounts that carry an instrument the file describes, named after the mount.
+  mounted: dict[str, str | None] = field(default_factory=dict)
+
+  @property
+  def instruments(self) -> dict[str, Any]:
+    """The instruments the description file describes, by name; {} for a device without mounts."""
+    return dict((self.raw.get("mounts") or {}).get("instruments") or {})
+
+  def not_driven(self) -> dict[str, str]:
+    """Mounts carrying an instrument the description file does not describe: they stay unused."""
+    return {m: name for m, name in self.mounted.items() if name and name not in self.instruments}
 
   @property
   def short_name(self) -> str:
@@ -169,16 +186,73 @@ def _component(name: str, raw: dict[str, Any], where: str) -> Component:
   )
 
 
+def _merge_specialized(shared: dict[str, Any], own: dict[str, Any]) -> dict[str, dict[str, Any]]:
+  """The specialized parameters every instrument shares, with an instrument's own on top: per parameter, the
+  instrument's fields (its limits, its source) are added to the shared ones (the type, the doc)."""
+  out: dict[str, dict[str, Any]] = {}
+  for op in {*shared, *own}:
+    params = {name: dict(fields or {}) for name, fields in (shared.get(op) or {}).items()}
+    for name, fields in (own.get(op) or {}).items():
+      params[name] = {**params.get(name, {}), **(fields or {})}
+    out[op] = params
+  return out
+
+
+def _mounted_components(raw: dict[str, Any], mounted: dict[str, str | None], where: str) -> dict[str, Component]:
+  """One component per mount that carries a described instrument: the instrument's own fields and limits, plus
+  the limits and specialized parameters every instrument shares."""
+  mounts = raw["mounts"]
+  shared = mounts.get("limits") or {}
+  shared_specialized = mounts.get("specialized") or {}
+  out: dict[str, Component] = {}
+  for mount in mounts["slots"]:
+    name = mounted.get(mount)
+    inst = (mounts.get("instruments") or {}).get(name) if name else None
+    if inst is None:
+      continue
+    body = {**inst, "title": f"{inst.get('title', name)} on the {mount} mount",
+            "limits": {**shared, **(inst.get("limits") or {})},
+            "specialized": _merge_specialized(shared_specialized, inst.get("specialized") or {})}
+    out[mount] = replace(_component(mount, body, f"{where}.mounts.{name}"), instrument=name)
+  return out
+
+
 def parse_device(path) -> DeviceSpec:
   text = path.read_text()
   if not text.startswith("---\n"):
     raise ValueError(f"{path}: no YAML front matter")
   _, front, guide = text.split("---\n", 2)
   raw = yaml.safe_load(front)
-  components = {n: _component(n, c, str(path)) for n, c in raw["components"].items()}
+  components = {n: _component(n, c, str(path)) for n, c in (raw.get("components") or {}).items()}
+  mounted: dict[str, str | None] = {}
+  if raw.get("mounts"):
+    mounted = {m: raw["mounts"].get("default", {}).get(m) for m in raw["mounts"]["slots"]}
+    for name in raw["mounts"].get("instruments") or {}:  # every instrument parses, mounted or not
+      _mounted_components(raw, {raw["mounts"]["slots"][0]: name}, str(path))
+    components.update(_mounted_components(raw, mounted, str(path)))
   return DeviceSpec(model=raw["model"], brand=raw["brand"], title=raw["title"],
                     backends=raw.get("backends", {}), layout=raw.get("layout", {}),
-                    components=components, guide=guide.strip(), path=path, raw=raw)
+                    components=components, guide=guide.strip(), path=path, raw=raw, mounted=mounted)
+
+
+def with_mounts(spec: DeviceSpec, mounted: dict[str, str | None] | None) -> DeviceSpec:
+  """The spec with its components built from what each mount carries; unchanged for a device without mounts,
+  or when nothing is given (the description file's default mounts, the simulator's)."""
+  if not spec.raw.get("mounts") or mounted is None:
+    return spec
+  slots = spec.raw["mounts"]["slots"]
+  unknown = sorted(set(mounted) - set(slots))
+  if unknown:
+    raise LabError("bad_option", f"{spec.model} has no mount {', '.join(map(repr, unknown))}.",
+                   f"Mounts: {', '.join(slots)}.")
+  full = {m: mounted.get(m) for m in slots}
+  fixed = {n: c for n, c in spec.components.items() if not c.instrument}
+  return replace(spec, mounted=full, components={**fixed, **_mounted_components(spec.raw, full, str(spec.path))})
+
+
+def device_spec(model: str, options: dict[str, Any] | None = None) -> DeviceSpec:
+  """A config entry's device: its description file, with the mounts the entry names (options.mounts)."""
+  return with_mounts(load_device(model), (options or {}).get("mounts"))
 
 
 def known_models() -> list[str]:

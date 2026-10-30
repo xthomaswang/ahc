@@ -89,7 +89,8 @@ async def test_a_robot_needs_the_persons_go_ahead_in_every_session(tmp_path, ope
     assert overview["next"].startswith("This session needs the person's go-ahead before anything moves")
     text = await lab.call_text("load_layout", layout=OT2_LAYOUT)
     assert "[session_unconfirmed]" in text and homes in text
-    assert "confirm_config(summary=<that summary>)" in text and "never call it on your own" in text
+    assert "confirm_config(summary=<config.confirm_summary>) now" in text and "approval in the dialog is their confirmation" in text
+    assert "Never approve for them" in text and "hands and deck are clear" in text  # the homing go-ahead rides on it
     for tool, args in MOTION:
       assert await lab.refused(tool, **args) == "session_unconfirmed", tool
     assert posts(fake_robot) == []  # no run created, no home
@@ -118,7 +119,8 @@ async def test_reading_checking_and_reporting_need_no_go_ahead(tmp_path, open_la
     await lab.call("record_verdict", check_id=check["check_id"], verdict="pass")
     written = await lab.call("configure_devices", devices=[{"id": "ot2", "model": "opentrons.ot2", "backend": "robot",
                                                             "options": robot_entry(fake_robot).options}])
-    assert written["config"]["status"] == "confirmed"  # the same config: its confirmation stays, the session still waits
+    # The config now names the mounts the robot carries (the person never confirmed them): pending again.
+    assert written["config"]["status"] == "pending" and ", mounts left p20_single_gen2, right p300_multi_gen2" in written["config"]["confirm_summary"]
     assert (await lab.call("lab_overview"))["session"]["go_ahead"] == "needed"
   assert posts(fake_robot) == []
 

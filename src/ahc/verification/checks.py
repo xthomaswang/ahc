@@ -2,7 +2,8 @@
 
 The agent judges each check; this module gathers the evidence it judges from. In simulation the
 simulator's state is compared with the digital twin and the verdict is marked simulated. On real
-hardware a person verifies for now (placeholder until camera and CV verifiers are connected).
+hardware a person verifies for now (placeholder until camera and CV verifiers are connected); photos from
+capture can be attached to a check as evidence, and the person still judges.
 volumes_match is the digital twin's own answer on every backend: what was sent, not what was measured.
 
 The person's tips_mounted and liquid_present checks hold motion (the server enforces it, as it does the
@@ -27,6 +28,7 @@ from ahc.devices.base import Adapter
 from ahc.devices.spec import DeviceSpec
 from ahc.core.errors import LabError
 from ahc.records import RunLog
+from ahc.verification.ask import DENIED, pass_now
 
 # What the person checks on a real deck besides each labware and its position: in the check itself, in what
 # verify asks them, and where find_layout_references sends them to the deck.
@@ -43,14 +45,13 @@ CHECKS = {
                    "in the digital twin: what was sent, not measured.",
 }
 
-CAMERA_NOTE = "no camera verifier connected yet (placeholder)"
+CAMERA_NOTE = ("no camera verifier: no image is judged automatically. Photos from capture can be attached with "
+               "images=[...] as evidence; on real hardware the person still records the verdict")
 TWIN_JUDGE = "digital twin (what was sent, not measured)"
-WAIT = ("Report waiting_for='person' and stop until they answer; record their verdict with record_verdict only when "
-        "they give it, never decide it yourself.")
 HOLDING = ("tips_mounted", "liquid_present")  # the person's checks that hold motion while they wait, or once failed
 # On real hardware the person checks the deck against this, every time.
 DECK_ON_SITE = (f"The person on site checks the deck against the layout: every slot's labware as listed, {ON_A_REAL_DECK}. "
-                "Show them the layout (also on the run dashboard). ")
+                "The layout is also on the run dashboard. ")
 
 
 class Verification:
@@ -74,9 +75,10 @@ class Verification:
   async def verify(self, check: str, device: str | None = None, targets: list[str] | None = None,
                    expect: str = "mounted", min_volume_ul: float = 0.0, person: bool = False,
                    expected: dict[str, Any] | None = None, tolerance_ul: float = 0.5,
-                   differs: str | None = None) -> dict[str, Any]:
+                   differs: str | None = None, images: list[str] | None = None) -> dict[str, Any]:
     """`person`: the verdict is the person's even in simulation (a layout no reference matches). `differs`: how
-    the loaded layout differs from the task folder's references, for the person checking the deck."""
+    the loaded layout differs from the task folder's references, for the person checking the deck. `images`:
+    photos from capture (the server checked their paths) kept as the check's camera evidence."""
     if check not in CHECKS:
       raise LabError("unknown_check", f"no check named {check!r}.", f"Checks: {', '.join(CHECKS)}.")
     if check == "volumes_match":
@@ -94,14 +96,16 @@ class Verification:
     check_id = uuid.uuid4().hex[:8]
     result = {"check_id": check_id, "check": check, "verdict": verdict, "judged_by": judged_by,
               "simulated": self.adapter.simulated,
-              "evidence": {"digital_twin": twin, "sensors": sensors, "camera": CAMERA_NOTE},
+              "evidence": {"digital_twin": twin, "sensors": sensors,
+                           "camera": {"images": list(images), "note": CAMERA_NOTE} if images else CAMERA_NOTE},
               "note": note}
     if check == "volumes_match" and twin["mismatches"]:
       result["mismatches"] = twin["mismatches"]
     replaced: list[str] = []
     if verdict == "pending":
       self.pending[check_id] = result
-      result["next"] = self._ask(check, device, targets, expect, min_volume_ul, person, differs)
+      result["ask_person"] = self._ask_person(check, device, targets, expect, min_volume_ul, twin)
+      result["next"] = self._ask(check_id, check, device, targets, expect, min_volume_ul, person, differs)
       if check in HOLDING:
         replaced = self._hold(check_id, check, device, twin, targets, expect, min_volume_ul)
         if replaced:
@@ -113,14 +117,34 @@ class Verification:
                         "evidence": result["evidence"], **({"supersedes": replaced[-1]} if replaced else {})})
     return result
 
-  def _ask(self, check, device, targets, expect, min_volume_ul, person, differs=None) -> str:
-    """What the person is asked, check by check."""
+  def _ask(self, check_id, check, device, targets, expect, min_volume_ul, person, differs=None) -> str:
+    """What the person is asked, check by check: the call that asks them is the next one."""
+    homes = check == "tips_mounted" and device is None and not self.adapter.simulated  # the dialog before load_layout
+    now = f" {pass_now(check_id, homes=homes)} {DENIED}"
     if person and self.adapter.simulated:
-      return ((differs or "This layout matches no reference in this task folder.") + " So the person confirms it: show "
-              "them the labware, positions and liquids (also on the run dashboard) and ask. " + WAIT)
+      return ((differs or "This layout matches no reference in this task folder.") + " So the person confirms it: "
+              "ask_person lists the labware, positions and liquids (also on the run dashboard)." + now)
     if check == "deck_matches_layout":
-      return DECK_ON_SITE + (f"{differs} " if differs else "") + WAIT
-    return f"The person on site checks {self._question(check, device, targets, expect, min_volume_ul)}. " + WAIT
+      return DECK_ON_SITE + (f"{differs} " if differs else "") + now.lstrip()
+    return f"The person on site checks {self._question(check, device, targets, expect, min_volume_ul)}.{now}"
+
+  def _ask_person(self, check, device, targets, expect, min_volume_ul, twin) -> str:
+    """What the person confirms by approving record_verdict, as one plain sentence: the note of that call."""
+    if check == "deck_matches_layout":
+      deck = f"The deck matches the loaded layout: {self.adapter.require_layout().describe()}"
+      return deck + (f"; {ON_A_REAL_DECK}." if not self.adapter.simulated else ".")
+    if check == "tips_mounted" and device is None:
+      names = list(self._pipettes())
+      return f"No tip on {'either' if len(names) == 2 else 'any'} pipette ({', '.join(names)})."
+    if check == "tips_mounted":
+      address = self._address(device)
+      if expect == "none":
+        return f"No tip on {address}."
+      n = twin.get("tips_mounted")
+      return (f"{n} tip{'s' if n != 1 else ''} seated straight on {address}." if isinstance(n, int) and n > 0 else
+              f"A tip on every channel in use of {address}, seated straight.")
+    least = f"at least {min_volume_ul:g} uL" if min_volume_ul > 0 else "some liquid"
+    return f"Each container of {', '.join(targets or [])} holds {least}."
 
   def _question(self, check, device, targets, expect, min_volume_ul) -> str:
     """What the person checks in a tips or liquid check, as one clause."""
@@ -235,9 +259,8 @@ class Verification:
       raise LabError("check_pending",
                      f"{named} {'waits' if len(waiting) == 1 else 'wait'} for the person's verdict, so nothing moves "
                      "until they answer.",
-                     "Report waiting_for='person' and wait; then record their answer with record_verdict(check_id=...) "
-                     "for that check, never a verdict of your own. A new verify of the same check replaces the one "
-                     "waiting.")
+                     f"{' '.join(pass_now(cid) for cid in waiting)} Never a verdict of your own. A new verify of the "
+                     "same check replaces the one waiting.")
     failed = {cid: h for cid, h in self.holds.items() if h["state"] == "failed"}
     for cid, hold in failed.items():
       if hold["check"] == "tips_mounted" and op != "drop_tips":
@@ -246,21 +269,21 @@ class Verification:
         raise LabError("check_failed",
                        f"the person failed tips_mounted check {cid} (they checked {hold['asked']}). "
                        f"{self._until(hold)}{' ' + doubt if doubt else ''}",
-                       "Ask the person what they see and report waiting_for='person'. Where the robot still holds "
-                       "tips, drop_tips; the person takes any others off by hand; then verify(check='tips_mounted', "
-                       "expect='none') without device again and wait for their verdict." if every else
-                       "Ask the person what they see and report waiting_for='person'. If the robot still holds tips on "
-                       "it (get_state), drop_tips, also for tips that sit crooked; if it holds none, the person takes "
-                       f"any off by hand and you verify(check='tips_mounted', device='{hold['subject']}', "
-                       "expect='none') for their verdict.")
+                       "Ask the person what they see. Where the robot still holds tips, drop_tips; the person takes "
+                       "any others off by hand; then verify(check='tips_mounted', expect='none') without device again "
+                       "and record_verdict with its ask_person." if every else
+                       "Ask the person what they see. If the robot still holds tips on it (get_state), drop_tips, also "
+                       "for tips that sit crooked; if it holds none, the person takes any off by hand and you "
+                       f"verify(check='tips_mounted', device='{hold['subject']}', expect='none'), then record_verdict "
+                       "with its ask_person.")
     for cid, hold in failed.items():
       if hold["check"] == "liquid_present" and op not in ("drop_tips", "load_layout"):
         raise LabError("check_failed",
                        f"the person failed liquid_present check {cid} (they checked {hold['asked']}). "
                        f"{self._until(hold)}",
-                       "Ask the person what they see and report waiting_for='person'. Once they have put it right, "
-                       "verify(check='liquid_present') of those targets again for their verdict, or load_layout again "
-                       "with the volumes they report.")
+                       "Ask the person what they see. Once they have put it right, verify(check='liquid_present') of "
+                       "those targets again and record_verdict with its ask_person, or load_layout again with the "
+                       "volumes they report.")
 
   def holding(self, skip: str | None = None) -> str:
     """What the person's checks hold back now, for lab_overview's next ("" when nothing); `skip`: a check named
@@ -271,8 +294,7 @@ class Verification:
         continue
       if hold["state"] == "pending":
         parts.append(f"{hold['check']} check {cid} waits for the person's verdict (they check {hold['asked']}): "
-                     f"report waiting_for='person' and wait; then record_verdict(check_id='{cid}') with their answer. "
-                     "Nothing moves before that.")
+                     f"{pass_now(cid)} Nothing moves before that.")
       else:
         parts.append(f"The person failed {hold['check']} check {cid}: {self._until(hold)}")
     return " ".join(parts) + (" " if parts else "")
@@ -417,19 +439,20 @@ class Verification:
       raise LabError("check_superseded",
                      f"check {check_id} was replaced by a new verify of the same check, so a verdict on it would change "
                      "nothing.",
-                     (f"Check {newest} waits for the person's verdict: ask" if newest in self.pending else
-                      "Run verify again and ask") + " the person about it as it is now, then record their answer for "
-                     "that check.")
+                     (f"Check {newest} waits for the person's verdict: " + pass_now(newest, "<its ask_person>")
+                      if newest in self.pending else
+                      "Run verify again, then record_verdict for that new check with its ask_person."))
     if check_id not in self.pending:
       raise LabError("unknown_check_id",
                      f"no check {check_id!r} waits for the person's verdict on this server. Simulated checks are judged by "
                      "the simulator (except a layout no reference matches), and a check made before the server restarted is gone.",
                      "Run verify again for a new check (after a restart: load_layout first); for a layout no reference "
-                     "matches, show the person the layout and record their verdict for that check.")
+                     "matches, record_verdict for the check verify gives, with its ask_person.")
     if verdict not in ("pass", "fail"):
       raise LabError("bad_verdict", "verdict must be 'pass' or 'fail'.")
     result = {**self.pending.pop(check_id), "verdict": verdict, "judged_by": "human", "note": note}
     result.pop("next", None)  # what the person was asked; the caller says what comes next
+    result.pop("ask_person", None)
     result.pop("supersedes", None)
     self._settle(check_id, verdict)
     self.runlog.record({"type": "verification", "check_id": check_id, "check": result["check"],

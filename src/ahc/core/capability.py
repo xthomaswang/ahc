@@ -98,10 +98,12 @@ class LiquidHandling:
   def _held(tip) -> float | None:
     return None if tip.tracker.is_disabled else tip.tracker.get_used_volume()
 
-  def _tip_room(self, op: str, address: str, tips: list[Any], volumes: list[float]) -> None:
+  def _tip_room(self, op: str, address: str, tips: list[Any], volumes: list[float],
+                air: list[float] | None = None) -> None:
     """Aspirate and mix: what the tips already hold plus this draw must fit them. Dispense: no more than
-    they hold. The device model checks again behind this (the STAR adds air and liquid-class volumes)."""
-    for tip, volume in zip(tips, volumes):
+    they hold. The device model checks again behind this (the STAR adds air and liquid-class volumes).
+    air: per tip, the air it holds or draws with this call (the adapter's transport_air), which takes room too."""
+    for tip, volume, drawn_air in zip(tips, volumes, air or [0.0] * len(tips)):
       held = self._held(tip)
       if op == "dispense":
         if held is not None and volume > held + 1e-6:
@@ -111,10 +113,13 @@ class LiquidHandling:
           raise LabError("exceeds_tip", f"{volume:g} uL exceeds the mounted {tip.maximal_volume:g} uL tips.",
                          "Split the transfer or mount larger tips.")
         continue
-      if (held or 0.0) + volume > tip.maximal_volume + 1e-9:
+      if (held or 0.0) + volume + drawn_air > tip.maximal_volume + 1e-9:
         already = f" on top of the {held:g} uL they hold" if held else ""
-        raise LabError("exceeds_tip", f"{volume:g} uL{already} exceeds the mounted {tip.maximal_volume:g} uL tips.",
-                       "Dispense first, split the transfer, or mount larger tips.")
+        with_air = f" and {drawn_air:g} uL of air" if drawn_air else ""
+        raise LabError("exceeds_tip",
+                       f"{volume:g} uL{with_air}{already} exceeds the mounted {tip.maximal_volume:g} uL tips.",
+                       "Dispense first, split the transfer, use a smaller air gap, or mount larger tips." if drawn_air
+                       else "Dispense first, split the transfer, or mount larger tips.")
 
   @staticmethod
   def _per_container(containers: list[Container], volumes: list[float]) -> dict[int, float]:
@@ -360,6 +365,12 @@ class LiquidHandling:
     rack = next((name for name, res in layout.labware.items() if spots and res is spots[0].parent), "tips")
     if len({id(s) for s in spots}) != given:
       raise LabError("bad_tips", f"{tips} names a tip spot twice.", "Name each tip spot once.")
+    gone = [s for s in spots if not s.has_tip()]
+    if gone:  # declared empty in the layout (tips_empty), or picked up and not returned
+      raise LabError("tip_spot_empty", f"{layout.where(gone)} holds no tip: the layout lists it as empty (tips_empty) or "
+                     "its tip was picked up and not returned.",
+                     "Name spots that hold a tip, or leave tips out for the next fresh ones. If the person finds a tip "
+                     "there, load_layout again with that spot out of tips_empty.")
     if n == 1:
       if given != 1:
         raise LabError("tip_count", f"{given} tip spots for the single-channel {address}: pass one spot, e.g. "
@@ -405,7 +416,8 @@ class LiquidHandling:
       height = self._height(comp, liquid_height, containers)
       flow = self._flow(comp, flow_rate)
       self._liquid(op, containers, vols)
-      self._tip_room(op, device, tips, vols)
+      air = self.adapter.transport_air("aspirate", comp, tips, extra) if op == "aspirate" else None
+      self._tip_room(op, device, tips, vols, air)
       draw = self._through_tips(op, comp, device, extra, containers, vols, tips)
       if op == "aspirate":  # the lowest surface: after the draw, or during a larger pre-wetting
         drawn = self._per_container(containers, [max(v, draw) for v in vols])

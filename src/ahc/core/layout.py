@@ -51,6 +51,34 @@ def deck_differences(layout: dict[str, str], reference: dict[str, str]) -> list[
   return out
 
 
+def well_runs(ids: list[str]) -> list[list[str]]:
+  """Wells or tip spots (A1, D12) as runs, in column order: runs down a column first (B1-H1), then, for what is left,
+  runs along a row (D1-D11), then singles. Each run is a range a target can name (plate:B1:H1, plate:D1:D11)."""
+  cells = {(i[0], int(i[1:])) for i in ids}
+  runs: list[list[str]] = []
+  used: set[tuple[str, int]] = set()
+  for col in sorted({c for _, c in cells}):
+    run: list[str] = []
+    for row in sorted(r for r, c in cells if c == col) + [""]:
+      if run and (not row or ROWS.index(row) != ROWS.index(run[-1]) + 1):
+        if len(run) > 1:
+          runs.append([f"{r}{col}" for r in run])
+          used.update((r, col) for r in run)
+        run = []
+      if row:
+        run.append(row)
+  left = cells - used
+  for row in sorted({r for r, _ in left}):
+    run_cols: list[int] = []
+    for col in sorted(c for r, c in left if r == row) + [0]:
+      if run_cols and (not col or col != run_cols[-1] + 1):
+        runs.append([f"{row}{c}" for c in run_cols])
+        run_cols = []
+      if col:
+        run_cols.append(col)
+  return sorted(runs, key=lambda run: (int(run[0][1:]), run[0][0]))
+
+
 def make_labware(spec: DeviceSpec, kind: str, type_name: str, name: str):
   """Create labware the description file allows for this device."""
   allowed = spec.layout.get("labware", {})
@@ -76,6 +104,8 @@ class Layout:
     self.liquids: dict[str, float] = {}
     self.picked: dict[str, list[TipSpot]] = {}  # component -> the spots its mounted tips came from
     self.returned: set[str] = set()  # spots holding a returned tip: never "next fresh" again
+    self.tip_states: dict[str, dict[str, list[str]]] = {}  # rack -> {"empty": [spot ids], "returned": [...]} as loaded
+    self.declared: dict[str, Any] | None = None  # the layout as load_layout was given it
 
   def add(self, name: str, resource: Any, type_name: str) -> None:
     if name in self.labware:
@@ -228,6 +258,37 @@ class Layout:
         container.tracker.set_volume(volume)
         self.liquids[container.name] = volume
 
+  def set_tip_states(self, empty: Any, returned: Any) -> None:
+    """The layout's tips_empty / tips_returned: spots with no tip at load (a pick-up that names none never lands on
+    them, and naming one is refused), and spots holding a tip that was returned (never the next fresh one, picked
+    only when named). Same target form as tips: 'tips:B1:H1', 'tips:col1', 'tips:A2'."""
+    spots: dict[str, list[TipSpot]] = {}
+    for key, given in (("tips_empty", empty), ("tips_returned", returned)):
+      if given is not None and not (isinstance(given, list) and all(isinstance(i, str) for i in given)):
+        raise LabError("bad_layout", f"{key} must be a list of tip targets, e.g. ['tips:B1:H1', 'tips:A2'].", TIP_FORMS)
+      try:
+        spots[key] = self.resolve_tips(given or [])
+      except LabError as exc:
+        raise LabError(exc.code, f"{key}: {exc.message}", exc.hint) from exc
+    both = {s.name for s in spots["tips_empty"]} & {s.name for s in spots["tips_returned"]}
+    if both:
+      raise LabError("bad_layout", f"{', '.join(sorted(both))} is in both tips_empty and tips_returned.",
+                     "A spot holds no tip (empty) or a returned one, not both.")
+    names = {id(res): name for name, res in self.labware.items()}
+    for key, state in (("tips_empty", "empty"), ("tips_returned", "returned")):
+      for spot in spots[key]:
+        rack = names[id(spot.parent)]
+        ids = self.tip_states.setdefault(rack, {"empty": [], "returned": []})[state]
+        identifier = spot.parent.get_child_identifier(spot)
+        if identifier in ids:
+          continue
+        ids.append(identifier)
+        if state == "empty":
+          if spot.has_tip():
+            spot.unassign_tip()
+        else:
+          self.returned.add(spot.name)
+
   # -- where the labware sits -----------------------------------------------------------------
 
   @staticmethod
@@ -271,6 +332,41 @@ class Layout:
         out[name] = {"kind": "container", "max_ul": res.max_volume}
     return out
 
+  def describe(self) -> str:
+    """The loaded deck as one sentence for the person: where each labware sits, its type and name, the starting
+    liquids in its wells (volumes per well, wells in runs like A1-H1) and the tip spots that are not fresh."""
+    parts = []
+    for name, type_name in self.types.items():
+      parent = (getattr(self, "placements", {}).get(name) or {}).get("parent") or ""
+      slot = re.search(r"slot_(\d+)$", parent)
+      site = re.fullmatch(r"(.+)-(\d+)", parent)
+      where = f"slot {slot.group(1)}" if slot else f"{site.group(1)} site {site.group(2)}" if site else parent
+      text = f"{name} ({type_name})"
+      held = self._liquids_of(name)
+      states = self.tip_states.get(name) or {}
+      used = "".join(f", {state} {', '.join(self._runs(states[state]))}" for state in ("empty", "returned")
+                     if states.get(state))
+      parts.append((f"{where}: " if where else "") + text + used + (f" holding {held}" if held else ""))
+    return "; ".join(parts)
+
+  @staticmethod
+  def _runs(wells: list[str]) -> list[str]:
+    """Wells or spots as ranges: ['B1', 'C1', 'A2'] -> ['B1-C1', 'A2'] (see well_runs)."""
+    return [run[0] if len(run) == 1 else f"{run[0]}-{run[-1]}" for run in well_runs(wells)]
+
+  def _liquids_of(self, labware: str) -> str:
+    """'A1-H1 1800 uL, A2-H2 500 uL': the starting liquids of one labware, wells grouped by volume and column."""
+    by_volume: dict[float, list[str]] = {}
+    for container, volume in self.liquids.items():
+      well = container.removeprefix(f"{labware}_well_") if container.startswith(f"{labware}_well_") else None
+      if well is not None or container == labware:
+        by_volume.setdefault(volume, []).append(well or "")
+    out = []
+    for volume, wells in by_volume.items():
+      names = self._runs([w for w in wells if w])
+      out.append((", ".join(names) + " " if names else "") + f"{volume:g} uL")
+    return ", ".join(out)
+
   def summary(self) -> dict[str, Any]:
     return {
       "kind": self.kind,
@@ -278,4 +374,6 @@ class Layout:
       "geometry": self.geometry(),
       "aliases": dict(self.aliases),
       "liquids_ul": dict(self.liquids),
+      **({"tip_states": {rack: {k: list(v) for k, v in states.items() if v} for rack, states in self.tip_states.items()}}
+         if self.tip_states else {}),
     }

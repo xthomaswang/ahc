@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from typing import Any, Callable
 
 import pylabrobot.resources as plr
@@ -53,10 +54,13 @@ class HamiltonAdapter(Adapter):
 
   def _build_deck(self, deck: Any, layout: dict[str, Any]) -> Layout:
     rules = self.spec.layout
-    if set(layout) - {"carriers", "liquids", "aliases"}:
-      raise LabError("bad_layout", f"unknown layout keys {sorted(set(layout) - {'carriers', 'liquids', 'aliases'})}.",
-                     "A Hamilton layout has carriers (type, track, sites), liquids and aliases.")
+    keys = {"carriers", "liquids", "aliases", "tips_empty", "tips_returned"}
+    if set(layout) - keys:
+      raise LabError("bad_layout", f"unknown layout keys {sorted(set(layout) - keys)}.",
+                     "A Hamilton layout has carriers (type, track, sites), liquids, aliases, and optionally "
+                     "tips_empty and tips_returned.")
     out = Layout(self.spec, kind="tracks")
+    out.declared = copy.deepcopy(layout)
     lo, hi = rules["tracks"]["min"], rules["tracks"]["max"]
     for carrier in layout.get("carriers", []):
       kind, track, name = carrier.get("type"), carrier.get("track"), carrier.get("name")
@@ -79,4 +83,5 @@ class HamiltonAdapter(Adapter):
         raise LabError("bad_track", f"carrier {name!r} on track {track}: {exc}") from exc
     out.set_aliases(layout.get("aliases") or {})
     out.set_liquids(layout.get("liquids") or {})
+    out.set_tip_states(layout.get("tips_empty"), layout.get("tips_returned"))
     return out

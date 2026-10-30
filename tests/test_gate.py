@@ -99,7 +99,7 @@ async def test_on_real_hardware_the_person_opens_the_gate(starlet, monkeypatch):
   # While the person's deck check waits, every pointer names that one check, and verify returns it again.
   again = await deck_check(starlet)
   assert again["check_id"] == second["check_id"] and again["verdict"] == "pending" and "repeat" in again
-  assert f"record_verdict(check_id='{second['check_id']}')" in await starlet.call_text("pick_up_tips", device=DEV)
+  assert f"record_verdict(check_id='{second['check_id']}', verdict='pass', note=" in await starlet.call_text("pick_up_tips", device=DEV)
   assert f"Deck check {second['check_id']} waits for the person" in (await starlet.call("lab_overview"))["next"]
   await starlet.call("load_layout", layout=STARLET_LAYOUT)  # reloading starts a new gate
   third = await deck_check(starlet)

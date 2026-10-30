@@ -29,12 +29,14 @@ import time
 import urllib.request
 import webbrowser
 from collections import Counter
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
 from ahc.core.errors import LabError
 from ahc.devices.spec import LIQUID_HANDLING_OPS
 from ahc.plan import PlanProgress
+from ahc.timing import run_timing
 from ahc.workspace import estop
 from ahc.workspace.store import Workspace, resolve_workspace
 
@@ -313,6 +315,8 @@ def replay(path: Path | None, stock: list[str] | None = None, ahc_dir: Path | No
           "workspace": header.get("workspace") or str(ahc_dir.parent), "summary": summary, "plates": plates,
           "containers": containers, "tip_racks": racks, "events": events[-200:], "gate": gate,
           "layout": layout_info, "estop": stopped,
+          # as_of: the page ticks the live clocks from it, so they never depend on the browser's time zone
+          "timing": {**run_timing(entries), "as_of": datetime.now().isoformat(timespec="milliseconds")},
           "agent": agent_view(decisions, progress, gate, ahc_dir / "agent-feed.jsonl", list(waiting.values())),
           "config": workspace_config(ahc_dir / "config.yaml")}
 
@@ -500,6 +504,15 @@ border:2px solid #fff;cursor:pointer;display:none}.stopbar.engaged .releasebtn{d
 .badge.done::before{content:"✓ ";color:var(--good)}.badge.ended::before{content:"■ ";color:var(--muted)}
 .agent .request{margin-top:6px;color:var(--ink2);font-size:13px}.agent .request .k,.agent .calling .k{color:var(--muted)}
 .agent .calling{margin-top:6px;font-size:13px}.agent .calling.denied .k{color:var(--critical);font-weight:600}
+.plan .dur{color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap}.plan li.now .dur{color:var(--ink)}
+.timesum{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
+.timesum .chip2{display:flex;gap:6px;align-items:baseline;background:var(--page);border:1px solid var(--border);
+border-radius:8px;padding:6px 10px;font-size:12px}.timesum .k{color:var(--muted)}.timesum .v{color:var(--ink);font-variant-numeric:tabular-nums}
+.timesum .fold{background:var(--page);border:1px solid var(--border);border-radius:8px;padding:6px 10px;font-size:12px}
+.timesum .fold summary{cursor:pointer;list-style:none}.timesum .fold summary::-webkit-details-marker{display:none}
+.timesum .fold summary::before{content:"▸ ";color:var(--muted)}.timesum .fold[open] summary::before{content:"▾ "}
+.timesum .fold .kv{margin:8px 0 2px}
+.clock{font-variant-numeric:tabular-nums}
 .agent .more{white-space:pre-line;color:var(--ink2);font-size:13px;line-height:1.5;max-height:12em;overflow:auto;margin-top:2px}
 .status{grid-column:1/-1;display:flex;flex-wrap:wrap;gap:8px}
 .status .chip2{display:flex;gap:6px;align-items:baseline;background:var(--surface);border:1px solid var(--border);
@@ -614,7 +627,7 @@ function timeline(evs){const ul=document.getElementById("timeline");ul.replaceCh
     if(e.status==="refused"&&e.message)li.append(el("div",{class:"msg"},e.message.replace(/^Error executing tool \w+: /,"")));
     else if(e.note)li.append(el("div",{class:"msg"},e.note));ul.append(li)})}
 
-function agentPanel(a){const box=document.getElementById("agent");box.replaceChildren();
+function agentPanel(a,tm){const box=document.getElementById("agent");box.replaceChildren();
   const head=el("div",{class:"label"});head.append(el("span",{},"Agent"));box.append(head);
   const nothing=!a||(!a.now&&!a.current&&!a.request&&!a.doing&&!(a.checks_waiting||[]).length);
   if(nothing){box.append(el("div",{class:"why"},"Nothing from the agent yet. In Claude Code the plugin shows what it is asked, says and calls as it happens; any agent can report decisions with report_decision."));return}
@@ -639,8 +652,29 @@ function agentPanel(a){const box=document.getElementById("agent");box.replaceChi
   if(a.plan&&a.plan.length){const ol=el("ol",{class:"plan"}),n=a.plan.length,st=a.steps||[];
     // Each call names its step: a step is ticked once the agent moves on, and the plan ends when it reports it done.
     const where=a.plan_done?"finished":a.current_step?`step ${a.current_step} of ${n}`:`${n} steps, not started`;
-    box.append(el("h3",{},`Plan · ${where}`+(a.plan_at?` · reported ${a.plan_at.slice(11)}`:"")));
-    a.plan.forEach((step,k)=>{const s=st[k]||"next";ol.append(el("li",{class:s},`${k+1}. ${step}`+(s==="skipped"?" · skipped":"")))});box.append(ol)}
+    const h=el("h3",{},`Plan · ${where}`+(a.plan_at?` · reported ${a.plan_at.slice(11)}`:""));
+    if(tm&&tm.run){h.append(" · run ",el("span",{class:"clock","data-clock":"run"}))}
+    box.append(h);
+    const byStep=Object.fromEntries(((tm&&tm.steps)||[]).map(x=>[x.step,x]));
+    a.plan.forEach((step,k)=>{const s=st[k]||"next",li=el("li",{class:s},`${k+1}. ${step}`+(s==="skipped"?" · skipped":""));
+      // elapsed on the step in progress (ticking), the time first call to last call on a step that is past
+      if(byStep[k+1]&&s==="now")li.append(el("span",{class:"dur","data-clock":"step:"+(k+1)}));
+      else if(byStep[k+1]&&s==="done")li.append(el("span",{class:"dur",title:"first to last call of this step"},dur(byStep[k+1].duration_s)));
+      ol.append(li)});box.append(ol);
+    if(a.plan_done&&tm&&tm.run&&tm.split){const sp=tm.split,tot=el("div",{class:"timesum"});
+      const chip=(k,v,title)=>{const c=el("span",{class:"chip2",title:title||""});c.append(el("span",{class:"k"},k),el("span",{class:"v"},v));tot.append(c)};
+      chip("Total",dur(tm.run.total_s),tm.run.start.replace("T"," ")+" to "+tm.run.end.slice(11));
+      chip("Robot",sp.robot_s===null?"not measured":dur(sp.robot_s)+(sp.robot_measured?"":" (some calls not timed)"),"Motion calls running on the device (measured)");
+      chip("Agent","~"+dur(sp.agent_s),"Estimate: the rest of the run (thinking and tool overhead)"+(sp.robot_s===null?"; includes the robot's time, which this log did not measure":""));
+      // Others: neither robot nor agent. A fold, closed until opened (it stays as left when the page redraws).
+      const fold=el("details",{class:"fold"}),sum=el("summary",{title:"Estimate: everything that is neither robot nor agent"});
+      sum.append(el("span",{class:"k"},"Others "),el("span",{class:"v"},"~"+dur(sp.others_s)));fold.append(sum);
+      const kv=el("div",{class:"kv"});
+      [["person_checks_s","Your checks, pending until your verdict"],["go_ahead_s","Go-ahead and config wait"],
+       ["estop_engaged_s","Emergency stop engaged"],["after_release_s","Recovery after a stop release"]].forEach(([k,label])=>
+        kv.append(el("span",{class:"k"},label),el("span",{},"~"+dur(sp.others[k]))));
+      fold.append(kv);fold.open=othersOpen;fold.addEventListener("toggle",()=>{othersOpen=fold.open});tot.append(fold);
+      box.append(tot)}}
   const feed=(a.stream||[]).filter(e=>e.kind!=="request").slice(0,-1).reverse().slice(0,6);
   if(feed.length){const h=el("div",{class:"history"});h.append(el("div",{},"Earlier"));
     const label={said:"said",decision:"decided",finished:"finished"};
@@ -721,6 +755,17 @@ async function pollStop(){const bar=document.getElementById("stopbar"),state=doc
   clearTimeout(pollStop.t);pollStop.t=setTimeout(pollStop,500)}
 pollStop();
 
+// Live clocks: the server says what time it was when it read the log (as_of); the page adds the time since.
+const dur=s=>{s=Math.max(0,Math.round(s));const h=Math.floor(s/3600),m=Math.floor(s%3600/60),r=s%60;
+  return h?`${h}h ${String(m).padStart(2,"0")}m ${String(r).padStart(2,"0")}s`:m?`${m}m ${String(r).padStart(2,"0")}s`:`${r}s`};
+let TIM={t:null,at:0,live:false},othersOpen=false;
+function clockOf(name){const t=TIM.t;if(!t||!t.run)return null;
+  const since=iso=>(Date.parse(t.as_of)-Date.parse(iso))/1000+(performance.now()-TIM.at)/1000;
+  if(name==="run")return TIM.live?since(t.run.start):t.run.total_s;
+  const s=(t.steps||[]).find(x=>"step:"+x.step===name);if(!s)return null;
+  return TIM.live?since(s.start):s.duration_s}
+function clocks(){document.querySelectorAll("[data-clock]").forEach(n=>{const v=clockOf(n.dataset.clock);n.textContent=v===null?"":dur(v)})}
+setInterval(clocks,1000);
 let last=null;
 function render(st){last=st;const sub=document.getElementById("sub");
   sub.textContent=st.run.run_id?`${st.run.device} · ${st.run.backend==="sim"?"simulated":st.run.backend} · run ${st.run.run_id}`
@@ -729,10 +774,12 @@ function render(st){last=st;const sub=document.getElementById("sub");
   if(!st.plates.length){const card=document.getElementById("platecard");card.replaceChildren(el("div",{class:"empty"},"No plate in the loaded layout yet."))}
   else{const p=st.plates[0];
     const cs=Object.values(p.wells).filter(d=>d.v>0&&d.c>0).map(d=>d.c);LO=Math.min(0.01,...cs);plate(p)}  // floor keeps the scale steady while a series grows
-  reservoirs(st.containers);racks(st.tip_racks);timeline(st.events);agentPanel(st.agent);statusRow(st);configCard(st)}
+  reservoirs(st.containers);racks(st.tip_racks);timeline(st.events);agentPanel(st.agent,st.timing);statusRow(st);configCard(st)}
 async function tick(){try{const r=await fetch("/state",{cache:"no-store"});if(r.status===204){document.getElementById("livetext").textContent="waiting for a run";}
-  else{const st=await r.json();const key=JSON.stringify([st.summary,st.events.length,(st.events.at(-1)||{}).i,st.agent,st.config,st.gate,st.estop]);
-    if(key!==tick.key){tick.key=key;render(st)}document.getElementById("dot").className="dot on";document.getElementById("livetext").textContent="live"}}
+  else{const st=await r.json();const tm=st.timing||{};
+    TIM={t:tm,at:performance.now(),live:!!tm.run&&!tm.run.done&&["working","waiting"].includes((st.agent||{}).state)};
+    const key=JSON.stringify([st.summary,st.events.length,(st.events.at(-1)||{}).i,st.agent,st.config,st.gate,st.estop,tm.steps,tm.split,tm.run&&tm.run.done]);
+    if(key!==tick.key){tick.key=key;render(st)}clocks();document.getElementById("dot").className="dot on";document.getElementById("livetext").textContent="live"}}
   catch(e){document.getElementById("dot").className="dot";document.getElementById("livetext").textContent="disconnected"}
   setTimeout(tick,500)}
 tick();
@@ -846,7 +893,8 @@ def serve(ws: Workspace, log: Path | Callable[[], Path | None] | None, port: int
   bound = httpd.server_address[1]
   hosts.update({f"127.0.0.1:{bound}", f"localhost:{bound}"})
   own_origins.update({f"http://127.0.0.1:{bound}", f"http://localhost:{bound}"})
-  threading.Thread(target=httpd.serve_forever, daemon=True).start()
+  httpd.thread = threading.Thread(target=httpd.serve_forever, daemon=True)  # for whoever shuts it down to join
+  httpd.thread.start()
   if open_browser:
     webbrowser.open(f"http://127.0.0.1:{bound}/")
   return httpd

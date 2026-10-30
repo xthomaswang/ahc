@@ -269,6 +269,48 @@ async def test_task_limits_the_person_added_stay(tmp_path, fake_robot):
   assert "volume_ul max 200" in ask.asked[0]
 
 
+def write_config(folder: Path, bot, mounts: dict) -> None:
+  """A config the person has not confirmed yet, for the fake robot with the mounts it carries. Written by hand:
+  configure_devices refuses a robot whose pipettes differ from the description file (mount_mismatch)."""
+  path = folder / ".ahc" / "config.yaml"
+  path.parent.mkdir(parents=True, exist_ok=True)
+  path.write_text(yaml.safe_dump({"devices": [{"id": "ot2", "model": "opentrons.ot2", "backend": "robot",
+                                               "options": {"host": "127.0.0.1", "port": bot.port,
+                                                           "robot_name": bot.name, "mounts": mounts}}]}))
+
+
+MOUNTS_WITHOUT_8_CHANNEL = {"left": "p300_single_gen2", "right": "p1000_single_gen2"}
+
+
+async def test_a_tips_stage_stops_before_the_robot_homes_on_another_pipette(tmp_path, fake_robot):
+  fake_robot.pipettes["right"] = {"name": "p1000_single_gen2", "model": "p1000_single_v2.0", "id": "R2"}
+  write_config(tmp_path, fake_robot, MOUNTS_WITHOUT_8_CHANNEL)
+  ask, lines = person(), []
+  code = await smoke(tmp_path, "tips", None, fake_robot.port, ask, out=lines.append, scripted=True)
+  text = "\n".join(lines)
+  assert code == 1 and "STOPPED" in text, text
+  assert "stage tips is written for a P300 8-channel on the right mount; this robot carries left p300_single_gen2, " \
+         "right p1000_single_gen2. Run --stage connect or --stage init" in text, text
+  assert len(ask.asked) == 1 and HOMING not in ask.asked  # only the config the person confirmed
+  assert posts(fake_robot) == []  # no run, no home: nothing reached the robot
+  assert not any(e.get("op") == "load_layout" for e in entries(tmp_path))
+
+
+async def test_the_connect_stage_passes_on_another_pipette(tmp_path, fake_robot):
+  fake_robot.pipettes["right"] = {"name": "p1000_single_gen2", "model": "p1000_single_v2.0", "id": "R2"}
+  write_config(tmp_path, fake_robot, MOUNTS_WITHOUT_8_CHANNEL)
+  ask, lines = person(), []
+  assert await smoke(tmp_path, "connect", None, fake_robot.port, ask, out=lines.append, scripted=True) == 0, lines
+  assert len(ask.asked) == 1 and ask.asked[0].startswith("Confirm this robot") and posts(fake_robot) == []
+
+
+async def test_configure_prints_what_each_mount_carries(tmp_path, fake_robot):
+  lines = []
+  assert await smoke(tmp_path, "connect", "127.0.0.1", fake_robot.port, person(), out=lines.append, scripted=True) == 0
+  text = "\n".join(lines)
+  assert "left  p20_single_gen2" in text and "right p300_multi_gen2" in text and "expects" not in text
+
+
 class _Client:
   """An MCP client stand-in: canned results per tool, and the calls made."""
 

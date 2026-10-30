@@ -10,7 +10,7 @@ written, before the server itself writes anything. Only tool names are recorded 
 AHC's, so shell commands and file contents never land in the feed.
 
 A call made while the folder's emergency stop is engaged is recorded as denied, not as being called:
-the stop hook (estop-guard.sh) refuses it, by the same reading of .ahc/estop.json. Parallel tool calls
+the stop hook (estop-guard.sh) refuses it (all but a capture, open_dashboard and the ToolSearch that loads them), by the same reading of .ahc/estop.json. Parallel tool calls
 run this at once; the feed is locked while one of them reads what it holds and appends, and every call
 carries its tool_use_id, so nothing is written twice.
 
@@ -28,6 +28,7 @@ import time
 from pathlib import Path
 
 AHC_TOOL = "mcp__plugin_ahc_ahc__"
+RUN_WHILE_STOPPED = (AHC_TOOL + "capture", AHC_TOOL + "open_dashboard", "ToolSearch")  # what estop-guard.sh lets through a stop
 TAIL_BYTES = 400_000
 FEED_TAIL_BYTES = 2_000_000
 TEXT_LIMIT = 600
@@ -193,7 +194,7 @@ def main() -> None:
     return  # AHC's own data folder (AHC_HOME), not a task's: a session in the home folder is no AHC task
   if not ahc_dir.is_dir() and not tool.startswith(AHC_TOOL):
     return  # not an AHC task (yet): nothing to watch
-  stopped = event == "pre" and estop_engaged(ahc_dir)
+  stopped = event == "pre" and tool not in RUN_WHILE_STOPPED and estop_engaged(ahc_dir)
   ahc_dir.mkdir(exist_ok=True)  # the first AHC call: the dashboard can show the agent from here on
   with open(feed, "a+b") as f:
     _lock(f)

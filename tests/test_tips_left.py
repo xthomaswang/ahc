@@ -146,8 +146,9 @@ async def test_tips_a_killed_server_left_on_hold_back_the_next_run(tmp_path, ope
     assert "picked up in a run that never dropped them: its server was killed or crashed" in text  # why
     assert note["at"].replace("T", " ") in text  # when
     hint = text.partition("Hint:")[2]
-    assert "Tell the person exactly that" in hint and "remove any tips by hand (or confirm there are none)" in hint
-    assert f"call {ASK_THE_PERSON} and wait for their verdict" in hint
+    assert "Tell the person exactly that" in hint and "remove any tips by hand (or there are none)" in hint
+    assert f"Then call {ASK_THE_PERSON} and record_verdict for it with its ask_person right away" in hint
+    assert "hands and deck are clear" in hint  # the dialog before load_layout carries the homing go-ahead
   assert posts(fake_robot).count("/runs") == runs  # no new run
 
 
@@ -232,7 +233,7 @@ async def test_the_person_clears_them_with_one_check_of_every_pipette(tmp_path, 
     assert check["verdict"] == "pending" and check["judged_by"] == "human (placeholder)"
     twin = check["evidence"]["digital_twin"]
     assert twin["pipettes"] == {"ot2.right": "unknown", "ot2.left": "unknown"} and twin["as_expected"] is None
-    assert f"checks every pipette ({DEV}, ot2.left)" in check["next"] and "8 on ot2.right" in check["next"]
+    assert f"checks every pipette (ot2.left, {DEV})" in check["next"] and "8 on ot2.right" in check["next"]
     failed = await lab.call("record_verdict", check_id=check["check_id"], verdict="fail")  # tips are still on
     assert "they remove them by hand" in failed["next"] and "again without device" in failed["next"]
     assert ws.tips_left() is not None

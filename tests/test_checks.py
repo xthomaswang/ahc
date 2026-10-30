@@ -74,8 +74,18 @@ async def test_on_real_hardware_the_person_is_asked_about_the_check_at_hand(star
   assert tips["next"].startswith("The person on site checks starlet.pip: no tip on any channel.")
   liquid = await starlet.call("verify", check="liquid_present", targets=["diluent"], min_volume_ul=50)
   assert liquid["next"].startswith("The person on site checks that each container of diluent holds at least 50 uL.")
-  assert all("never decide it yourself" in c["next"] for c in (deck, tips, liquid))
-  answered = await starlet.call("record_verdict", check_id=liquid["check_id"], verdict="fail")
-  assert answered["next"].startswith("The person found liquid_present not as expected: stop, ask them")
+  for check in (deck, tips, liquid):  # the next call is the person's dialog, made right away
+    assert f"call record_verdict(check_id='{check['check_id']}', verdict='pass', note=<ask_person>) now" in check["next"]
+    assert "never approve for them" in check["next"]
+    assert "If they deny it, stop, ask what they see and record_verdict(verdict='fail')" in check["next"]
+    assert "ask in chat first" in check["next"]  # a client without a dialog
+  assert tips["ask_person"] == "No tip on starlet.pip."
+  assert liquid["ask_person"] == "Each container of diluent holds at least 50 uL."
+  assert deck["ask_person"].startswith("The deck matches the loaded layout: tip_car site 0: tips (hamilton_96_tiprack_300uL_filter)")
+  assert "trough_car site 0: diluent_trough (Hamilton_1_trough_200ml_Vb) holding 100000 uL" in deck["ask_person"]
+  assert deck["ask_person"].endswith("no tips on either pipette.")
+  answered = await starlet.call("record_verdict", check_id=liquid["check_id"], verdict="fail", note="the trough is empty")
+  assert "ask_person" not in answered
+  assert answered["next"].startswith("The person found liquid_present not as expected: stop and go on only as they say")
   answered = await starlet.call("record_verdict", check_id=tips["check_id"], verdict="pass")
   assert "no tip on any channel" not in answered["next"]  # what comes next, not what the person was asked

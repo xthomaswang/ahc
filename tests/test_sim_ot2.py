@@ -1,5 +1,6 @@
 """ahc-sim ot2: one base install for all tasks, one simulator instance per task folder."""
 
+import json
 import os
 import socket
 import subprocess
@@ -78,6 +79,57 @@ def test_each_task_gets_its_own_instance_and_port(home, tmp_path):
     _, _, _, port_b = ot2.prepare_instance(b, base)
   assert port_b != port_a and ot2.read_settings(b)["port"] == port_b
   assert ot2.workspace_options(b) == {"host": "127.0.0.1", "port": port_b}
+
+
+def prepared(tmp_path, config: str | dict | None = None) -> tuple[Workspace, dict]:
+  """A task folder with this config (text, or entries for the first OT-2 device), its simulator prepared;
+  returns the folder and the pipette file the simulator will read."""
+  base = ot2.setup(fake_checkout(tmp_path / "checkout"), out=lambda _: None)
+  ws = Workspace(tmp_path / "task")
+  ws.root.mkdir()
+  if isinstance(config, dict):
+    entry = {"id": "ot2", "model": "opentrons.ot2", **config}
+    config = yaml.safe_dump({"devices": [entry]})
+  if config is not None:
+    ws.dir.mkdir()
+    ws.config_path.write_text(config)
+  ot2.prepare_instance(ws, base)
+  return ws, json.loads((ot2.instance_dir(ws) / "sim_ot2.json").read_text())
+
+
+def test_the_simulator_carries_the_mounts_the_config_names(home, tmp_path):
+  ws, pipettes = prepared(tmp_path, {"backend": "sim", "options": {"mounts": {"left": "p300_single_gen2",
+                                                                              "right": "p1000_single_gen2"}}})
+  assert pipettes["attached_instruments"] == {"left": {"model": "p300_single_v2.1", "id": "sim-left"},
+                                              "right": {"model": "p1000_single_v2.2", "id": "sim-right"}}
+  assert ot2.read_settings(ws)["mounts"] == {"left": "p300_single_gen2", "right": "p1000_single_gen2"}
+
+
+def test_the_mounts_of_a_robot_entry_are_simulated_too(home, tmp_path):
+  _, pipettes = prepared(tmp_path, {"backend": "robot", "options": {
+    "host": "192.0.2.10", "mounts": {"left": "p20_multi_gen2", "right": None}}})
+  assert pipettes["attached_instruments"] == {"left": {"model": "p20_multi_v2.1", "id": "sim-left"}}  # empty: left out
+
+
+def test_without_mounts_the_simulator_carries_the_default_pair(home, tmp_path):
+  default = {"left": {"model": "p20_single_v2.2", "id": "sim-left"}, "right": {"model": "p300_multi_v2.1", "id": "sim-right"}}
+  for config in (None, {"backend": "sim"}, "devices: [this is not a config"):
+    assert prepared(tmp_path / str(hash(str(config))), config)[1]["attached_instruments"] == default
+
+
+def test_a_broken_config_is_not_rewritten_and_the_next_start_follows_the_fixed_one(home, tmp_path):
+  ws, _ = prepared(tmp_path, "devices: [this is not a config")
+  assert ws.config_path.read_text() == "devices: [this is not a config"
+  ws.config_path.write_text(yaml.safe_dump({"devices": [{"id": "ot2", "model": "opentrons.ot2", "backend": "sim",
+                                                         "options": {"mounts": {"right": "p300_single_gen2"}}}]}))
+  ot2.prepare_instance(ws, ot2.installed_base())
+  pipettes = json.loads((ot2.instance_dir(ws) / "sim_ot2.json").read_text())
+  assert pipettes["attached_instruments"] == {"right": {"model": "p300_single_v2.1", "id": "sim-right"}}
+
+
+def test_a_pipette_without_a_simulator_model_is_named(home, tmp_path):
+  with pytest.raises(ot2.SimError, match="p50_single_gen2"):
+    prepared(tmp_path, {"backend": "sim", "options": {"mounts": {"left": "p50_single_gen2"}}})
 
 
 def test_the_same_task_twice_is_refused(home, tmp_path, monkeypatch):

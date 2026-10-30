@@ -346,3 +346,15 @@ async def test_ahc_estop_says_whether_a_server_took_the_stop(tmp_path, open_lab)
     assert "Acknowledged by the AHC server" in out.stdout, out.stdout
     status = json.loads(_cli("--status", "--workspace", str(task)).stdout)
   assert status["engaged"] and status["folder"] == str(task) and status["acknowledged"]["at"]
+
+
+@pytest.mark.parametrize("tool,runs", [("mcp__plugin_ahc_ahc__capture", True), ("mcp__plugin_ahc_ahc__open_dashboard", True), ("ToolSearch", True),
+                                       ("mcp__plugin_ahc_ahc__aspirate", False), ("Bash", False), (None, False)])
+def test_a_capture_still_runs_while_the_stop_is_engaged(tmp_path, tool, runs):
+  ws = Workspace(tmp_path)
+  estop.engage(ws, by="test")
+  stdin = json.dumps({"hook_event_name": "PreToolUse", "tool_name": tool}) if tool else ""
+  hook = run_hook("estop-guard.sh", stdin=stdin, CLAUDE_PROJECT_DIR=str(tmp_path))
+  assert hook.returncode == 0, hook.stderr
+  assert (hook.stdout == "") is runs  # the cameras record the deck; anything else is denied and ends the turn
+

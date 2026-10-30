@@ -65,6 +65,10 @@ Carriers sit on tracks 1–30. A layout lists carriers with their track and the 
 site, for example a `TIP_CAR_480_A00` on track 1 holding a tip rack at site 0. Plates go on a
 `PLT_CAR_L5AC_A00`, troughs on a `Trough_CAR_4R200_A00`.
 
+A rack that is not full: the optional layout keys `tips_empty` and `tips_returned` list tip spots
+without a tip and spots holding a used tip (`tips_empty: ["tips:A1:H1"]`); see `last_deck` in
+`find_layout_references` for continuing from the last run's deck.
+
 ## Liquid handling
 
 - `volumes` are per target; one number is broadcast to every target.

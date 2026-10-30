@@ -19,7 +19,8 @@ they edited is shown and confirmed as it is. A limit that would refuse a stage's
 stage before the robot homes, not half-way through it. Every stage is a new server session, which
 moves nothing before the person's go-ahead: asked at the terminal (confirming the config gives it).
 Tips an earlier stage left on the pipettes, which the robot forgot, hold the next run back until the
-person says at the terminal that both pipettes are empty.
+person says at the terminal that both pipettes are empty. The stages from tips on need a P300 8-channel on the
+right mount: with another pipette there, they stop before the robot homes.
 
 Rehearse first against an OT-2 simulator: `ahc-sim ot2` in some folder, then in the task folder
 `ahc-smoke --host 127.0.0.1 --port <the simulator's port> --stage dilution`.
@@ -45,6 +46,8 @@ from ahc.workspace.estop import running_agent
 
 STAGES = ["connect", "init", "tips", "water", "dilution"]
 DEV = "ot2.right"  # the 8-channel P300; the left P20 is not used here
+DEV_PIPETTE = "p300_multi_gen2"  # what DEV's tips and wells are written for: an 8-channel on the right mount
+DEFAULT_MOUNTS = {"left": "p20_single_gen2", "right": "p300_multi_gen2"}  # a config without options.mounts
 
 LAYOUT = {
   "slots": {"1": {"name": "tips", "type": "opentrons_96_tiprack_300ul"},
@@ -76,8 +79,6 @@ TIP_COLUMNS = {"connect": [], "init": [], "tips": [1], "water": [1, 2], "dilutio
 PLATE_COLUMNS = {"connect": [], "init": [], "tips": [], "water": [12], "dilution": [1, 2, 3]}
 
 HOMING = "The robot homes now: pipettes rise and the gantry moves. Hands out and deck set? [yes/no] "
-
-EXPECTED_PIPETTES = {"right": "p300_multi_gen2", "left": "p20_single_gen2"}
 
 
 class Refused(Exception):
@@ -281,9 +282,8 @@ class Smoke:
       raise Stop(f"no robot-server at {host}:{port} ({exc}). Is the robot on, and on this network?") from exc
     self.out(f"robot      {health.get('name')} at {host}:{port} · serial {health.get('robot_serial')} · "
              f"software {health.get('api_version')} · firmware {health.get('fw_version')}")
-    for mount, expected in EXPECTED_PIPETTES.items():
-      flag = "" if mounts.get(mount) == expected else f"   <- the description file expects {expected}"
-      self.out(f"           {mount:<5} {mounts.get(mount)}{flag}")
+    for mount in ("left", "right"):
+      self.out(f"           {mount:<5} {mounts.get(mount) or 'empty'}")
     written = await self.call("configure_devices", devices=[{"id": "ot2", "model": "opentrons.ot2", "backend": "robot",
                                                              "options": {"host": host, "port": port,
                                                                          "robot_name": health.get("name")}}],
@@ -391,6 +391,13 @@ async def run_stage(lab: Smoke, stage: str, host: str | None, port: int) -> None
   if stage == "connect":
     lab.out(f"           next: {overview['next']}")
     return
+  if STAGES.index(stage) >= STAGES.index("tips"):  # before anything moves: the pipette these stages are written for
+    options = (overview["config"].get("devices") or [{}])[0].get("options") or {}
+    mounts = options.get("mounts") or DEFAULT_MOUNTS
+    if mounts.get("right") != DEV_PIPETTE:
+      carried = ", ".join(f"{mount} {mounts.get(mount) or 'empty'}" for mount in ("left", "right"))
+      raise Stop(f"stage {stage} is written for a P300 8-channel on the right mount; this robot carries {carried}. "
+                 "Run --stage connect or --stage init; an agent drives other pipettes.")
   await lab.check_limits(stage)  # a task limit that refuses this stage does so now, before the robot homes
   await lab.go_ahead(stage)
 

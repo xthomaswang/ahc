@@ -75,7 +75,11 @@ budgets:
    writes your choice with `configure_devices`, and you confirm it (see
    [Simulation or a real robot](#simulation-or-a-real-robot)).
 3. `find_layout_references` looks for protocols and earlier layouts in this folder: put plate maps,
-   volume tables and protocol notes in `.ahc/protocols/`.
+   volume tables and protocol notes in `.ahc/protocols/`. It also returns `last_deck`, the deck the
+   last run ended with (volumes, used tip spots) as a layout, so the next run continues from it
+   instead of the agent writing that state by hand. You confirm it at the deck check as any layout
+   (`ask_person` lists the volumes and the empty and returned tip spots); with a top camera
+   configured, `capture` can show you the plate there.
 4. The agent reports its plan as concrete steps. The server refuses `load_layout` and every action
    until then; after that, every call names its plan step and the dashboard ticks each step as the
    agent moves on.
@@ -84,16 +88,17 @@ budgets:
    placement (the labware type at each position, carriers included) matches none of the folder's
    layouts, such as a first run from the built-in example or a changed deck. The folder's layouts
    are those saved in `.ahc/layouts/` and those whose deck check passed in an earlier run; protocol
-   files guide a layout but are never matched. The agent shows you the layout (it is on the
-   dashboard too) and what differs from the closest earlier one, and waits; answer in the chat, and
-   the agent records your answer with `record_verdict`, a call Claude Code always asks you to
-   approve. Once confirmed, the layout is saved, and later layouts with the same placement are
+   files guide a layout but are never matched. The agent calls `record_verdict` with a note listing
+   the labware, positions and liquids (it is on the dashboard too), and Claude Code shows you the
+   approval dialog with what differs from the closest earlier layout: your approval is the
+   confirmation, a denial is not (the agent then asks what you see and records a fail with your
+   words). Once confirmed, the layout is saved, and later layouts with the same placement are
    checked by the simulator. Labware names, liquids and volumes do not count, and a saved layout
    loaded by name never needs you.
 6. Liquid handling. Targets name wells, ranges, columns (`plate:col2`, A2 to H2) and rows
    (`plate:rowB`, B1 to B12), and every result says where it went (`plate: column 2 (A2-H2)`).
 7. `verify(check="volumes_match", expected={...})` compares the final volumes the plan expects with
-   the digital twin; then `report_decision(plan_done=true)` with the result.
+   the digital twin; then `report_decision(plan_done=true)` with the result. That report and `get_run` return `timing` (run total, per-step durations, robot / agent / others split, where others is waiting for the person plus stops and their recovery; the agent and others parts are estimates), and the dashboard shows it live.
 
 The task folder then holds:
 
@@ -103,6 +108,7 @@ The task folder then holds:
 .ahc/protocols/       protocols you put here for the agent to consult
 .ahc/runs/            run logs
 .ahc/sim/             this task's OT-2 simulator
+.ahc/state/deck.json  the twin's deck after the last call that changed it (volumes, tip spots, unknown wells)
 .ahc/tips-left.json   on a real robot: tips that may still be on the pipettes
 ```
 
@@ -111,9 +117,10 @@ The task folder then holds:
 The server follows the task folder's config. Without one nothing moves: the agent asks the person
 whether to simulate or use a real robot, and which device, writes the choice with
 `configure_devices` and shows them `config.confirm_summary`, one line naming the device, where a
-real one is and the task limits. When the person says so, the agent calls `confirm_config` with that
-summary; Claude Code asks the person to approve the call and shows it, and a summary that no longer
-matches the config is refused. Only then can anything move. Task limits in the config tighten the
+real one is, what each OT-2 mount carries and the task limits. The agent then calls `confirm_config`
+with that summary right away; Claude Code asks the person to approve the call and shows it. Their
+approval is the confirmation (a denial is not), and a summary that no longer matches the config is
+refused. Only then can anything move. Task limits in the config tighten the
 device's limits (for example `starlet.pip: {volume_ul: {max: 200}}`) and can never loosen them.
 
 Where it is needed, the person also gives each server session a go-ahead before anything moves:
@@ -139,6 +146,10 @@ another model), a robot the config names is simulated on this task's simulator i
 go-ahead is needed. Without it, `claude -p` moves nothing in a folder that needs the go-ahead:
 Claude Code refuses `confirm_config` where nobody can answer.
 
+In a client that shows no approval dialog on each call, the agent asks in chat first and calls the
+tool with what you said; AHC cannot tell the difference, so such a client's own approval settings
+are all that stand between the agent and those calls.
+
 ## Commands for the person
 
 Besides the MCP server, AHC has commands a person runs at a terminal: `ahc-dashboard`, `ahc-estop`,
@@ -147,6 +158,9 @@ Besides the MCP server, AHC has commands a person runs at a terminal: `ahc-dashb
 from a clone as `uv run --project <clone> <command>`, or without either as
 `uvx --from git+https://github.com/xthomaswang/ahc <command>`. The server's hints give the absolute
 path of the plugin's `ahc-sim`; the other commands sit in the same folder.
+
+The dashboard needs no command: the agent calls the `open_dashboard` tool, which serves it from the MCP
+server (port 8770, or the next free one on 127.0.0.1) and opens it in your browser. It ends with the server.
 
 ## The OT-2 simulator
 
@@ -159,6 +173,11 @@ ahc-sim ot2 --setup             # install once
 ahc-sim ot2                     # in the task folder: run this task's simulator (keeps running)
 ahc-sim ot2 --status
 ```
+
+The simulator starts with the default pair (a P300 8-channel on `ot2.right`, a P20 single channel on
+`ot2.left`) unless the config's `options.mounts` names other pipettes. To rehearse with the robot's
+pipettes, copy its `options.mounts` into the `sim` entry; `ahc-sim ot2` gives the simulator those
+pipettes each time it starts, so restart it after changing them.
 
 ## A real OT-2 (bring-up)
 
@@ -174,17 +193,27 @@ devices:
     options: {host: 192.168.1.20, port: 31950, robot_name: <the name /health reports>}
 ```
 
-Before writing it, `configure_devices` reads the robot's name and pipettes (no run, no motion) and
-fills in `robot_name`. It refuses other pipettes (`mount_mismatch`), and an entry that already
-names a robot when another one answers (`wrong_robot`); the person sees that identity before they
-confirm. With `robot_name` set, the server refuses any other robot at that address.
+The agent can look for the robot with the `find_robots` tool (an mDNS browse, then a `GET /health` on
+each candidate; read-only, and the only way an agent without a shell looks): you say which robot the
+task uses.
+
+Before writing the config, `configure_devices` reads the robot's name and what each mount carries (no run, no
+motion) and fills in `options.robot_name` and `options.mounts`. A mount with a pipette AHC does not
+describe stays unused; a robot with none AHC drives is refused (`no_usable_pipette`), as is an entry
+that names a robot when another one answers (`wrong_robot`). The person sees that identity and the
+mounts before they confirm. With `robot_name`
+set, the server refuses any other robot at that address. If the robot's pipettes change after the
+person confirmed, `load_layout` is refused (`mount_mismatch`): write the config again with
+`configure_devices` and have the person confirm it.
 
 On a real robot:
 
 - Every server session starts with the person's go-ahead (see
   [Simulation or a real robot](#simulation-or-a-real-robot)).
 - `load_layout` starts a new run and homes the robot, before the deck check: the person keeps hands
-  and the deck clear.
+  and the deck clear. It has no dialog of its own, so the agent says in chat, in the same message
+  before the dialog right ahead of it (the tips note or `confirm_config`), that approving also means
+  hands and deck are clear and the robot homes next; with no such dialog it asks in chat.
 - A new run does not know the tips an earlier run left on the pipettes, and its first pick-up would
   drive them into a rack. So AHC notes the tips in `.ahc/tips-left.json` from each pick-up until
   they are dropped, and after a stop or an unknown outcome (the note outlives a crash), and
@@ -194,11 +223,17 @@ On a real robot:
   their verdict on one check for both pipettes, `verify(check="tips_mounted", expect="none")`
   without a device. Their pass clears the note.
 - Every deck check, tip check and liquid check waits for the person's verdict, and nothing moves
-  while a tip or liquid check waits (`check_pending`). After the person fails a tip check, only
-  `drop_tips` moves until the tips are dropped or a later tip check on that pipette passes; after a
-  failed liquid check, only `drop_tips` and `load_layout` move until a later check of those wells
-  passes or a new layout is loaded (`check_failed`). `volumes_match` is the exception: it compares
-  the expected volumes with the digital twin, which holds what was sent, not what was measured.
+  while a tip or liquid check waits (`check_pending`). `verify` returns `ask_person` with it, one
+  sentence of what the person confirms (each slot's labware and liquids; "No tip on either pipette
+  (ot2.left, ot2.right)"; "8 tips seated straight on ot2.right"; the wells and minimum volume), and
+  the agent passes it as the note of `record_verdict(verdict="pass")`. Claude Code's approval
+  dialog for that call is the question: approving passes the check, denying does not. After a
+  denial the agent stops, asks what you see and records a fail with your words, which asks you
+  again. After the person fails a tip check, only `drop_tips` moves until the tips are dropped or a
+  later tip check on that pipette passes; after a failed liquid check, only `drop_tips` and
+  `load_layout` move until a later check of those wells passes or a new layout is loaded
+  (`check_failed`). `volumes_match` is the exception: it compares the expected volumes with the
+  digital twin, which holds what was sent, not what was measured.
 - An omitted liquid height is the description file's default, 1 mm above the cavity bottom on the
   OT-2, and every result records the height used. An aspirate or mix that would leave the tips above
   the liquid is refused.
@@ -237,7 +272,9 @@ The deck: slot 1 an Opentrons 300 uL tip rack, slot 2 a Corning 2 mL deep-well p
 column 1 and water in column 2 (about 1 mL per well), slot 3 an empty Corning 360 uL flat-bottom
 plate, and the trash in slot 12. Each stage prints which tip columns must be full and which plate
 columns empty. Rehearse against a simulator first: run `ahc-sim ot2` in another folder, then
-`ahc-smoke --host 127.0.0.1 --port <its port> --stage dilution` in the task folder.
+`ahc-smoke --host 127.0.0.1 --port <its port> --stage dilution` in the task folder. The connect and
+init stages work with any pipettes. The tips, water and dilution stages are written for a P300
+8-channel on the right mount; on a robot with other pipettes they stop before anything moves.
 
 ### An agent on the real OT-2
 
@@ -258,22 +295,64 @@ claude --permission-mode default --disallowedTools Bash WebFetch
   `"mcp__*"`, which removes AHC's own tools too.
 - The agent never runs `ahc-smoke`, `ahc-estop` or `ahc-sim` itself; you run them at a terminal.
 
-The agent writes the robot you name with `configure_devices` and asks you to confirm it. In every
-later session (also after `--resume` or a `/mcp` reconnect) it shows you the summary again before
-anything moves, and your approval of `confirm_config` is that session's go-ahead. Claude Code asks
-you to approve `confirm_config` and `record_verdict` on every call, in every permission mode and
-despite allow rules; without a person to answer, as in `claude -p`, it refuses them, so a headless
-session moves nothing on the robot. Every deck, tip and liquid check then waits for your verdict.
+The agent writes the robot you name with `configure_devices` and calls `confirm_config` at once. In
+every later session (also after `--resume` or a `/mcp` reconnect) it calls it again before anything
+moves, and your approval of it is that session's go-ahead. Claude Code asks you to approve
+`confirm_config` and `record_verdict` on every call, in every permission mode and despite allow
+rules: that dialog is the confirmation, so the agent does not wait for you to type "confirm" first,
+and each deck, tip and liquid check reaches you as a `record_verdict` dialog whose note says what you
+confirm. Deny it and the check is not passed. Without a person to answer, as in `claude -p`, Claude
+Code refuses them, so a headless session moves nothing on the robot.
 Run the `ahc-smoke` stages first, so the robot, the deck and your checks are known to work before an
 agent chooses the calls. Other MCP clients reach the robot the same way: `ahc-mcp` without
 `--backend sim`, or with `--backend config`.
 
+## Cameras (opt-in)
+
+A task can declare cameras in `.ahc/config.yaml`; with none declared nothing of this is active. They are
+part of the config the person confirms (a change sends it back to pending):
+
+```yaml
+cameras:
+  - {name: top, device: "USB Camera"}       # name: lowercase id; device: the exact macOS camera name
+  - {name: side, device: "Intel(R) RealSense(TM) Depth Camera 435 with RGB Module RGB"}
+```
+
+The agent writes them with `configure_devices(cameras=[...])` (omitted: the config's cameras stay; `[]`
+removes them) after the person says which camera is which. Each name is checked against the AVFoundation
+devices (`ffmpeg -f avfoundation -list_devices true -i ""`): `camera_not_found` lists the available ones,
+and without macOS or ffmpeg (`brew install ffmpeg`) it is `camera_unavailable`.
+
+The agent decides when to look: `capture(label, plan_step=None, cameras=None, final=False)` takes one
+frame from each named camera (all when omitted), one after another, and returns the images inline (at
+most 1280 px wide) with their paths. Full-size JPEGs stay next to the run log:
+
+```
+.ahc/runs/<run id>.jsonl
+.ahc/runs/<run id>/0_preset/                  before any plan step
+.ahc/runs/<run id>/<k>_<step text>/           plan step k
+.ahc/runs/<run id>/<N+1>_results/             final=true, N = the plan's step count
+    <camera>_<HHMMSS>.jpg, captures.jsonl     one line per image: time, camera, device, file, label, plan_step, final
+```
+
+`verify(..., images=[paths from capture])` keeps photos as the check's `evidence.camera`, also listed by
+`list_checks` and in the run log. Nothing changes about who judges: on real hardware the person still
+records the verdict. Notes:
+
+- Captures are refused in simulation (`camera_not_in_simulation`): a camera shows the real deck.
+- A capture is no motion, so it still runs while the emergency stop is engaged: the Claude Code hook
+  (`hooks/estop-guard.sh`) lets `capture` (and the ToolSearch that loads it) through and denies every
+  other call, which ends the agent's turn.
+- Images stay on this computer, unmasked and never uploaded by AHC; the client shows them to its model.
+- macOS asks once whether the terminal (or Claude Code) may use the camera.
+
 ## Dashboard and demo
 
-Run these in a task folder (see [Commands for the person](#commands-for-the-person)):
+The agent opens the dashboard itself with `open_dashboard` (its URL is in `lab_overview.dashboard`).
+To run it, or the demo, by hand, use a task folder (see [Commands for the person](#commands-for-the-person)):
 
 ```bash
-ahc-dashboard                                   # follows this folder's newest active run log
+uv run --project <repo> ahc-dashboard           # follows this folder's newest active run log
 ahc-demo --backend sim                          # paced serial dilution, 3D view and dashboard
 ahc-demo --backend sim --device opentrons.ot2   # needs this folder's OT-2 simulator running
 ```
@@ -305,9 +384,10 @@ recorded, never shell commands or file contents. `AHC_FEED=0 claude` turns this 
 
 ## Emergency stop
 
-Press the red button on the dashboard, or run `ahc-estop` in the task folder (`ahc-estop --workspace
-<folder>` from anywhere; `lab_overview` names the folder of the server the agent uses). `ahc-estop`
-says whether a server took the stop and what the device reported.
+Press the red button on the dashboard (the agent opens it with `open_dashboard`), or run
+`uv run --project <repo> ahc-estop` in the task folder (add `--workspace <folder>` from anywhere;
+`lab_overview.emergency_stop.how` has the exact command and the folder of the server the agent uses).
+`ahc-estop` says whether a server took the stop and what the device reported.
 
 - The server sends the device nothing more and refuses every action, configuration change and check
   until a person releases it; reading state and `report_decision` still work. In Claude Code the
@@ -325,7 +405,8 @@ says whether a server took the stop and what the device reported.
   the wells.
 - On the simulated STARlet the stop ends the call in the simulator.
 
-Releasing is the person's: the dashboard's Release, after a confirmation, or `ahc-estop --release`
+Releasing is the person's: the dashboard's Release, after a confirmation, or
+`uv run --project <repo> ahc-estop --release`
 at a terminal, which refuses to run under an agent (`CLAUDECODE` or `AI_AGENT` set) or without a
 terminal. Only a release of the stop the server holds clears it: if the stop file is replaced by a
 release of another stop, the server writes its stop back and the person releases once more. After a
@@ -346,7 +427,8 @@ uvx --from git+https://github.com/xthomaswang/ahc ahc-mcp --backend sim
 `--backend sim` forces simulation; without it the server follows the folder's config, as the
 plugin's does. `confirm_config` and `record_verdict` carry a flag that makes Claude Code ask the
 person on every call. Other clients ignore it: only their own approval settings stand between the
-agent and those two calls, the session's go-ahead included.
+agent and those two calls, the session's go-ahead included. AHC's instructions tell the agent to ask
+in chat first in a client that shows no such dialog.
 
 ## Development
 

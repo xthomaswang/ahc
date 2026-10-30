@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ahc.core.errors import LabError
+from ahc.verification.ask import pass_now
 
 STATES = {"pass": "passed", "fail": "failed", "pending": "pending"}
 
@@ -56,14 +57,16 @@ class Gate:
       raise LabError("gate_failed", "the last deck check failed: the deck does not match the loaded layout, so nothing may move.",
                      "The person on site fixes the deck, then verify(check='deck_matches_layout') again, or load a corrected layout.")
     check = self.waiting_for_person()
-    waiting = (f"Deck check {check} waits for the person's verdict: show them the deck and wait for their answer, then "
-               f"record_verdict(check_id='{check}') with it." if check else None)
+    waiting = (f"Deck check {check} waits for the person's verdict: {pass_now(check, '<ask_person from verify>')}"
+               if check else None)
     if self.needs_person:
       raise LabError("gate_pending", "the person has not confirmed this layout yet, so nothing may move. "
                      + (self.differs or "No layout saved or run in this task folder to compare it with."),
-                     waiting or "verify(check='deck_matches_layout') asks for their verdict; show them the layout and wait for it.")
+                     waiting or "verify(check='deck_matches_layout') gives ask_person for the person; then record_verdict "
+                     "for that check right away.")
     raise LabError("gate_pending", "the deck has not been confirmed against the loaded layout, so nothing may move.",
-                   waiting or "Call verify(check='deck_matches_layout'); on real hardware the person on site records the verdict.")
+                   waiting or "Call verify(check='deck_matches_layout'); on real hardware it gives ask_person, and you "
+                   "record_verdict for that check right away.")
 
   def apply(self, check_id: str, verdict: str) -> None:
     self.state, self.check_id = STATES[verdict], check_id

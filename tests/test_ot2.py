@@ -36,7 +36,7 @@ async def test_eight_channel_constraints(ot2):
   assert await ot2.refused("aspirate", device=DEV, targets=["diluent"], volumes=100,
                            specialized={"jet": True}) == "unknown_param"
   params = await ot2.call("get_params", device=DEV, op="aspirate")
-  assert params["specialized"] == {} and "every channel moves the same volume" in params["constraints"]
+  assert set(params["specialized"]) == {"air_gap_ul"} and "every channel moves the same volume" in params["constraints"]
 
 
 async def test_layout_refusals(ot2):

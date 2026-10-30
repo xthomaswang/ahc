@@ -62,7 +62,8 @@ def apply_limits(spec: DeviceSpec, limits: dict[str, Any]) -> DeviceSpec:
     if prefix != spec.prefix or name not in components:
       known = ", ".join(f"{spec.prefix}.{c}" for c in components)
       raise _refuse("config_invalid", f"limits: {address!r} is not a component of this task's device.",
-                    f"Components: {known}.")
+                    f"Components: {known}." + (" A mount that is empty, or carries a pipette AHC does not drive, has none."
+                                               if spec.mounted else ""))
     if not isinstance(params, dict):
       raise _refuse("config_invalid", f"limits.{address} must map parameters to bounds.", "Write e.g. volume_ul: {max: 200}.")
     comp = components[name]

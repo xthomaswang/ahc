@@ -5,6 +5,8 @@
     .ahc/protocols/    protocols the agent consults when writing a layout
     .ahc/runs/         run logs
     .ahc/sim/          this task's simulator settings and state
+    .ahc/state/deck.json  the digital twin's deck after the last call that changed it (volumes, tip spots, tips
+                          on the pipettes, what is unknown): find_layout_references offers it as the last deck
     .ahc/tips-left.json  the tips a real robot's run holds or may hold (from each pick-up, a stop, an unknown
                          outcome, a tips check the person failed, the server ending): the robot forgets them once
                          that run stops
@@ -167,6 +169,30 @@ class Workspace:
 
   def clear_tips_left(self) -> None:
     self.tips_left_path.unlink(missing_ok=True)
+
+  # -- the deck the last run left ---------------------------------------------------------------
+
+  @property
+  def deck_path(self) -> Path:
+    return self.dir / "state" / "deck.json"
+
+  def write_deck(self, deck: dict[str, Any]) -> bool:
+    """The twin's deck state, never half written. Not rewritten when only its time changed. False: nothing written."""
+    old = self.read_deck()
+    if old is not None and {k: v for k, v in old.items() if k != "at"} == {k: v for k, v in deck.items() if k != "at"}:
+      return False
+    self.require_task_folder()
+    self.deck_path.parent.mkdir(parents=True, exist_ok=True)
+    write_atomic(self.deck_path, json.dumps(deck, indent=2) + "\n")
+    return True
+
+  def read_deck(self) -> dict[str, Any] | None:
+    """The saved deck state, or None when there is none or it cannot be read."""
+    try:
+      deck = json.loads(self.deck_path.read_text())
+    except (OSError, ValueError):
+      return None
+    return deck if isinstance(deck, dict) and isinstance(deck.get("layout"), dict) else None
 
   # -- the folder's record ------------------------------------------------------------------------
 

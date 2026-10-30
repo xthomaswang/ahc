@@ -12,6 +12,7 @@ import pytest
 from ahc.core.errors import LabError
 from ahc.devices.opentrons.ot2 import OT2Adapter
 from ahc.examples import OT2_LAYOUT
+from ahc.server import REPO
 from ahc.workspace import Config, DeviceEntry, Workspace
 from ahc.workspace.config import HEADER
 from conftest import OT2_HOST, OT2_PORT, load_verified, robot_server_up
@@ -209,7 +210,8 @@ async def test_configure_devices_reads_the_robot_before_the_person_confirms(tmp_
     config, identity = written["config"], written["device_identity"]
     assert config["status"] == "pending" and config["devices"][0]["options"]["robot_name"] == "fake-ot2"
     assert identity["robot_serial"] == "OT2FAKE" and identity["pipettes"]["right"]["name"] == "p300_multi_gen2"
-    assert config["confirm_summary"] == f"ot2 = opentrons.ot2, backend robot, robot 'fake-ot2' at 127.0.0.1:{fake_robot.port}; task limits: none"
+    assert config["confirm_summary"] == f"ot2 = opentrons.ot2, backend robot, robot 'fake-ot2' at 127.0.0.1:{fake_robot.port}, mounts left p20_single_gen2, right p300_multi_gen2; task limits: none"
+    assert config["devices"][0]["options"]["mounts"] == {"left": "p20_single_gen2", "right": "p300_multi_gen2"}
     assert "identity" in written["next"] and "confirm_summary" in written["next"]
     assert requests(fake_robot) == [("GET", "/health"), ("GET", "/instruments")]  # read-only: no run, no motion
     confirmed = await lab.call("confirm_config", summary=config["confirm_summary"])
@@ -222,15 +224,16 @@ async def test_configure_devices_reads_the_robot_before_the_person_confirms(tmp_
   assert [m for m, _ in requests(fake_robot)].count("POST") == 0  # confirming moves nothing either
 
 
-async def test_configure_devices_refuses_another_robot_and_other_pipettes(tmp_path, open_lab, fake_robot, monkeypatch):
+async def test_configure_devices_refuses_another_robot_and_mounts_it_does_not_carry(tmp_path, open_lab, fake_robot, monkeypatch):
   stub_probe(monkeypatch)
   async with open_lab(tmp_path, backend=None) as lab:
     text = await lab.call_text("configure_devices", devices=robot(host="127.0.0.1", port=fake_robot.port,
                                                                   robot_name="lab-ot2-7"))
     assert "[wrong_robot]" in text and "'fake-ot2', not 'lab-ot2-7'" in text
-    stub_probe(monkeypatch, mounts={"ok": False, "problems": ["right mount has p20_single_gen2, expected p300_multi_gen2"]})
-    text = await lab.call_text("configure_devices", devices=robot(host="127.0.0.1", port=fake_robot.port))
-    assert "[mount_mismatch]" in text and "p20_single_gen2" in text and "nothing was written" in text
+    text = await lab.call_text("configure_devices", devices=robot(host="127.0.0.1", port=fake_robot.port,
+                                                                  mounts={"left": "p20_single_gen2", "right": "p1000_single_gen2"}))
+    assert "[mount_mismatch]" in text and "p300_multi_gen2" in text and "nothing was written" in text
+    assert "Leave mounts out" in text
     closed = socket.socket()
     closed.bind(("127.0.0.1", 0))
     port = closed.getsockname()[1]
@@ -258,28 +261,43 @@ async def test_only_a_server_that_may_drive_a_robot_carries_its_rules(tmp_path, 
   async with open_lab(tmp_path, backend=None) as lab:
     real = lab.client.instructions
   assert "Real hardware" not in forced and "forces simulation" in forced
-  assert len(real) < 3800 and real.startswith(forced.split("\nConfig:")[0])
-  for text in (forced, real):  # the person's tools, called only with what the person said
-    assert "Call confirm_config or record_verdict only when the person says so, with what they said; never on your own." in text
-    assert "Never call confirm_config" not in text
-  for rule in ("never guess, scan or discover", "homes it",
+  assert len(real) < 5000 and real.startswith(forced.split("\nConfig:")[0])
+  for text in (forced, real):  # the person's tools: their approval in the client's dialog is the confirmation
+    assert "their approval in the client's dialog is the confirmation, so call them right away; do not wait for a typed answer" in text
+    assert "record_verdict(check_id, verdict='pass', note=<ask_person>)" in text and "confirm_config(summary=config.confirm_summary)" in text
+    assert ("Denied means not confirmed: stop, ask the person what they see, record_verdict(verdict='fail') "
+            "with their words as the note.") in text  # after a denial
+    assert "Never approve for them or invent their words." in text
+    assert "A client with no approval dialog on each call: ask in chat first." in text  # the fallback
+    assert "only when the person says so" not in text and "wait for their verdict" not in text
+  for rule in ("find_robots or ask the person for its address", "never probe addresses yourself", "homes the robot: hands and deck must be clear",
+               "say in chat, in the same message before that call, that approving also means hands and deck are clear "
+               "and the robot homes next. With no such dialog, ask in chat.",
+               "it returns pending with ask_person; report waiting_for='person', then record_verdict right away",
                "Every verify on real hardware waits for the person, except volumes_match (the digital twin's answer)",
                "never retry a motion call", "removes any tips",
                "- Never reach the robot except through these tools: no curl or other HTTP to it, no ahc-smoke; only the "
                "person releases a stop (never ahc-estop --release).",
-               "plate:col2 then plate:col3, one pass each", "confirm_config(summary=config.confirm_summary)",
+               "plate:col2 then plate:col3, one pass each", "call confirm_config(summary=config.confirm_summary) right away",
                "With no config, ask the person whether to simulate or use a real robot",
-               "Each new server session also waits for their go-ahead", "(lab_overview.session)"):
+               "Each new server session also needs their go-ahead", "(lab_overview.session)"):
     assert rule in real, rule
   assert "AHC_PLUGIN_BACKEND" not in real + forced
   async with open_lab(tmp_path, backend=None) as lab:
     tools = {t.name: t for t in (await lab.client.list_tools()).tools}
   assert "starts a new run and homes the robot" in tools["load_layout"].description
   assert "on real hardware every check but volumes_match" in tools["record_verdict"].description
+  for name in ("record_verdict", "confirm_config"):  # the tool descriptions say the same as the instructions
+    description = tools[name].description
+    assert "in the client's dialog" in description and "ask in chat first" in description, name
+    assert "Never approve it for them" in description, name
+  assert "verdict='pass' and note=verify's ask_person" in tools["record_verdict"].description
+  assert "then record verdict='fail' with their words as the note" in tools["record_verdict"].description
+  assert "pending with ask_person" in tools["verify"].description
   for tool in ("aspirate", "dispense", "mix"):
     schema = json.dumps(tools[tool].input_schema)
     assert "plate:col2 then plate:col3" in schema
-    assert "A head whose channels move together (ot2.right) serves one full column per call, top to bottom." in schema
+    assert "A head whose channels move together (an 8-channel mount) serves one full column per call, top to bottom; a single-channel mount serves one well per call." in schema
 
 
 # -- layouts, deck checks and tips on real hardware --------------------------------------------------
@@ -330,15 +348,15 @@ async def test_lab_overview_says_how_to_stop_this_server(tmp_path, open_lab, mon
   monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(tmp_path))
   async with open_lab(tmp_path, "sim") as lab:
     overview = await lab.call("lab_overview")
-  assert f"ahc-dashboard started in {root}" in overview["emergency_stop"]["how"]
-  assert f"ahc-estop --workspace {root}" in overview["emergency_stop"]["how"] and "warning" not in overview
+  assert "the stop button on the dashboard (open_dashboard opens it)" in overview["emergency_stop"]["how"]
+  assert f"uv run --project {REPO} ahc-estop --workspace {root}" in overview["emergency_stop"]["how"] and "warning" not in overview
   assert "power switch" not in overview["emergency_stop"]["how"]  # a simulator stops at once
   elsewhere = tmp_path / "elsewhere"
   elsewhere.mkdir()
   monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(elsewhere))  # Claude Code started in another folder
   async with open_lab(tmp_path, "sim") as lab:
     warning = (await lab.call("lab_overview"))["warning"]
-  assert str(elsewhere) in warning and f"ahc-estop --workspace {root}" in warning
+  assert str(elsewhere) in warning and f"ahc-estop --workspace {root}" in warning and "open_dashboard" in warning
 
 
 async def test_on_a_real_robot_the_stop_says_what_it_cannot_do(tmp_path, open_lab, fake_robot):
@@ -355,5 +373,6 @@ def test_the_robot_backend_says_how_another_robot_is_refused():
   robot = load_device("opentrons.ot2").backends["robot"]
   assert robot == ("A real OT-2: its own robot-server on the lab network, over the same HTTP API. Set options.host "
                    "(options.port if not 31950) in the config; configure_devices reads the robot's name into "
-                   "options.robot_name, which confirm_config requires (robot_name_required), so another robot is "
-                   "refused. The person confirms it.")
+                   "options.robot_name and its pipettes into options.mounts, and confirm_config requires the name "
+                   "(robot_name_required), so another robot is refused. The person confirms the robot and its "
+                   "mounts together.")

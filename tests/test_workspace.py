@@ -62,7 +62,7 @@ async def test_forced_simulation_writes_its_config_on_first_use(tmp_path, open_l
     await lab.call("load_layout", layout=STARLET_LAYOUT)
     config = config_of(tmp_path)
     assert config["devices"] == STARLET_SIM and config["confirmation"]["by"] == "simulation"
-    assert sorted(p.name for p in (tmp_path / ".ahc").iterdir()) == ["config.yaml", "layouts", "protocols", "runs", "sim"]
+    assert sorted(p.name for p in (tmp_path / ".ahc").iterdir()) == ["config.yaml", "layouts", "protocols", "runs", "sim", "state"]
     assert (await lab.call("lab_overview"))["config"]["status"] == "confirmed"
   assert run_entries(tmp_path)[0]["workspace"] == str(tmp_path.resolve())
 
@@ -253,7 +253,7 @@ async def test_reading_a_hand_edited_folder_writes_no_run_log(tmp_path, open_lab
     assert not (tmp_path / ".ahc" / "runs").exists()
     await lab.call("report_decision", decision="Ask the person to confirm the edited limits", waiting_for="person")
   entries = run_entries(tmp_path)
-  assert [e.get("type") for e in entries] == ["run", "audit", "agent"]
+  assert [e.get("type") for e in entries] == ["run", "audit", "wait", "agent"]  # wait: this session awaits the go-ahead
   assert entries[1]["event"] == "config_edited_outside_server"
 
 

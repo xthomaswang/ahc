@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
@@ -122,12 +123,17 @@ def read_identity(host: str, port: int, timeout: float) -> dict[str, Any]:
 class OpentronsAdapter(Adapter):
   """What Opentrons robots share: numbered deck slots and the robot-server HTTP API."""
 
-  OPTIONS = {"sim": frozenset(), "robot": frozenset({"host", "port", "robot_name"})}
-  _EXPECTED: dict[str, tuple[str, int]] = {}  # mount -> (pipette name, channels) the description file expects
+  OPTIONS = {"sim": frozenset({"mounts"}), "robot": frozenset({"host", "port", "robot_name", "mounts"})}
 
   @classmethod
   def check_options(cls, backend: str, options: dict[str, Any]) -> None:
     super().check_options(backend, options)
+    mounts = options.get("mounts")
+    if "mounts" in options and not (isinstance(mounts, dict) and set(mounts) <= set(MOUNTS)
+                                    and all(v is None or isinstance(v, str) for v in mounts.values())):
+      raise LabError("bad_option", f"options.mounts {mounts!r} is not a map from mounts to pipette names.",
+                     f"Write e.g. {{left: p300_single_gen2, right: null}} (null: empty); mounts: {', '.join(MOUNTS)}. "
+                     "configure_devices reads them from the robot: leave mounts out and it fills them.")
     if backend == "sim":
       return
     host = options.get("host")
@@ -154,19 +160,21 @@ class OpentronsAdapter(Adapter):
             for slot, item in (slots.items() if isinstance(slots, dict) else [])}
 
   @classmethod
-  def check_mounts(cls, pipettes: dict[str, Any]) -> dict[str, Any]:
-    """Each mount against the description file: {"ok", "problems"}."""
+  def check_mounts(cls, pipettes: dict[str, Any], expected: dict[str, str | None]) -> dict[str, Any]:
+    """What each mount carries against the confirmed config's mounts (a spec's `mounted`: every mount, empty and
+    not-driven included): {"ok", "problems"}."""
     problems = []
-    for mount, (name, _channels) in cls._EXPECTED.items():
+    for mount, name in expected.items():
       found = (pipettes.get(mount) or {}).get("name")
       if found != name:
-        problems.append(f"{mount} mount has {found!r}, the description file expects {name!r}" if found else
-                        f"{mount} mount is empty, the description file expects {name!r}")
+        problems.append(f"{mount} mount has {found!r}, the confirmed config names {name!r}" if found and name else
+                        f"{mount} mount has {found!r}, the confirmed config names it empty" if found else
+                        f"{mount} mount is empty, the confirmed config names {name!r}")
     return {"ok": not problems, "problems": problems}
 
   @classmethod
   def probe_identity(cls, backend: str, options: dict[str, Any]) -> dict[str, Any]:
-    """Who answers at a robot entry's address: /health and the mounts, read-only (no run, no motion)."""
+    """Who answers at a robot entry's address: /health and the pipettes, read-only (no run, no motion)."""
     if backend == "sim":
       return {}
     host, port = options.get("host"), int(options.get("port") or 31950)
@@ -176,7 +184,9 @@ class OpentronsAdapter(Adapter):
       raise LabError("backend_unreachable", f"no robot-server answers at {host}:{port} ({exc}).",
                      "Check that the robot is on and on this network, and its address. A robot that is off "
                      "cannot be checked: write the config once it answers.") from exc
-    out["mounts"] = cls.check_mounts(out["pipettes"])
+    given = options.get("mounts")  # only an entry that already names its mounts is checked against them
+    if given is not None:
+      out["mounts"] = cls.check_mounts(out["pipettes"], {m: given.get(m) for m in MOUNTS})
     return out
 
   async def start(self) -> None:
@@ -214,16 +224,17 @@ class OpentronsAdapter(Adapter):
   def identity(self) -> dict[str, Any]:
     """The robot's name, serial and software from /health, and what each mount carries. Blocking."""
     out = read_identity(self.host, self.port, timeout=10)
-    out["mounts"] = self.check_mounts(out["pipettes"])
+    out["mounts"] = self.check_mounts(out["pipettes"], self.spec.mounted)
     return out
 
   def _build_deck(self, deck: OTDeck, layout: dict[str, Any]) -> Layout:
     rules = self.spec.layout
-    extra = set(layout) - {"slots", "liquids", "aliases"}
+    extra = set(layout) - {"slots", "liquids", "aliases", "tips_empty", "tips_returned"}
     if extra:
       raise LabError("bad_layout", f"unknown layout keys {sorted(extra)}.",
-                     "An Opentrons layout has slots, liquids and aliases.")
+                     "An Opentrons layout has slots, liquids, aliases, and optionally tips_empty and tips_returned.")
     out = Layout(self.spec, kind="slots")
+    out.declared = copy.deepcopy(layout)
     lo, hi = rules["slots"]["min"], rules["slots"]["max"]
     for slot, item in (layout.get("slots") or {}).items():
       if not str(slot).isdigit() or not lo <= int(slot) <= hi:
@@ -233,4 +244,5 @@ class OpentronsAdapter(Adapter):
       out.add(item["name"], resource, item["type"])
     out.set_aliases(layout.get("aliases") or {})
     out.set_liquids(layout.get("liquids") or {})
+    out.set_tip_states(layout.get("tips_empty"), layout.get("tips_returned"))
     return out

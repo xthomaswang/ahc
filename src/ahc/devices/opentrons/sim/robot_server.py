@@ -18,13 +18,13 @@ import sys
 import time
 import urllib.request
 from dataclasses import dataclass
-from importlib import resources
 from pathlib import Path
 from typing import Any, Callable
 
 import yaml
 
 from ahc.core.errors import LabError
+from ahc.devices.spec import device_spec, load_device
 from ahc.workspace.store import Workspace, ahc_home, write_atomic
 
 REPO = "https://github.com/Opentrons/opentrons-ot2.git"
@@ -36,6 +36,11 @@ PYTHON = "3.10"  # what OT-2 software runs on; uv downloads it if needed
 SIZE = "about 45 MB of git data and 100 MB of Python packages, about 270 MB on disk (measured 2026-10-01)"
 PORTS = range(31950, 32000)
 HOST = "127.0.0.1"
+MODEL = "opentrons.ot2"
+# The simulator's own model for each pipette name ot2.md describes (the simulator's attached_instruments).
+SIM_MODELS = {"p20_single_gen2": "p20_single_v2.2", "p20_multi_gen2": "p20_multi_v2.1",
+              "p300_single_gen2": "p300_single_v2.1", "p300_multi_gen2": "p300_multi_v2.1",
+              "p1000_single_gen2": "p1000_single_v2.2"}
 
 
 class SimError(Exception):
@@ -223,14 +228,43 @@ def base_versions(ws: Workspace) -> dict[str, str]:
   return {"opentrons-ot2": commit} if commit else {}
 
 
+def configured_mounts(ws: Workspace) -> dict[str, str | None]:
+  """What the simulator carries: the mounts of the task config's first OT-2 entry, whatever its backend, else
+  the description file's default pair. A config that cannot be read means the default, and is never rewritten."""
+  from ahc.workspace.config import parse_config  # late: config imports the device registry
+
+  try:
+    text = ws.read_config_text()
+    entry = next((e for e in parse_config(text).devices if e.model == MODEL), None) if text else None
+    if entry is not None and entry.options.get("mounts") is not None:
+      return dict(device_spec(MODEL, entry.options).mounted)
+  except (LabError, ValueError, TypeError, AttributeError, OSError):
+    pass
+  return dict(load_device(MODEL).mounted)
+
+
+def attached_instruments(mounts: dict[str, str | None]) -> dict[str, Any]:
+  """The simulator's attached_instruments for these mounts; an empty mount is left out."""
+  out = {}
+  for mount, name in mounts.items():
+    if name is None:
+      continue
+    if name not in SIM_MODELS:
+      raise SimError(f"the simulator has no model for the pipette {name!r} on the {mount} mount. Simulated pipettes: "
+                     f"{', '.join(SIM_MODELS)}. Change options.mounts in this task's config with configure_devices.")
+    out[mount] = {"model": SIM_MODELS[name], "id": f"sim-{mount}"}
+  return out
+
+
 def prepare_instance(ws: Workspace, base: Base) -> tuple[list[str], dict[str, str], Path, int]:
   """Write this task's simulator settings and return how to launch it: (argv, env, cwd, port)."""
   ws.ensure()
   d = instance_dir(ws)
   (d / "state").mkdir(parents=True, exist_ok=True)
   config = d / "sim_ot2.json"
-  if not config.is_file():
-    config.write_text(resources.files("ahc.devices.opentrons.sim").joinpath("sim_ot2.json").read_text())
+  mounts = configured_mounts(ws)  # every start: the config may have named other pipettes since the last
+  attached = attached_instruments(mounts)
+  config.write_text(json.dumps({"attached_instruments": attached, "attached_modules": {}}, indent=2) + "\n")
   port = choose_port(ws)
   env = {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV"}
   env.update({"ENABLE_VIRTUAL_SMOOTHIE": "true",
@@ -241,7 +275,7 @@ def prepare_instance(ws: Workspace, base: Base) -> tuple[list[str], dict[str, st
               "DEV_ROBOT_NAME": robot_name(ws)})
   argv = [str(base.robot_server / ".venv" / "bin" / "uvicorn"), "robot_server.app:app",
           "--host", HOST, "--port", str(port), "--ws", "wsproto"]
-  settings = {"port": port, "robot_name": robot_name(ws), "pipettes": str(config), "state": str(d / "state"),
+  settings = {"port": port, "robot_name": robot_name(ws), "pipettes": str(config), "mounts": mounts, "state": str(d / "state"),
               "opentrons_config": str(d / "opentrons"),
               "base": {"robot_server": str(base.robot_server), "commit": base.commit},
               "started_at": time.strftime("%Y-%m-%dT%H:%M:%S")}

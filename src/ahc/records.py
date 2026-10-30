@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from ahc.devices.spec import LIQUID_HANDLING_OPS
+from ahc.timing import run_timing
 
 
 def _sh(cmd: list[str]) -> str:
@@ -87,6 +88,7 @@ class RunLog:
     self.backend = backend
     self.extra = extra or {}
     self.entries: list[dict[str, Any]] = []
+    self.written: list[dict[str, Any]] = []  # the same entries as written, with their `t`, for the timing
     self.started = False
 
   def _start(self) -> None:
@@ -98,7 +100,9 @@ class RunLog:
   def _write(self, entry: dict[str, Any]) -> None:
     """Append one entry. The folder is made again if someone removed it; if the file still cannot be
     written (a full disk), the entry goes to stderr, so a log failure never hides what happened."""
-    line = json.dumps({"t": time.strftime("%Y-%m-%dT%H:%M:%S"), **entry}, default=str) + "\n"
+    stamped = {"t": time.strftime("%Y-%m-%dT%H:%M:%S"), **entry}
+    self.written.append(stamped)
+    line = json.dumps(stamped, default=str) + "\n"
     try:
       self.runs_dir.mkdir(parents=True, exist_ok=True)
       with self.path.open("a") as f:
@@ -133,4 +137,5 @@ class RunLog:
       "commands_sent": sum(e.get("commands", 0) for e in calls if e["status"] == "ok"),
       "verifications": [{k: e[k] for k in ("check", "verdict", "judged_by")}
                         for e in self.entries if e.get("type") == "verification"],
+      "timing": run_timing(self.written),
     }

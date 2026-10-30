@@ -1,0 +1,25 @@
+# Tools that run while an AHC emergency stop is engaged: everything else is denied, and the denial ends the turn.
+# Read by hooks/estop-guard.sh and hooks/agent_feed.py (one name per line, exact; blank lines and # lines are ignored).
+# Allowed: what lets the agent look and tell the person the state. Nothing that can act, write, fetch or work around the stop.
+Read
+Grep
+Glob
+ToolSearch
+TodoWrite
+SendMessage
+ListAgents
+# AHC, read-only. capture is no motion: the cameras still record the deck. open_dashboard serves the stop button's page.
+mcp__plugin_ahc_ahc__lab_overview
+mcp__plugin_ahc_ahc__get_state
+mcp__plugin_ahc_ahc__get_run
+mcp__plugin_ahc_ahc__list_checks
+mcp__plugin_ahc_ahc__describe_device
+mcp__plugin_ahc_ahc__get_params
+mcp__plugin_ahc_ahc__find_layout_references
+mcp__plugin_ahc_ahc__find_robots
+mcp__plugin_ahc_ahc__capture
+# physical_world_context captures (and measures coverage) but moves nothing. map_camera, propose_verdict and agent_verdict are not here.
+mcp__plugin_ahc_ahc__physical_world_context
+mcp__plugin_ahc_ahc__open_dashboard
+# The agent reports waiting_for='person' after a stop.
+mcp__plugin_ahc_ahc__report_decision

@@ -7,6 +7,10 @@
     .ahc/sim/          this task's simulator settings and state
     .ahc/state/deck.json  the digital twin's deck after the last call that changed it (volumes, tip spots, tips
                           on the pipettes, what is unknown): find_layout_references offers it as the last deck
+    .ahc/cameras/<name>/reference.jpg  a camera's reference image for its slot map (candidate.jpg: the last
+                          map_camera capture, until boxes are written for it)
+    .ahc/state/physical_world.json the last physical_world_context (sources, points, confidence), for the dashboard
+    .ahc/state/vision_record.json  how often the agent's image judgments agreed with the person's verdicts
     .ahc/tips-left.json  the tips a real robot's run holds or may hold (from each pick-up, a stop, an unknown
                          outcome, a tips check the person failed, the server ending): the robot forgets them once
                          that run stops
@@ -80,6 +84,14 @@ class Workspace:
   @property
   def sim_dir(self) -> Path:
     return self.dir / "sim"
+
+  @property
+  def cameras_dir(self) -> Path:
+    return self.dir / "cameras"
+
+  @property
+  def state_dir(self) -> Path:
+    return self.dir / "state"
 
   def require_task_folder(self) -> None:
     """Refuse to write where this folder's .ahc is AHC's own data folder: in the home folder, ~/.ahc

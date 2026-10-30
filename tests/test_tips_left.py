@@ -41,6 +41,7 @@ def killed(lab) -> None:
     pass
 
   lab.server.lab.shutdown = nothing
+  lab.server.lab.release_robot()  # the process is gone, and its lock with it (flock)
 
 
 async def until(condition, seconds: float = 5.0):
@@ -158,8 +159,9 @@ async def test_tips_of_another_session_on_this_folder_are_never_said_to_be_left_
     await first.call("pick_up_tips", device=DEV)
     async with open_lab(tmp_path, backend=None) as second:  # a second agent session in the same folder
       await go_ahead(second)
-      text = await second.call_text("load_layout", layout=OT2_LAYOUT)
-  assert "[tips_unconfirmed]" in text and "ended without dropping them" not in text  # its server may well be alive
+      assert await second.refused("load_layout", layout=OT2_LAYOUT) == "robot_in_use"  # the first still drives the robot
+      text = (await second.call("lab_overview"))["next"]
+  assert "Tips may still be on the pipettes" in text and "ended without dropping them" not in text  # its server may well be alive
   assert "unless another agent session open on this folder still holds them (then that one drops them first)" in text
 
 

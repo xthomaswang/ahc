@@ -127,6 +127,7 @@ def run_timing(entries: list[dict[str, Any]]) -> dict[str, Any]:
   steps: dict[int, dict[str, Any]] = {}
   check_step: dict[Any, int] = {}  # a check's step, so its verdict (which names none) counts for that step
   waiting: dict[Any, datetime] = {}  # a check pending: since when
+  counted: set[Any] = set()  # checks counted once, however often the log mentions them
   go_ahead: datetime | None = None
   stopped: dict[Any, datetime] = {}  # emergency stops engaged: since when, by stop id
   others: dict[str, list[tuple[datetime, datetime]]] = {k: [] for k in OTHERS}
@@ -163,10 +164,17 @@ def run_timing(entries: list[dict[str, Any]]) -> dict[str, Any]:
     if kind == "verification":
       check_id, verdict = e.get("check_id"), e.get("verdict")
       if verdict == "pending":
-        waiting[check_id] = span[1]  # the person is asked once verify has answered
-        counts["checks"] += 1
+        if e.get("auto"):  # the agent judges it from camera images: no person's time (one it waited on so far ends)
+          if check_id in waiting:
+            since = waiting.pop(check_id)
+            others["person_checks_s"].append((since, max(span[0], since)))
+        else:
+          waiting[check_id] = span[1]  # the person is asked once verify has answered
+        if check_id not in counted:  # the same check is logged again when auto starts or ends for it
+          counted.add(check_id)
+          counts["checks"] += 1
         if step is not None:
-          check_step[check_id] = step
+          check_step.setdefault(check_id, step)
       else:
         if step is None:
           step = check_step.get(check_id)

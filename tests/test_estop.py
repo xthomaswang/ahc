@@ -14,10 +14,11 @@ from pathlib import Path
 import anyio
 import pytest
 
-from ahc.examples import STARLET_LAYOUT
+from ahc.examples import OT2_LAYOUT, STARLET_LAYOUT
 from ahc.workspace import estop
 from ahc.workspace.store import Workspace
-from conftest import load_verified
+from ackenv import ROBOT, dead_pid, put_ack
+from conftest import load_verified, robot_lab
 from hookenv import HOOKS, run_hook
 
 pytestmark = pytest.mark.anyio
@@ -285,76 +286,273 @@ def _run_log(ws: Workspace, *entries: dict) -> Path:
   return log
 
 
-def test_whether_a_server_took_the_stop_comes_from_its_run_log(tmp_path):
+async def until(condition, seconds: float = 10.0):
+  with anyio.fail_after(seconds):
+    while not condition():
+      await anyio.sleep(0.05)
+
+
+def acks_of(ws: Workspace, pressed: dict) -> dict[str, dict]:
+  """The acknowledgements of this press by server."""
+  return {a["server"]: a for a in estop.acknowledgements(ws, pressed)}
+
+
+def answered(ws: Workspace, pressed: dict, n: int):
+  return lambda: len(acks := estop.acknowledgements(ws, pressed)) == n and all(a["halt"] != "pending" for a in acks)
+
+
+def test_an_ack_counts_only_for_the_press_it_answers(tmp_path):
   ws = Workspace(tmp_path)
   pressed = estop.engage(ws, by="dashboard")
-  assert estop.acknowledgement(ws, pressed) is None  # no run log: no server took it
-  _run_log(ws, {"type": "estop", "state": "engaged", "id": "another", "t": "2026-10-22T10:00:01"})
-  assert estop.acknowledgement(ws, pressed) is None  # another stop
-  _run_log(ws, {"type": "estop", "state": "engaged", "id": pressed["id"], "t": "2026-10-22T10:00:02"})
-  ack = estop.acknowledgement(ws, pressed)
-  assert ack["at"] == "2026-10-22T10:00:02" and ack["halt"] is None
-  _run_log(ws, {"type": "estop", "state": "engaged", "id": pressed["id"], "t": "2026-10-22T10:00:02"},
-           {"type": "audit", "event": "device_halt_failed", "detail": "timeout"})
-  assert estop.acknowledgement(ws, pressed)["halt"] == "failed"  # the outcome that matters most is shown
-
-
-def test_a_run_log_entry_without_an_id_is_matched_by_when_and_who(tmp_path):
-  ws = Workspace(tmp_path)
-  pressed = estop.engage(ws, by="terminal")
-  _run_log(ws, {"type": "estop", "state": "engaged", "by": "terminal", "at": "1999-01-01T00:00:00"})
-  assert estop.acknowledgement(ws, pressed) is None
-  _run_log(ws, {"type": "estop", "state": "engaged", "by": "terminal", "at": pressed["at"], "t": pressed["at"]},
-           {"type": "audit", "event": "device_halted", "detail": "the device stopped its run"})
-  assert estop.acknowledgement(ws, pressed)["halt"] == "halted"
+  assert estop.acknowledgements(ws, pressed) == []  # no server wrote one
+  put_ack(ws, {**pressed, "id": "another"}, os.getpid(), "stopped", ROBOT)
+  put_ack(ws, {**pressed, "at": "1999-01-01T00:00:00"}, os.getpid(), "stopped", ROBOT, server="old001")  # the same stop file, pressed earlier
+  assert estop.acknowledgements(ws, pressed) == []
+  estop.acks_dir(ws, pressed["id"]).joinpath("junk.json").write_text("{not json")
+  put_ack(ws, pressed, os.getpid(), "no_device")
+  assert [a["halt"] for a in estop.acknowledgements(ws, pressed)] == ["no_device"]
 
 
 def test_a_stop_file_written_again_is_a_press_of_its_own(tmp_path):
-  """A stop file AHC did not write keeps its id when the same text is written again; the server's entry for
-  the earlier press must not count for the later one."""
+  """A stop file AHC did not write keeps its id when the same text is written again; the servers' acks of the
+  earlier press must not count for the later one."""
   ws = Workspace(tmp_path)
   ws.dir.mkdir()
   estop.path(ws).write_text("stop\n")
   os.utime(estop.path(ws), (time.time() - 3600, time.time() - 3600))
   first = estop.read(ws)
-  log = _run_log(ws, {"type": "estop", "state": "engaged", "id": first["id"], "at": first["at"], "by": first["by"],
-                      "t": first["at"]},
-                 {"type": "audit", "event": "device_not_halted", "detail": "nothing was running"},
-                 {"type": "estop", "state": "released", "id": first["id"]})
+  put_ack(ws, first, os.getpid(), "stopped", ROBOT)
   estop.path(ws).write_text("stop\n")  # pressed again, an hour later, the same way
   again = estop.read(ws)
   assert again["id"] == first["id"] and again["at"] != first["at"]
-  assert estop.acknowledgement(ws, again) is None  # the earlier press's entry is not this one's
-  with log.open("a") as f:
-    f.write(json.dumps({"type": "estop", "state": "engaged", "id": again["id"], "at": again["at"], "t": again["at"]})
-            + "\n")
-  ack = estop.acknowledgement(ws, again)
-  assert ack["at"] == again["at"] and ack["halt"] is None
+  assert estop.acknowledgements(ws, first) and estop.acknowledgements(ws, again) == []
 
 
-async def test_ahc_estop_says_whether_a_server_took_the_stop(tmp_path, open_lab):
+def test_an_ack_from_a_dead_process_is_marked_stale(tmp_path):
+  ws = Workspace(tmp_path)
+  pressed = estop.engage(ws, by="terminal")
+  put_ack(ws, pressed, os.getpid(), "no_device", server="live01")
+  put_ack(ws, pressed, dead_pid(), "stopped", ROBOT, server="dead01", run_active=True)
+  put_ack(ws, pressed, dead_pid(), "pending", ROBOT, server="dead02")
+  acks = acks_of(ws, pressed)
+  assert [acks[k]["stale"] for k in ("live01", "dead01", "dead02")] == [False, True, True]
+  assert "STALE" in estop.describe_server(acks["dead01"]) and "STALE" not in estop.describe_server(acks["live01"])
+  # A stale server that had finished says what it knew; one that died while stopping leaves the question open.
+  assert estop.verdict([acks["live01"], acks["dead01"]], 1)["state"] == "stopped"
+  open_question = estop.verdict(list(acks.values()), 1)
+  assert open_question["state"] == "not_confirmed" and "ended before its device answered" in open_question["text"]
+  assert estop.pid_alive(os.getpid()) and not estop.pid_alive(0) and not estop.pid_alive(None) and not estop.pid_alive("12")
+
+
+@pytest.mark.parametrize("acks,state,words", [
+  ([], "not_confirmed", "no AHC server has acknowledged the stop"),
+  ([("no_device", None)], "nothing_to_stop", "no AHC server has a device run to stop"),
+  ([("no_run", ROBOT)], "nothing_to_stop", "power switch"),
+  ([("stopped", ROBOT)], "stopped", "the robot reports its run stopped"),
+  ([("stopped", ROBOT), ("no_device", None), ("no_run", ROBOT)], "stopped", "the robot reports its run stopped"),
+  ([("stopped", {**ROBOT, "backend": "sim"})], "stopped", "the simulator reports its run stopped"),
+  ([("no_stop", {"id": "starlet", "model": "hamilton.starlet", "backend": "sim", "robot": None})], "nothing_to_stop", "no AHC server"),
+  ([("no_stop", {"id": "starlet", "model": "hamilton.starlet", "backend": "robot", "robot": None})], "not_confirmed", "has no stop AHC can reach"),
+  ([("stopped", ROBOT), ("not_confirmed", ROBOT)], "not_confirmed", "could not confirm the stop (timeout)"),
+  ([("stopped", ROBOT), ("other_run_active", ROBOT)], "not_confirmed", "another client's run"),
+  ([("stopped", ROBOT), ("pending", ROBOT)], "not_confirmed", "is still stopping"),
+])
+def test_the_verdict_never_says_stopped_while_a_question_is_open(tmp_path, acks, state, words):
+  ws = Workspace(tmp_path)
+  pressed = estop.engage(ws, by="test")
+  for n, (halt, device) in enumerate(acks):
+    put_ack(ws, pressed, os.getpid(), halt, device, server=f"s{n:05d}", detail="timeout")
+  out = estop.verdict(estop.acknowledgements(ws, pressed), 2)
+  assert out["state"] == state and words in out["text"]
+  if state == "not_confirmed":
+    assert out["text"].startswith("NOT confirmed: ") and out["text"].endswith("the power switch is the immediate stop")
+
+
+async def test_every_server_writes_its_own_ack_bound_or_not(tmp_path, open_lab, fake_robot):
+  ws = Workspace(tmp_path)
+  async with robot_lab(open_lab, tmp_path, fake_robot) as lab:
+    await load_verified(lab, layout=OT2_LAYOUT)  # a run is active on the robot
+    async with open_lab(tmp_path, backend=None) as idle, open_lab(tmp_path, backend=None) as another:
+      pressed = estop.engage(ws, by="test")
+      await until(answered(ws, pressed, 3))
+      acks = acks_of(ws, pressed)
+      assert len(acks) == 3 and {a["pid"] for a in acks.values()} == {os.getpid()}  # three servers in one process
+      robot = acks[lab.server.lab._server]
+      assert robot["halt"] == "stopped" and robot["run_active"] is True
+      assert robot["device"] == {"id": "ot2", "model": "opentrons.ot2", "backend": "robot", "robot": fake_robot.name}
+      assert robot["id"] == pressed["id"] and robot["at"] == pressed["at"] and robot["started"] and robot["seen"] <= robot["updated"]
+      for quiet in (idle, another):
+        ack = acks[quiet.server.lab._server]
+        assert ack["halt"] == "no_device" and ack["device"] is None and ack["run_active"] is None
+      assert estop.verdict(list(acks.values()), 0) == {"state": "stopped", "text": "the robot reports its run stopped"}
+      # The ahc-estop command shows one line per server and the same verdict.
+      out = await anyio.to_thread.run_sync(lambda: _cli("--workspace", str(tmp_path), "--wait", "10"))
+      assert out.returncode == 0 and "already engaged" in out.stdout, out.stderr
+      lines = [line for line in out.stdout.splitlines() if line.startswith("  pid ")]
+      assert len(lines) == 3 and sum(line.endswith(": no device bound: nothing to stop") for line in lines) == 2, out.stdout
+      assert any(f"ot2 opentrons.ot2/robot '{fake_robot.name}', run active: " in line and "the robot reports its run stopped" in line for line in lines)
+      assert out.stdout.rstrip().endswith("Verdict: the robot reports its run stopped.")
+
+
+async def test_a_robot_that_does_not_take_the_stop_is_never_reported_stopped(tmp_path, open_lab, fake_robot):
+  ws = Workspace(tmp_path)
+  async with robot_lab(open_lab, tmp_path, fake_robot) as lab:
+    await load_verified(lab, layout=OT2_LAYOUT)
+    fake_robot.stop_status = 500  # the robot does not take the stop
+    pressed = estop.engage(ws, by="test")
+    await until(answered(ws, pressed, 1))
+    ack = acks_of(ws, pressed)[lab.server.lab._server]
+    assert ack["halt"] == "not_confirmed" and ack["run_active"] is True and ack["detail"]
+    out = await anyio.to_thread.run_sync(lambda: _cli("--status", "--workspace", str(tmp_path)))
+    assert out.returncode == 0 and "Verdict: NOT confirmed: " in out.stdout, out.stdout
+    assert "the power switch is the immediate stop." in out.stdout and "reports its run stopped" not in out.stdout
+
+
+async def test_another_clients_run_is_reported_as_other_run_active(tmp_path, open_lab, fake_robot):
+  ws = Workspace(tmp_path)
+  async with robot_lab(open_lab, tmp_path, fake_robot) as lab:
+    await load_verified(lab, layout=OT2_LAYOUT)
+    fake_robot.other_client_run()  # the Opentrons App took the robot over
+    pressed = estop.engage(ws, by="test")
+    await until(answered(ws, pressed, 1))
+    ack = acks_of(ws, pressed)[lab.server.lab._server]
+    assert ack["halt"] == "other_run_active" and "replaced it" in ack["detail"]
+    assert estop.verdict([ack], 0)["state"] == "not_confirmed"
+
+
+async def test_a_stop_with_no_run_active_says_so(tmp_path, open_lab, fake_robot):
+  ws = Workspace(tmp_path)
+  async with robot_lab(open_lab, tmp_path, fake_robot) as lab:
+    await lab.call("lab_overview")  # bound to the robot, no layout loaded: no run
+    pressed = estop.engage(ws, by="test")
+    await until(answered(ws, pressed, 1))
+    ack = acks_of(ws, pressed)[lab.server.lab._server]
+    assert ack["halt"] == "no_run" and ack["run_active"] is False and ack["device"]["robot"] == fake_robot.name
+    assert estop.verdict([ack], 0)["state"] == "nothing_to_stop"
+
+
+async def test_a_simulated_starlet_has_no_device_stop_and_says_so(tmp_path, open_lab):
+  ws = Workspace(tmp_path)
+  async with open_lab(tmp_path, "sim") as lab, open_lab(tmp_path, backend=None) as idle:
+    await load_verified(lab, layout=STARLET_LAYOUT)
+    pressed = estop.engage(ws, by="test")
+    await until(answered(ws, pressed, 2))
+    acks = acks_of(ws, pressed)
+    star = acks[lab.server.lab._server]
+    assert star["halt"] == "no_stop" and star["device"]["model"] == "hamilton.starlet" and star["device"]["backend"] == "sim"
+    assert acks[idle.server.lab._server]["halt"] == "no_device"
+    assert estop.verdict(list(acks.values()), 0)["state"] == "nothing_to_stop"  # no real robot involved
+    out = await anyio.to_thread.run_sync(lambda: _cli("--workspace", str(tmp_path), "--wait", "10"))
+    assert "starlet hamilton.starlet/sim" in out.stdout and "Verdict: no AHC server has a device run to stop" in out.stdout
+
+
+def test_ahc_estop_waits_for_a_pending_server_and_not_for_the_ones_with_nothing_bound(tmp_path):
+  ws = Workspace(tmp_path)
+  ws.dir.mkdir()
+  pressed = estop.engage(ws, by="test")
+  put_ack(ws, pressed, os.getpid(), "no_device", server="idle01")
+  started = time.monotonic()
+  acks = estop.wait_for_acks(ws, pressed, wait=30, settle=0.3)
+  assert [a["halt"] for a in acks] == ["no_device"] and time.monotonic() - started < 3  # not the 30 s asked for
+  put_ack(ws, pressed, os.getpid(), "pending", ROBOT, server="busy01")
+  started = time.monotonic()
+  acks = estop.wait_for_acks(ws, pressed, wait=1.0, settle=0.3)
+  assert {a["halt"] for a in acks} == {"no_device", "pending"} and 0.9 < time.monotonic() - started < 3  # held up, to the end
+  out = _cli("--workspace", str(tmp_path), "--wait", "0.5")
+  assert "still stopping the device's run" in out.stdout and "Verdict: NOT confirmed: " in out.stdout
+  put_ack(ws, pressed, dead_pid(), "stopped", ROBOT, server="gone01", run_active=True)
+  put_ack(ws, pressed, os.getpid(), "stopped", ROBOT, server="busy01", run_active=True)
+  out = _cli("--status", "--workspace", str(tmp_path))
+  assert "STALE" in out.stdout and "Verdict: the robot reports its run stopped." in out.stdout, out.stdout
+  data = json.loads(_cli("--status", "--json", "--workspace", str(tmp_path)).stdout)
+  assert data["engaged"] and data["verdict"]["state"] == "stopped" and len(data["servers"]) == 3
+  assert [s["stale"] for s in data["servers"] if s["server"] == "gone01"] == [True]
+
+
+def test_ahc_estop_without_any_server_says_it_is_not_confirmed(tmp_path):
   nobody = tmp_path / "nobody"
   nobody.mkdir()
   out = _cli("--workspace", str(nobody), "--wait", "0")
   assert out.returncode == 0 and f"engaged for {nobody}" in out.stdout
-  assert "No AHC server has worked in this folder" in out.stdout and "Not acknowledged by any AHC server" in out.stdout
-  task = tmp_path / "task"
-  task.mkdir()
-  async with open_lab(task, "sim") as lab:
-    await load_verified(lab, layout=STARLET_LAYOUT)
-    out = await anyio.to_thread.run_sync(lambda: _cli("--workspace", str(task), "--wait", "10"))
-    assert "Acknowledged by the AHC server" in out.stdout, out.stdout
-    status = json.loads(_cli("--status", "--workspace", str(task)).stdout)
-  assert status["engaged"] and status["folder"] == str(task) and status["acknowledged"]["at"]
+  assert "No AHC server has worked in this folder" in out.stdout
+  assert "Verdict: NOT confirmed: no AHC server has acknowledged the stop" in out.stdout
+  assert "the power switch is the immediate stop." in out.stdout
 
 
-@pytest.mark.parametrize("tool,runs", [("mcp__plugin_ahc_ahc__capture", True), ("mcp__plugin_ahc_ahc__open_dashboard", True), ("ToolSearch", True),
-                                       ("mcp__plugin_ahc_ahc__aspirate", False), ("Bash", False), (None, False)])
-def test_a_capture_still_runs_while_the_stop_is_engaged(tmp_path, tool, runs):
+def test_ahc_estop_status_without_a_stop(tmp_path):
+  out = _cli("--status", "--workspace", str(tmp_path))
+  assert out.returncode == 0 and f"No emergency stop is engaged for {tmp_path}" in out.stdout
+  estop.release(Workspace(tmp_path), by="x")  # nothing engaged: nothing written
+  estop.engage(Workspace(tmp_path), by="test")
+  estop.release(Workspace(tmp_path), by="person")
+  assert "released" in _cli("--status", "--workspace", str(tmp_path)).stdout
+  assert json.loads(_cli("--status", "--json", "--workspace", str(tmp_path)).stdout)["engaged"] is False
+
+
+AHC = "mcp__plugin_ahc_ahc__"
+ALLOWED = ["Read", "Grep", "Glob", "ToolSearch", "TodoWrite", "SendMessage", "ListAgents",
+           *(AHC + t for t in ("lab_overview", "get_state", "get_run", "list_checks", "describe_device", "get_params",
+                               "find_layout_references", "find_robots", "capture", "physical_world_context", "open_dashboard",
+                               "report_decision"))]
+DENIED = ["Bash", "Write", "Edit", "NotebookEdit", "WebFetch", "WebSearch", "Agent", "Task", "BashOutput", "KillShell",
+          *(AHC + t for t in ("load_layout", "pick_up_tips", "aspirate", "dispense", "mix", "drop_tips", "invoke", "verify",
+                              "record_verdict", "confirm_config", "configure_devices", "disconnect", "map_camera",
+                              "propose_verdict", "agent_verdict")),
+          "mcp__other__read_file", "mcp__plugin_ahc_other__get_state", AHC + "an_unknown_tool", "read", "Read ", "Read\nBash", "", None]
+
+
+@pytest.mark.parametrize("tool,runs", [(t, True) for t in ALLOWED] + [(t, False) for t in DENIED])
+def test_while_stopped_only_what_lets_the_agent_look_and_report_runs(tmp_path, tool, runs):
   ws = Workspace(tmp_path)
   estop.engage(ws, by="test")
-  stdin = json.dumps({"hook_event_name": "PreToolUse", "tool_name": tool}) if tool else ""
+  stdin = json.dumps({"hook_event_name": "PreToolUse", "tool_name": tool}) if tool is not None else ""
   hook = run_hook("estop-guard.sh", stdin=stdin, CLAUDE_PROJECT_DIR=str(tmp_path))
   assert hook.returncode == 0, hook.stderr
-  assert (hook.stdout == "") is runs  # the cameras record the deck; anything else is denied and ends the turn
+  assert (hook.stdout == "") is runs  # an allowlist: anything not listed is denied, and the denial ends the turn
+  if not runs:
+    out = json.loads(hook.stdout)
+    assert out["continue"] is False and out["hookSpecificOutput"]["permissionDecision"] == "deny"
 
+
+def test_the_allowlist_is_one_file_both_hooks_read():
+  names = [line.strip() for line in (HOOKS / "estop-allowed-tools.txt").read_text().splitlines()
+           if line.strip() and not line.startswith("#")]
+  assert sorted(names) == sorted(ALLOWED) and len(names) == len(set(names))
+  assert _feed_hook_module().run_while_stopped() == set(ALLOWED)
+  for acting in ("aspirate", "load_layout", "verify", "record_verdict", "confirm_config", "disconnect"):
+    assert AHC + acting not in names
+
+
+def test_the_hook_denies_everything_without_python_or_without_the_list(tmp_path):
+  ws = Workspace(tmp_path / "task")
+  estop.engage(ws, by="test")
+  read = json.dumps({"tool_name": "Read"})
+  assert run_hook("estop-guard.sh", stdin=read, CLAUDE_PROJECT_DIR=str(ws.root)).stdout == ""
+  tools = tmp_path / "bin"  # grep, and no python3 for /usr/bin/env to find
+  tools.mkdir()
+  grep = next(p for p in ("/usr/bin/grep", "/bin/grep") if Path(p).exists())
+  (tools / "grep").symlink_to(grep)
+  out = run_hook("estop-guard.sh", stdin=read, PATH=str(tools), CLAUDE_PROJECT_DIR=str(ws.root))
+  assert json.loads(out.stdout)["continue"] is False  # even a Read: nothing says it may run
+  copy = tmp_path / "hooks"  # the list missing next to the script
+  copy.mkdir()
+  (copy / "estop-guard.sh").write_text((HOOKS / "estop-guard.sh").read_text())
+  out = subprocess.run(["/bin/sh", str(copy / "estop-guard.sh")], input=read, capture_output=True, text=True, timeout=30,
+                       env={**os.environ, "CLAUDE_PROJECT_DIR": str(ws.root)})
+  assert json.loads(out.stdout)["continue"] is False
+
+
+def test_the_feed_hook_marks_a_call_denied_by_the_same_list(tmp_path):
+  feed = _feed_hook_module()
+  task = tmp_path / "task"
+  (task / ".ahc").mkdir(parents=True)
+  estop.engage(Workspace(task), by="test")
+  seen = {}
+  for tool in ALLOWED + DENIED:
+    if not isinstance(tool, str) or not tool:
+      continue
+    stopped = tool not in feed.run_while_stopped() and feed.estop_engaged(task / ".ahc")
+    seen[tool] = stopped
+    hook = run_hook("estop-guard.sh", stdin=json.dumps({"tool_name": tool}), CLAUDE_PROJECT_DIR=str(task))
+    assert stopped is bool(hook.stdout), tool  # the feed says denied exactly when the stop hook denies
+  assert not any(seen[t] for t in ALLOWED) and all(seen[t] for t in DENIED if isinstance(t, str) and t)

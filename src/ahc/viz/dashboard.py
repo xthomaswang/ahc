@@ -10,6 +10,15 @@ everything else 0, complete mixing assumed); volumes match the server's trackers
 
 Its stop button stops the server of the task folder the page names (in its title and stop bar); it
 answers only to its own page (Host and Origin checked, never framed).
+
+    ahc-dashboard --view-only           # the same page for an audience: no stop or release, every POST refused
+
+Anyone at a dashboard can press release, so the person keeps the control page and shows the view-only one.
+
+Cameras: a camera with a slot map shows its reference image with the boxes drawn over it, and what the cameras
+cover (the last physical_world_context: per source and per check type). The control page lets the person drag the boxes (corners resize, the body
+moves) and save; a save writes the config, which is pending until they confirm it again. The view-only page
+shows the same, with no handles and no save.
 """
 
 from __future__ import annotations
@@ -26,13 +35,16 @@ import secrets
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.request
 import webbrowser
 from collections import Counter
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
+from ahc import auto_verify
 from ahc.core.errors import LabError
 from ahc.devices.spec import LIQUID_HANDLING_OPS
 from ahc.plan import PlanProgress
@@ -160,13 +172,23 @@ def replay(path: Path | None, stock: list[str] | None = None, ahc_dir: Path | No
       decisions.append({k: e[k] for k in ("t", "decision", "why", "current_step", "waiting_for", "plan_done") if k in e})
       continue
     if e.get("type") == "verification":
-      if e.get("verdict") == "pending":  # the person's verdict, on real hardware or for a layout without a reference
+      if e.get("verdict") == "pending" and e.get("auto"):  # the agent judges it from camera images (auto-verify)
+        waiting.pop(e.get("check_id"), None)
+      elif e.get("verdict") == "pending":  # the person's verdict, on real hardware or for a layout without a reference
         waiting[e.get("check_id")] = {"check_id": e.get("check_id"), "check": e.get("check"), "t": e.get("t"),
                                       "what": _check_text(e, names)}
       else:
         waiting.pop(e.get("check_id"), None)
       events.append({"i": i, "t": e.get("t"), "op": "verify", "status": e.get("verdict"),
-                     "detail": f"{e.get('check')} → {e.get('verdict')} ({e.get('judged_by')})"})
+                     "detail": f"{e.get('check')} → {e.get('verdict')} ({'waits for the agent to judge it from camera images' if e.get('auto') else e.get('judged_by')})"})
+      continue
+    if e.get("type") == "vision":
+      if e.get("event") == "handback" and e.get("check_id") in waiting:  # the person's now: show what the agent said
+        waiting[e["check_id"]]["said"] = {k: e.get(k) for k in ("verdict", "note", "why") if e.get(k)}
+      elif e.get("event") == "auto_verdict":
+        events.append({"i": i, "t": e.get("t"), "op": "auto verdict", "status": "pass",
+                       "detail": f"{e.get('check')}: the agent judged pass from {len(e.get('images') or [])} image(s)"
+                                 + (f" · {e['note']}" if e.get("note") else "")})
       continue
     if e.get("type") == "gate":
       # A gate waits for its own deck check: an earlier one (before a reload, or a released stop) opens nothing.
@@ -318,7 +340,19 @@ def replay(path: Path | None, stock: list[str] | None = None, ahc_dir: Path | No
           # as_of: the page ticks the live clocks from it, so they never depend on the browser's time zone
           "timing": {**run_timing(entries), "as_of": datetime.now().isoformat(timespec="milliseconds")},
           "agent": agent_view(decisions, progress, gate, ahc_dir / "agent-feed.jsonl", list(waiting.values())),
-          "config": workspace_config(ahc_dir / "config.yaml")}
+          "config": workspace_config(ahc_dir / "config.yaml"), "auto": auto_state(ahc_dir)}
+
+
+def auto_state(ahc_dir: Path) -> dict[str, Any] | None:
+  """Auto-verify as the page shows it: AUTO or the reason it is off per authorised check type, the pause, the review
+  list of the agent's verdicts. None when the config has no auto_verify."""
+  from ahc.workspace.config import parse_config
+
+  try:
+    config = parse_config((ahc_dir / "config.yaml").read_text())
+  except (OSError, LabError):
+    return None
+  return auto_verify.dashboard_view(Workspace(ahc_dir.parent), config)
 
 
 def _check_text(entry: dict[str, Any], names: Callable[[str], str]) -> str:
@@ -407,14 +441,83 @@ def workspace_config(path: Path) -> dict[str, Any] | None:
   except LabError as exc:
     return {"status": "invalid", "reason": exc.message, "path": str(path)}
   status, why = config.status(forced_sim=False)
-  return {"status": status, "reason": why, "path": str(path),
-          "devices": [{"id": d.id, "model": d.model, "backend": d.backend} for d in config.devices],
-          "limits": config.limits, "confirmation": config.confirmation, "sim": config.sim}
+  out = {"status": status, "reason": why, "path": str(path),
+         "devices": [{"id": d.id, "model": d.model, "backend": d.backend} for d in config.devices],
+         "limits": config.limits, "confirmation": config.confirmation, "sim": config.sim}
+  if config.auto_verify:
+    out["auto_verify"] = config.auto_verify.data()
+  if config.cameras:
+    out["cameras"] = [{"name": c.name, "device": c.device, "sees": c.sees(),
+                       "slot_map": {k: c.slot_map[k] for k in ("size", "view", "slots")} if c.slot_map else None}
+                      for c in config.cameras]
+    seen = _json(path.parent / "state" / "physical_world.json")
+    if seen and any(c.slot_map for c in config.cameras):
+      out["physical_world"] = {k: seen.get(k) for k in ("checked_at", "vision_context", "instrument_context", "points",
+                                                       "physical_world_confidence", "suggestions")}
+  return out
+
+
+def _json(path: Path) -> dict[str, Any] | None:
+  try:
+    data = json.loads(path.read_text())
+  except (OSError, ValueError):
+    return None
+  return data if isinstance(data, dict) else None
+
+
+def reference_image(ws: Workspace, name: str) -> bytes | None:
+  """A camera's reference image, for the page; only a camera the config names, only its own file."""
+  from ahc.workspace.config import parse_config
+
+  try:
+    config = parse_config(ws.config_path.read_text())
+    camera = next(c for c in config.cameras if c.name == name and c.slot_map)
+    return (ws.dir / camera.slot_map["reference"]).read_bytes()
+  except (OSError, LabError, StopIteration):
+    return None
+
+
+def run_image(ws: Workspace, relative: str) -> bytes | None:
+  """A capture or crop of a run, for the review list: only a .jpg file under .ahc/runs."""
+  try:
+    path = (ws.runs_dir / urllib.parse.unquote(relative)).resolve()
+    if path.suffix != ".jpg" or not path.is_file() or not path.is_relative_to(ws.runs_dir.resolve()):
+      return None
+    return path.read_bytes()
+  except (OSError, ValueError):
+    return None
+
+
+def save_slots(ws: Workspace, name: str, slots: Any) -> tuple[int, dict[str, Any]]:
+  """The person's dragged boxes into the config: the camera's own slots, moved or resized, none added or dropped.
+  The config's digest changes, so it is pending until they confirm it again."""
+  from ahc.workspace.config import HEADER, parse_config, parse_slot_map
+
+  try:
+    config = parse_config(ws.config_path.read_text())
+  except (OSError, LabError) as exc:
+    return 409, {"error": f"the config cannot be read: {getattr(exc, 'message', exc)}"}
+  camera = next((c for c in config.cameras if c.name == name and c.slot_map), None)
+  if camera is None:
+    return 404, {"error": f"no camera {name!r} with a slot map"}
+  if not isinstance(slots, dict) or set(slots) != set(camera.slot_map["slots"]):
+    return 400, {"error": "save the boxes of the slots the map has, no more and no fewer"}
+  try:
+    new = parse_slot_map({**camera.slot_map, "slots": slots}, name)
+  except LabError as exc:
+    return 400, {"error": exc.message}
+  if new == camera.slot_map:
+    return 200, {"saved": False, "reason": "no box changed", "status": config.status(False)[0]}
+  cameras = [replace(c, slot_map=new) if c.name == name else c for c in config.cameras]
+  config = replace(config, cameras=cameras)
+  ws.write_config(config.data(), HEADER)
+  status, why = config.status(False)
+  return 200, {"saved": True, "status": status, "reason": why}
 
 
 PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="ahc-token" content="__AHC_TOKEN__">
+<meta name="ahc-token" content="__AHC_TOKEN__"><meta name="ahc-view" content="__AHC_VIEW__">
 <title>AHC · __AHC_FOLDER__</title>
 <style>
 :root{color-scheme:light;--page:#f9f9f7;--surface:#fcfcfb;--ink:#0b0b0b;--ink2:#52514e;--muted:#898781;
@@ -486,6 +589,8 @@ background:var(--critical);color:#fff;border:2px solid var(--critical);cursor:po
 .releasebtn{float:none;font-size:13px;padding:6px 12px;border-radius:8px;background:#fff;color:var(--critical);
 border:2px solid #fff;cursor:pointer;display:none}.stopbar.engaged .releasebtn{display:inline-block}
 .stopbar .folder{margin-left:auto;color:var(--ink2);font-size:12px;overflow-wrap:anywhere}.stopbar.engaged .folder{color:#fff}
+.stopbar .servers{flex-basis:100%;font-size:12px}.stopbar .servers:empty{display:none}
+.stopbar .servers div{padding:1px 0;overflow-wrap:anywhere}.stopbar.engaged .servers{color:#fff}
 .stopbar .note{flex-basis:100%;font-weight:700;color:var(--critical)}.stopbar .note:empty{display:none}
 .stopbar.engaged .note{color:#fff;text-decoration:underline}
 .st.stop::before{content:"■ ";color:var(--critical)}.st.released::before{content:"✓ ";color:var(--good)}
@@ -523,12 +628,21 @@ border-radius:8px;padding:6px 10px;font-size:12px;max-width:100%;overflow:hidden
 .kv{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;font-size:12px;margin:4px 0 10px}.kv .k{color:var(--muted)}
 h3{font-size:12px;font-weight:600;color:var(--ink2);margin:12px 0 4px}
 #configcard td,#configcard th{text-align:left}
+#cameracard td,#cameracard th{text-align:left}#cameracard svg{display:block;border-radius:6px;background:var(--grid)}
+#cameracard svg text{fill:#fff;stroke:#000;stroke-width:3px;paint-order:stroke;font-size:15px;pointer-events:none}
+#cameracard .handle{fill:#fff;stroke:#0b0b0b;stroke-width:2;cursor:nwse-resize}#cameracard .box{fill:rgba(0,200,0,.10);stroke:#0ca30c;stroke-width:2;cursor:move}
+#cameracard .box.tips{stroke:#fab219;fill:rgba(250,178,25,.12)}#cameracard .camhead{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:12px 0 6px}
+#cameracard .camhead button{float:none}#cameracard .camnote{color:var(--ink2);font-size:12px}
+#autocard .autorow{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;margin:6px 0}#autocard .camnote{color:var(--ink2);font-size:12px}
+#autocard .autobadge{font-size:11px;font-weight:700;letter-spacing:.04em;padding:1px 8px;border-radius:10px;background:var(--chip);color:var(--ink2)}
+#autocard .autobadge.auto{background:var(--good);color:#fff}#autocard .review{border-top:1px solid var(--grid);padding:8px 0}
+#autocard .thumbs{display:flex;gap:6px;flex-wrap:wrap;margin:4px 0}#autocard .thumbs img{height:64px;border-radius:4px;border:1px solid var(--border);display:block}
 </style></head><body>
-<div class="stopbar" id="stopbar"><button class="stopbtn" id="stopbtn" title="Stops every command of this task folder's server at once">EMERGENCY STOP</button>
-<span class="state" id="stopstate">Stops the hardware commands of this task folder at once; only a person releases it.</span>
-<button class="releasebtn" id="releasebtn">Release…</button>
-<span class="folder" title="The task folder this button stops">Task folder <code>__AHC_FOLDER__</code></span>
-<span class="note" id="stopnote"></span></div>
+<div class="stopbar" id="stopbar">__AHC_STOPBTN__
+<span class="state" id="stopstate">__AHC_IDLE__</span>
+__AHC_RELEASEBTN__
+<span class="folder" title="The task folder this page shows">Task folder <code>__AHC_FOLDER__</code></span>
+<span class="note" id="stopnote"></span><div class="servers" id="stopservers"></div></div>
 <header><h1>AHC · live run</h1><span class="sub" id="sub">waiting for a run log…</span>
 <span class="live"><span class="dot" id="dot"></span><span id="livetext">connecting</span></span></header>
 <main>
@@ -538,7 +652,9 @@ h3{font-size:12px;font-weight:600;color:var(--ink2);margin:12px 0 4px}
 <div class="col"><section class="card" id="platecard"><div class="empty">No layout loaded yet.</div></section>
 <section class="card"><h2>Reservoirs</h2><div id="containers"></div></section>
 <section class="card"><h2>Tips <span class="sub">· hollow = used, dashed = returned after use</span></h2><div class="racks" id="racks"></div></section>
-<section class="card" id="configcard"></section></div>
+<section class="card" id="configcard"></section>
+<section class="card" id="autocard" style="display:none"></section>
+<section class="card" id="cameracard" style="display:none"></section></div>
 <div class="col"><section class="card"><h2>Hardware calls <span class="sub">· newest first</span></h2><ul id="timeline"></ul></section></div>
 </main><div id="tip"></div>
 <script>
@@ -648,7 +764,8 @@ function agentPanel(a,tm){const box=document.getElementById("agent");box.replace
   // Every check that waits for the person's verdict (on real hardware all of them), from the run log.
   (a.checks_waiting||[]).filter(c=>!(a.layout_waits&&c.check==="deck_matches_layout")).forEach(c=>{const b=el("div",{class:"banner"});
     b.append(el("span",{},`Waiting for your check: ${c.what} (${c.check}, asked ${(c.t||"").slice(11)}). Look, then answer where you were asked (the agent, or the ahc-smoke terminal)`
-      +(c.check==="deck_matches_layout"?"; nothing moves until you do.":".")));box.append(b)})
+      +(c.check==="deck_matches_layout"?"; nothing moves until you do.":".")
+      +(c.said?` The agent looked at the camera images${c.said.verdict?" and judged "+c.said.verdict:""}${c.said.note?" ("+c.said.note+")":""}; auto-verify handed this check to you${c.said.why?": "+c.said.why:""}.`:"")));box.append(b)})
   if(a.plan&&a.plan.length){const ol=el("ol",{class:"plan"}),n=a.plan.length,st=a.steps||[];
     // Each call names its step: a step is ticked once the agent moves on, and the plan ends when it reports it done.
     const where=a.plan_done?"finished":a.current_step?`step ${a.current_step} of ${n}`:`${n} steps, not started`;
@@ -722,7 +839,92 @@ function configCard(st){const card=document.getElementById("configcard");card.re
   const wrap=el("div",{class:"tablewrap"});wrap.append(tb);card.append(wrap);
   const liq=(L.layout||{}).liquids;if(liq&&Object.keys(liq).length)card.append(el("div",{class:"legend"},"Starting liquids: "+Object.entries(liq).map(([k,v])=>`${k} ${fmt(v)} uL`).join(", ")))}
 
-const TOKEN=document.querySelector('meta[name="ahc-token"]').content;
+// Cameras: the reference image with its boxes. The control page drags them (a corner resizes, the body moves) and saves;
+// the config is then pending until the person confirms it again. Never rebuilt while a box is unsaved.
+const camWork={};
+function cameraCard(cfg){const card=document.getElementById("cameracard");
+  const cams=((cfg||{}).cameras||[]).filter(c=>c.slot_map);
+  if(!cams.length){card.style.display="none";card.replaceChildren();return}
+  if(Object.values(camWork).some(w=>w.dirty))return;
+  card.style.display="";card.replaceChildren(el("h2",{},"Cameras"));
+  const vis=cfg.physical_world||{},seen=(vis.vision_context||{}).cameras||{};
+  cams.forEach(c=>{const m=c.slot_map,[W,H]=m.size,work=JSON.parse(JSON.stringify(m.slots));camWork[c.name]={dirty:false};
+    const head=el("div",{class:"camhead"});head.append(el("b",{},c.name),el("span",{class:"dev"},`${c.device} · sees ${c.sees}`));
+    const cam=seen[c.name];if(cam&&cam.status&&cam.status!=="ok")head.append(el("span",{class:"tag"},cam.status.replace(/_/g," ")));
+    const msg=el("span",{class:"camnote"}),save=el("button",{},"Save boxes"),undo=el("button",{},"Undo");save.disabled=undo.disabled=true;
+    if(!VIEW)head.append(save,undo);head.append(msg);card.append(head);
+    const pad=Math.round(Math.max(W,H)*0.12),svg=sv("svg",{viewBox:`${-pad} ${-pad} ${W+2*pad} ${H+2*pad}`,role:"img","aria-label":`${c.name} reference with slot boxes`});
+    svg.style.width="100%";svg.style.maxHeight="540px";svg.style.touchAction="none";
+    svg.append(sv("image",{href:`/camera/${encodeURIComponent(c.name)}/reference.jpg`,x:0,y:0,width:W,height:H}));
+    svg.append(sv("rect",{x:0,y:0,width:W,height:H,fill:"none",stroke:"var(--axis)","stroke-width":1}));
+    const r=Math.max(5,Math.round(W/110)),parts={},pt=ev=>{const p=svg.createSVGPoint();p.x=ev.clientX;p.y=ev.clientY;const q=p.matrixTransform(svg.getScreenCTM().inverse());return[q.x,q.y]};
+    const draw=()=>Object.entries(work).forEach(([k,b])=>{const p=parts[k];p.rect.setAttribute("x",b[0]);p.rect.setAttribute("y",b[1]);
+      p.rect.setAttribute("width",b[2]-b[0]);p.rect.setAttribute("height",b[3]-b[1]);p.label.setAttribute("x",Math.max(b[0],0)+6);p.label.setAttribute("y",Math.max(b[1],0)+20);
+      p.handles.forEach((h,i)=>{h.setAttribute("cx",i%3?b[2]:b[0]);h.setAttribute("cy",i<2?b[1]:b[3])})});
+    const touched=()=>{camWork[c.name].dirty=true;save.disabled=undo.disabled=false;msg.textContent="Unsaved: the config will wait for the person's confirmation.";draw()};
+    Object.keys(work).forEach(k=>{const tips=k.startsWith("tips:"),g=sv("g"),rect=sv("rect",{class:"box"+(tips?" tips":"")}),
+      label=sv("text",{});label.textContent=tips?k.slice(5):"slot "+k;g.append(rect,label);const handles=[];
+      if(!VIEW){rect.addEventListener("pointerdown",ev=>{ev.preventDefault();rect.setPointerCapture(ev.pointerId);const o=pt(ev),b0=work[k].slice();
+          rect.onpointermove=e=>{const q=pt(e);work[k]=[b0[0]+q[0]-o[0],b0[1]+q[1]-o[1],b0[2]+q[0]-o[0],b0[3]+q[1]-o[1]];touched()};
+          rect.onpointerup=()=>{rect.onpointermove=rect.onpointerup=null}});
+        [[0,1],[2,1],[2,3],[0,3]].forEach(([ix,iy],i)=>{const h=sv("circle",{class:"handle",r});handles.push(h);g.append(h);
+          h.addEventListener("pointerdown",ev=>{ev.preventDefault();ev.stopPropagation();h.setPointerCapture(ev.pointerId);
+            h.onpointermove=e=>{const q=pt(e),b=work[k].slice();b[ix]=q[0];b[iy]=q[1];
+              if(b[2]-b[0]>=12&&b[3]-b[1]>=12){work[k]=b;touched()}};h.onpointerup=()=>{h.onpointermove=h.onpointerup=null}})})}
+      parts[k]={rect,label,handles};svg.append(g)});
+    draw();card.append(svg);
+    undo.onclick=()=>{Object.keys(work).forEach(k=>work[k]=m.slots[k].slice());camWork[c.name].dirty=false;save.disabled=undo.disabled=true;msg.textContent="";draw()};
+    save.onclick=async()=>{save.disabled=true;msg.textContent="Saving…";
+      try{const r=await fetch(`/cameras/${encodeURIComponent(c.name)}/slots`,{method:"POST",headers:{"X-AHC-Control":"1","X-AHC-Token":TOKEN,"Content-Type":"application/json"},body:JSON.stringify({slots:work})});
+        const j=await r.json();if(!r.ok){msg.textContent=`Not saved (${r.status}): ${j.error||""}`;save.disabled=false;return}
+        camWork[c.name].dirty=false;undo.disabled=true;
+        msg.textContent=j.saved?"Saved. The config is pending until the person confirms it again (confirm_config).":"Nothing changed."}
+      catch(e){msg.textContent="Not saved: the dashboard did not answer.";save.disabled=false}}});
+  const pts=vis.points||[];card.append(el("h3",{},"Physical world context"+(vis.checked_at?` · checked ${vis.checked_at.slice(11,19)}`:"")));
+  if(!pts.length){card.append(el("div",{class:"dev"},"Nothing checked yet: the agent runs physical_world_context once the plan is reported and a layout is loaded."));return}
+  // The sources: what each observes and covers; then the conclusion per check type; then every point with the sources that cover it.
+  const conf=vis.physical_world_confidence||{},bySource=conf.by_source||{},inst=vis.instrument_context||{};
+  const srcs=el("div",{class:"legend"});
+  Object.entries(bySource).forEach(([n,v])=>srcs.append(el("div",{},`${n}: covers ${v.covers} of ${v.observes} points it observes`)));
+  srcs.append(el("div",{},`instrument:${inst.device||"?"}: ${inst.note||"no sensors"}`));card.append(srcs);
+  const cls={covered:"pass",uncovered:"fail",unclear:"pending"};
+  const checks=el("div",{class:"autorow"});
+  Object.entries(conf.by_check||{}).forEach(([c,v])=>{const p=v.points||{};
+    checks.append(el("span",{class:"st "+(cls[v.status]||"audit"),title:(v.sources||[]).map(x=>`${x.source} (${x.level})`).join(", ")},`${c.replace(/_/g," ")}: ${v.status}`),
+      el("span",{class:"dev"},`${p.covered||0} covered, ${p.unclear||0} unclear, ${p.uncovered||0} uncovered`))});card.append(checks);
+  const tb=el("table"),hr=el("tr");["Point","Check","Level","Status","Sources"].forEach(x=>hr.append(el("th",{},x)));tb.append(hr);
+  pts.forEach(p=>{const row=el("tr"),st=el("td"),s=el("span",{class:"st "+(cls[p.status]||"audit"),title:p.why||""},p.status),
+      cov=(p.sources||[]).filter(e=>e.covers).map(e=>`${e.source} (${e.level})`).join(", ");
+    st.append(s);row.append(el("td",{title:p.why||""},p.what),el("td",{},p.check),el("td",{},p.level),st,el("td",{},cov||"–"));tb.append(row)});
+  const wrap=el("div",{class:"tablewrap"});wrap.append(tb);card.append(wrap);
+  if((vis.suggestions||[]).length)card.append(el("div",{class:"legend"},"To cover the rest: "+vis.suggestions.join("; ")))}
+
+// Auto-verify: AUTO or why it is off per authorised check, the pause (control page only), and the agent's verdicts to review.
+function autoCard(a){const card=document.getElementById("autocard");
+  if(!a){card.style.display="none";card.replaceChildren();return}
+  card.style.display="";const h=el("h2",{},"Auto-verify"+(a.paused?" · paused":"")),msg=el("span",{class:"camnote"});card.replaceChildren(h);
+  if(!VIEW){const b=el("button",{id:"autopause"},a.paused?"Resume auto":"Pause auto");
+    b.onclick=async()=>{b.disabled=true;
+      try{const r=await fetch(a.paused?"/auto/resume":"/auto/pause",{method:"POST",headers:{"X-AHC-Control":"1","X-AHC-Token":TOKEN,"Content-Type":"application/json"},body:"{}"});
+        if(!r.ok){let j={};try{j=await r.json()}catch(e){}msg.textContent=`Not changed (${r.status}): ${j.error||""}`;b.disabled=false}else tick.key=null}
+      catch(e){msg.textContent="Not changed: the dashboard did not answer.";b.disabled=false}};h.append(b)}
+  card.append(msg);
+  if(a.run)card.append(el("div",{class:"autorow"},el("span",{class:"autobadge "+(a.run.state==="on"?"auto":"off")},a.run.state==="on"?"RUN ON":"RUN OFF"),
+    el("b",{},"Run level"),el("span",{class:"dev"},a.run.state==="on"?"every point of the listed check types is confident":a.run.why)));
+  Object.entries(a.checks||{}).forEach(([c,s])=>{const row=el("div",{class:"autorow"});
+    row.append(el("span",{class:"autobadge "+s.state},s.state==="auto"?"AUTO":"OFF"),el("b",{},c),
+      el("span",{class:"dev"},s.state==="auto"?`streak ${s.streak} of ${a.min_streak} agreements`:s.why));card.append(row)});
+  card.append(el("h3",{},`Auto verdicts to review · ${a.review.length}`));
+  if(!a.review.length)card.append(el("div",{class:"dev"},"None yet. Every check the agent passes by itself is listed here with its images."));
+  a.review.forEach(r=>{const item=el("div",{class:"review"});
+    item.append(el("div",{},`${(r.t||"").replace("T"," ")} · ${r.check}`+(r.note?` · ${r.note}`:"")));
+    const row=el("div",{class:"thumbs"});
+    (r.images||[]).forEach(p=>{const href="/run-image/"+p.split("/").map(encodeURIComponent).join("/"),link=el("a",{href,target:"_blank",rel:"noopener"});
+      link.append(el("img",{src:href,loading:"lazy",alt:p.split("/").pop()}));row.append(link)});
+    item.append(row);
+    (r.per_point||[]).forEach(pp=>item.append(el("div",{class:"dev"},`${pp.what}: ${pp.verdict}`+(pp.note?` · ${pp.note}`:""))));card.append(item)})}
+
+const TOKEN=document.querySelector('meta[name="ahc-token"]').content,VIEW=document.querySelector('meta[name="ahc-view"]').content==="1";
 const ELSEWHERE="Use the robot's own stop or its power switch, or ahc-estop in the task folder.";
 // A press that did not arrive is said at once and stays until a stop shows engaged; never silent.
 function note(text){const n=document.getElementById("stopnote");n.textContent=text;clearTimeout(note.t);
@@ -734,24 +936,24 @@ async function control(path,body){const stop=path==="/estop";
   if(r.ok){note("");return true}
   let why="";try{why=(await r.json()).error||""}catch(err){}
   note(stop?`STOP NOT SENT (${r.status} ${why}). `+ELSEWHERE:`Not released (${r.status}): ${why}`);return false}
-document.getElementById("stopbtn").onclick=async()=>{await control("/estop",{reason:"pressed on the dashboard"});pollStop()};
-document.getElementById("releasebtn").onclick=async()=>{
+const stopBtn=document.getElementById("stopbtn"),releaseBtn=document.getElementById("releasebtn");  // absent on the view-only page
+if(stopBtn)stopBtn.onclick=async()=>{await control("/estop",{reason:"pressed on the dashboard"});pollStop()};
+if(releaseBtn)releaseBtn.onclick=async()=>{
   if(!confirm("Release the emergency stop?\n\nOnly when the deck is safe. The agent must check the deck again before anything moves."))return;
   await control("/estop/release",{confirm:true});pollStop()};
-const HALT={halted:"the device's run is stopped",not_halted:"the device reported nothing running, or it has no device-level stop",
-  failed:"the device's stop FAILED: the robot may still be executing its last command; the power switch is the immediate stop"};
-async function pollStop(){const bar=document.getElementById("stopbar"),state=document.getElementById("stopstate");
+const IDLE=VIEW?"View only: the stop and its release are on the person's own page.":"Stops the hardware commands of this task folder at once; only a person releases it.";
+async function pollStop(){const bar=document.getElementById("stopbar"),state=document.getElementById("stopstate"),list=document.getElementById("stopservers");
   try{const r=await fetch("/estop",{cache:"no-store"});const e=await r.json();
-  if(e.engaged){const a=e.acknowledged;bar.className="stopbar engaged";
+  if(e.engaged){bar.className="stopbar engaged";
     let text=`■ EMERGENCY STOP ENGAGED · pressed ${(e.at||"").replace("T"," ")} (${e.by})`;
     if(e.unreadable)text+=` · the stop file is not one AHC wrote (${e.unreadable}), so it counts as pressed`;
-    // Acknowledged: the server's run log holds this stop (its id). Until then, say so plainly.
-    text+=a?` · the AHC server${a.server||""} took it at ${(a.at||"").slice(11)}; ${a.halt?HALT[a.halt]:"no device stop reported (yet)"}`
-      :` · NOT acknowledged by any AHC server yet (${e.pressed_s??"?"} s): if the robot is moving, stop it with its own controls or the power switch`;
+    // One line per AHC server that took the stop (its own acknowledgement), then what the person may rely on.
+    text+=` · ${e.verdict?e.verdict.text:"no verdict"}`;
     state.textContent=text+" · nothing runs until a person releases it";
+    list.replaceChildren(...(e.servers||[]).map(s=>el("div",{},s.line)));
     if(document.getElementById("stopnote").textContent.startsWith("STOP NOT SENT"))note("")}
-  else{bar.className="stopbar";state.textContent=e.released_at?`Released ${(e.released_at||"").replace("T"," ")} by ${e.released_by}; the deck must be checked again before anything moves.`:"Stops the hardware commands of this task folder at once; only a person releases it."}}
-  catch(err){state.textContent="The dashboard does not answer: this button cannot stop anything now. "+ELSEWHERE}
+  else{bar.className="stopbar";list.replaceChildren();state.textContent=e.released_at?`Released ${(e.released_at||"").replace("T"," ")} by ${e.released_by}; the deck must be checked again before anything moves.`:IDLE}}
+  catch(err){state.textContent="The dashboard does not answer"+(VIEW?".":": this button cannot stop anything now. "+ELSEWHERE)}
   clearTimeout(pollStop.t);pollStop.t=setTimeout(pollStop,500)}
 pollStop();
 
@@ -774,11 +976,11 @@ function render(st){last=st;const sub=document.getElementById("sub");
   if(!st.plates.length){const card=document.getElementById("platecard");card.replaceChildren(el("div",{class:"empty"},"No plate in the loaded layout yet."))}
   else{const p=st.plates[0];
     const cs=Object.values(p.wells).filter(d=>d.v>0&&d.c>0).map(d=>d.c);LO=Math.min(0.01,...cs);plate(p)}  // floor keeps the scale steady while a series grows
-  reservoirs(st.containers);racks(st.tip_racks);timeline(st.events);agentPanel(st.agent,st.timing);statusRow(st);configCard(st)}
+  reservoirs(st.containers);racks(st.tip_racks);timeline(st.events);agentPanel(st.agent,st.timing);statusRow(st);configCard(st);cameraCard(st.config);autoCard(st.auto)}
 async function tick(){try{const r=await fetch("/state",{cache:"no-store"});if(r.status===204){document.getElementById("livetext").textContent="waiting for a run";}
   else{const st=await r.json();const tm=st.timing||{};
     TIM={t:tm,at:performance.now(),live:!!tm.run&&!tm.run.done&&["working","waiting"].includes((st.agent||{}).state)};
-    const key=JSON.stringify([st.summary,st.events.length,(st.events.at(-1)||{}).i,st.agent,st.config,st.gate,st.estop,tm.steps,tm.split,tm.run&&tm.run.done]);
+    const key=JSON.stringify([st.summary,st.events.length,(st.events.at(-1)||{}).i,st.agent,st.config,st.auto,st.gate,st.estop,tm.steps,tm.split,tm.run&&tm.run.done]);
     if(key!==tick.key){tick.key=key;render(st)}clocks();document.getElementById("dot").className="dot on";document.getElementById("livetext").textContent="live"}}
   catch(e){document.getElementById("dot").className="dot";document.getElementById("livetext").textContent="disconnected"}
   setTimeout(tick,500)}
@@ -789,24 +991,45 @@ let resizeTimer;addEventListener("resize",()=>{clearTimeout(resizeTimer);resizeT
 
 def stop_status(ws: Workspace) -> dict[str, Any]:
   """What the stop bar shows: the folder's stop as every reader sees it (estop.read), and for an engaged
-  stop whether an AHC server acknowledged it in a run log, with what the device reported."""
+  stop each AHC server's own acknowledgement (with a line to show) and the verdict on them."""
   record = estop.read(ws)
   out: dict[str, Any] = {**(record or {"engaged": False}), "folder": str(ws.root)}
   if record and record.get("engaged"):
-    ack = estop.acknowledgement(ws, record)
-    out["acknowledged"] = {**ack, "server": estop.server_text(ack)} if ack else None
     try:
       out["pressed_s"] = max(0, round(time.time() - estop.path(ws).stat().st_mtime))
     except OSError:
       out["pressed_s"] = None
+    acks = estop.acknowledgements(ws, record)
+    out["servers"] = [{**a, "line": estop.describe_server(a)} for a in acks]
+    out["verdict"] = estop.verdict(acks, out["pressed_s"] or 0)
   return out
 
 
+STOP_BUTTON = ('<button class="stopbtn" id="stopbtn" title="Stops every command of this task folder\'s server at once">'
+               'EMERGENCY STOP</button>')
+RELEASE_BUTTON = '<button class="releasebtn" id="releasebtn">Release…</button>'
+IDLE_TEXT = "Stops the hardware commands of this task folder at once; only a person releases it."
+VIEW_ONLY_TEXT = "View only: the stop and its release are on the person's own page."
+
+
+def render_page(ws: Workspace, token: str, view_only: bool = False) -> str:
+  """The page: with the stop and release buttons, or (view_only) without them and without the release token."""
+  return (PAGE.replace("<title>AHC · __AHC_FOLDER__</title>", "<title>AHC · __AHC_FOLDER__ · view only</title>" if view_only
+                       else "<title>AHC · __AHC_FOLDER__</title>")
+          .replace("__AHC_STOPBTN__", "" if view_only else STOP_BUTTON)
+          .replace("__AHC_RELEASEBTN__", "" if view_only else RELEASE_BUTTON)
+          .replace("__AHC_IDLE__", VIEW_ONLY_TEXT if view_only else IDLE_TEXT)
+          .replace("__AHC_VIEW__", "1" if view_only else "0")
+          .replace("__AHC_FOLDER__", html.escape(str(ws.root)))
+          .replace("__AHC_TOKEN__", "" if view_only else token))
+
+
 def serve(ws: Workspace, log: Path | Callable[[], Path | None] | None, port: int,
-          open_browser: bool) -> http.server.ThreadingHTTPServer:
+          open_browser: bool, view_only: bool = False) -> http.server.ThreadingHTTPServer:
   """The dashboard of one task folder on 127.0.0.1:<port> (0: a free port; the one bound is
   httpd.server_address[1]). Its stop button writes that folder's estop.json. `log` pins a run log, or a
-  function that gives one once it exists; without it the page follows the folder's newest active log."""
+  function that gives one once it exists; without it the page follows the folder's newest active log.
+  view_only: the same page without the stop and release buttons, and every POST refused."""
   token = secrets.token_hex(16)  # per process: the release comes from this page, not a stray request
   hosts: set[str] = set()
   own_origins: set[str] = set()
@@ -836,7 +1059,10 @@ def serve(ws: Workspace, log: Path | Callable[[], Path | None] | None, port: int
       origin = self.headers.get("Origin")
       return self.headers.get("Host") in hosts and (origin is None or origin in own_origins)
 
-    def do_POST(self):  # noqa: N802 - the emergency stop and its release
+    def do_POST(self):  # noqa: N802 - the emergency stop and its release, the boxes, the auto-verify pause
+      if view_only:  # nothing here writes anything: no stop, no release, whoever asks
+        self.rfile.read(min(int(self.headers.get("Content-Length") or 0), 65536))
+        return self._json(403, {"error": "this dashboard is view-only: the stop and its release are on the person's own page"})
       # Only this page's own fetch: a custom header and our origin. Another site cannot set the
       # header without a preflight, which this server never answers.
       if not self._ours() or self.headers.get("X-AHC-Control") != "1":
@@ -848,6 +1074,26 @@ def serve(ws: Workspace, log: Path | Callable[[], Path | None] | None, port: int
         payload = {}
       if not isinstance(payload, dict):
         payload = {}
+      edit = re.fullmatch(r"/cameras/([a-z][a-z0-9_]{0,31})/slots", self.path)
+      if edit:  # the person's dragged boxes: from this page, with its token, like a release
+        if self.headers.get("Origin") not in own_origins or \
+            not hmac.compare_digest(self.headers.get("X-AHC-Token") or "", token):
+          return self._json(403, {"error": "save from the dashboard page"})
+        try:
+          status, body = save_slots(ws, edit.group(1), payload.get("slots"))
+        except OSError as exc:
+          return self._json(500, {"error": f"could not write the config: {exc}"})
+        return self._json(status, body)
+      if self.path in ("/auto/pause", "/auto/resume"):  # the person's switch, from this page with its token, like a release
+        if self.headers.get("Origin") not in own_origins or \
+            not hmac.compare_digest(self.headers.get("X-AHC-Token") or "", token):
+          return self._json(403, {"error": "pause or resume auto-verify on the dashboard page"})
+        try:
+          if self.path == "/auto/pause":
+            return self._json(200, {"paused": True, **auto_verify.pause(ws)})
+          return self._json(200, {"paused": False, "changed": auto_verify.resume(ws)})
+        except OSError as exc:
+          return self._json(500, {"error": f"could not write the pause: {exc}"})
       if self.path == "/estop":
         try:
           return self._json(200, {**estop.engage(ws, by="dashboard", reason=str(payload.get("reason") or "")),
@@ -876,7 +1122,7 @@ def serve(ws: Workspace, log: Path | Callable[[], Path | None] | None, port: int
         return self._json(403, {"error": "forbidden"})
       route = self.path.split("?", 1)[0]
       if route == "/whoami":
-        return self._json(200, {"app": "ahc-dashboard", "folder": str(ws.root), "pid": os.getpid()})
+        return self._json(200, {"app": "ahc-dashboard", "folder": str(ws.root), "pid": os.getpid(), "view_only": view_only})
       if route == "/estop":
         return self._json(200, stop_status(ws))
       if route == "/state":
@@ -884,9 +1130,16 @@ def serve(ws: Workspace, log: Path | Callable[[], Path | None] | None, port: int
         if state is None:
           return self._send(204)
         return self._json(200, state)
+      shown = re.fullmatch(r"/camera/([a-z][a-z0-9_]{0,31})/reference\.jpg", route)
+      if shown:
+        data = reference_image(ws, shown.group(1))
+        return self._send(200, data, "image/jpeg") if data else self._send(404)
+      image = re.fullmatch(r"/run-image/(.+)", route)
+      if image:
+        data = run_image(ws, image.group(1))
+        return self._send(200, data, "image/jpeg") if data else self._send(404)
       if route in ("/", "/index.html"):
-        page = PAGE.replace("__AHC_FOLDER__", html.escape(str(ws.root))).replace("__AHC_TOKEN__", token)
-        return self._send(200, page.encode(), "text/html; charset=utf-8")
+        return self._send(200, render_page(ws, token, view_only).encode(), "text/html; charset=utf-8")
       return self._send(404)
 
   httpd = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
@@ -911,25 +1164,28 @@ def whoami(port: int, timeout: float = 1.0) -> dict[str, Any] | None:
 
 
 def open_dashboard(ws: Workspace, log: Path | Callable[[], Path | None] | None, port: int,
-                   open_browser: bool, reuse: bool = True) -> tuple[http.server.ThreadingHTTPServer | None, str]:
+                   open_browser: bool, reuse: bool = True,
+                   view_only: bool = False) -> tuple[http.server.ThreadingHTTPServer | None, str]:
   """For ahc-smoke, ahc-demo and ahc-dashboard: this folder's dashboard, never another folder's. A
   dashboard for this folder already on `port` follows the run too (unless `reuse` is off); anything
-  else there is left alone, and the next free port serves this folder. Returns the server started
-  (None when one was already there) and a line for the person."""
+  else there is left alone, and the next free port serves this folder. A view-only dashboard is its
+  own kind: it never reuses a control page, nor a control page a view-only one. Returns the server
+  started (None when one was already there) and a line for the person."""
   try:
-    httpd = serve(ws, log, port, open_browser)
+    httpd = serve(ws, log, port, open_browser, view_only)
     return httpd, f"http://127.0.0.1:{httpd.server_address[1]}/"
   except OSError:
     pass
   other = whoami(port)
-  if reuse and other is not None and _same_folder(other.get("folder"), ws.root):
+  same_kind = other is not None and bool(other.get("view_only")) == view_only
+  if reuse and other is not None and same_kind and _same_folder(other.get("folder"), ws.root):
     return None, f"http://127.0.0.1:{port}/ (the ahc-dashboard already running for this folder)"
-  taken = (f"port {port} serves the dashboard of {other.get('folder')}"
+  taken = (f"port {port} serves the {'view-only ' if other.get('view_only') else ''}dashboard of {other.get('folder')}"
            + ("" if _same_folder(other.get("folder"), ws.root) else "; its stop button does NOT stop this run")
            if other is not None else f"port {port} is taken by something that is not this folder's dashboard")
   for candidate in [*range(port + 1, port + 21), 0]:
     try:
-      httpd = serve(ws, log, candidate, open_browser)
+      httpd = serve(ws, log, candidate, open_browser, view_only)
     except OSError:
       continue
     return httpd, f"http://127.0.0.1:{httpd.server_address[1]}/ ({taken})"
@@ -963,6 +1219,9 @@ def main() -> None:
   parser.add_argument("--log", default=None, help="a specific run log; default follows the newest active one in the workspace")
   parser.add_argument("--port", type=int, default=8770)
   parser.add_argument("--no-browser", action="store_true")
+  parser.add_argument("--view-only", action="store_true",
+                      help="a page for an audience: no stop or release controls, every POST refused (run it next to the "
+                           "control one; it takes the next free port)")
   args = parser.parse_args()
   log = Path(args.log).expanduser().resolve() if args.log else None
   folder = args.workspace or (log_folder(log) if log else None)
@@ -975,7 +1234,7 @@ def main() -> None:
   except LabError as exc:
     sys.exit(f"ahc-dashboard: {exc.message} {exc.hint}")
   try:  # a port held by another folder's dashboard is never taken for this one's
-    httpd, where = open_dashboard(ws, log, args.port, not args.no_browser, reuse=log is None)
+    httpd, where = open_dashboard(ws, log, args.port, not args.no_browser, reuse=log is None, view_only=args.view_only)
   except OSError as exc:
     sys.exit(f"ahc-dashboard: {exc}")
   if httpd is None:
@@ -983,7 +1242,9 @@ def main() -> None:
       webbrowser.open(f"http://127.0.0.1:{args.port}/")
     print(f"ahc-dashboard: {where}")
     return
-  print(f"dashboard on {where} for {ws.root}; its stop button stops this folder's server  (Ctrl-C to stop)")
+  print(f"dashboard on {where} for {ws.root}; "
+        + ("view only: no stop or release" if args.view_only else "its stop button stops this folder's server")
+        + "  (Ctrl-C to stop)")
   try:
     threading.Event().wait()
   except KeyboardInterrupt:

@@ -222,6 +222,22 @@ On a real robot:
   when and why; the person removes them by hand (or sees there are none), and the agent asks for
   their verdict on one check for both pipettes, `verify(check="tips_mounted", expect="none")`
   without a device. Their pass clears the note.
+- `disconnect` lets go of the robot without an emergency stop, so the session, the dashboard and
+  the run log stay up: it ends the run (`run_ended_confirmed` is the robot's own answer, not an
+  assumption), closes the connection, notes tips still on a pipette as a restart does and logs it.
+  Afterwards motion is refused (`disconnected`) until you give the go-ahead (`confirm_config`) and
+  the layout is loaded again. There is no terminal command for it; ending the server does the same
+  stop: SIGTERM and SIGINT (what Claude Code sends when a session ends) stop the run and close the
+  dashboard, for at most 10 s, then exit and log it if the robot did not confirm.
+- One server per robot: `load_layout` takes an exclusive lock on `<AHC_HOME>/locks/<robot name>.lock`
+  (`flock`: it frees itself when the process dies; the file holds the pid, task folder, start time
+  and Claude session id for the refusal). It is released by `disconnect`, when the server ends and
+  with a new config. A second server's `load_layout` is refused (`robot_in_use`) and names the
+  holder; you decide which session drives the robot. Reading takes no lock; simulators take none.
+- A robot's USB link-local address can change between days. When the address does not answer
+  (`backend_unreachable`), AHC looks for the configured `robot_name` with `find_robots` (about 3 s)
+  and the refusal names the address it answers at. It never switches the address itself: the agent
+  writes it with `configure_devices` and you confirm it (the name is checked).
 - Every deck check, tip check and liquid check waits for the person's verdict, and nothing moves
   while a tip or liquid check waits (`check_pending`). `verify` returns `ask_person` with it, one
   sentence of what the person confirms (each slot's labware and liquids; "No tip on either pipette
@@ -341,10 +357,111 @@ records the verdict. Notes:
 
 - Captures are refused in simulation (`camera_not_in_simulation`): a camera shows the real deck.
 - A capture is no motion, so it still runs while the emergency stop is engaged: the Claude Code hook
-  (`hooks/estop-guard.sh`) lets `capture` (and the ToolSearch that loads it) through and denies every
-  other call, which ends the agent's turn.
+  (`hooks/estop-guard.sh`) lets it through, with the other calls that only look or report (see
+  [Emergency stop](#emergency-stop)), and denies every other call, which ends the agent's turn.
 - Images stay on this computer, unmasked and never uploaded by AHC; the client shows them to its model.
 - macOS asks once whether the terminal (or Claude Code) may use the camera.
+
+### Slot maps and the physical world context
+
+A camera can carry a slot map (`cameras[].slot_map` in the config): a reference image under
+`.ahc/cameras/<name>/reference.jpg` and one box per deck slot it sees, in the reference's pixels. It is
+part of the confirmation digest, and the confirm summary says what each camera sees ("usb ... (sees slots 1-9)").
+Nobody writes it by hand:
+
+- `map_camera(camera)` takes a reference image (the deck clear, nothing in front of the lens) and returns it
+  inline with the OT-2 deck guide; the agent proposes `map_camera(camera, slots={"2": [x0, y0, x1, y1], ...})`,
+  which is written to the config (pending until the person confirms it) and drawn on the reference to check.
+  A box may reach past the frame (a plate cut off at the edge); `view="side"` marks a side camera (levels stop
+  at `slot`); a close-up region for tips is `tips:<component>`.
+- The dashboard's control page shows each reference with its boxes: the person drags corners (resize) or the
+  body (move) and saves, which writes the config and sends it back to pending. The view-only page shows the
+  overlay without handles. Saving needs the page's own token, like a release.
+
+Every capture of a mapped camera is aligned to the reference (ORB features, RANSAC homography) and each
+slot's crop is measured, by AHC and never self-reported. A capture's `images[].slots` has per slot: the
+warped `box` (in the preview's pixels), `level` (`unclear`, `slot`: labware presence, type and liquid colour
+can be judged, `well`: single wells can be resolved, `tip` for a tips region), `sharpness`, `px_per_well`,
+`visible` and a crop file `<camera>_<HHMMSS>_slot<N>.jpg` next to the image. Thresholds (calibrated on 16 real
+captures; see `src/ahc/vision.py`): frame sharpness at least 12, slot crop sharpness at least 6, at least
+half the box inside the frame, 0.8 px/mm for a slot, 20 px per well for `well`, 40 aligned features; a frame
+out of focus or covered is `unclear`, a camera that no longer aligns `needs_new_map`.
+
+`physical_world_context()` is the umbrella for what AHC can observe of the real deck. It is built from independent
+context sources, each reporting per verification point whether it can observe the point, at what level and how
+fresh the observation is:
+
+- `vision_context`: the cameras (slot maps, alignment, the quality gate above);
+- `instrument_context`: the device's own sensors, which the device adapter reports (`Adapter.sensor_report`). The OT-2
+  GEN2 has none ("OT-2: no tip or liquid sensors"); the STARlet's tip presence, liquid-level detection and pressure
+  monitoring are not read as evidence yet;
+- later sources (a balance, a plate reader, room sensors) implement the same small interface (`src/ahc/physical_world.py`).
+
+The digital twin is not a source: its tracked volumes and tips are the expectation that observations are
+compared with, and they never add confidence.
+
+Once a plan is reported and a layout is loaded the run has verification points: every layout slot at level `slot`
+for `deck_matches_layout`, the targets the agent declares with `report_decision(vision_points=[...])` at level
+`well` for `liquid_present`, and `tips:<pipette>` at level `tip` for `tips_mounted` (uncovered until a camera maps
+such a region or the instrument senses tips). The tool returns:
+
+```json
+{"vision_context": {"cameras": {"usb": {"status": "ok", "fresh": true, "frame_sharpness": 41.2, "alignment": {"ok": true, "inliers": 1109}}}},
+ "instrument_context": {"device": "ot2", "observes": {}, "note": "OT-2: no tip or liquid sensors"},
+ "points": [{"what": "slot:2", "level": "slot", "check": "deck_matches_layout", "declared_by": "derived",
+             "status": "covered", "sources": [{"source": "vision:usb", "level": "well", "fresh": true, "covers": true}]},
+            {"what": "tips:ot2.right", "level": "tip", "check": "tips_mounted", "declared_by": "derived",
+             "status": "uncovered", "sources": [], "why": "no source observes it"}],
+ "physical_world_confidence": {"by_check": {"deck_matches_layout": {"status": "covered", "points": {"covered": 4, "uncovered": 0, "unclear": 0},
+                                                                  "sources": [{"source": "vision:usb", "level": "well"}]},
+                                            "tips_mounted": {"status": "uncovered", "points": {"covered": 0, "uncovered": 2, "unclear": 0}, "sources": []}},
+                               "by_source": {"vision:usb": {"observes": 4, "covers": 4}}, "all_confident": false},
+ "suggestions": ["a camera with a 'tips:ot2.right' region (map_camera) close enough to see the tip: at least 60 px across, or an instrument with a tip sensor"],
+ "checked_at": "2026-10-29T19:12:00"}
+```
+
+`physical_world_confidence` is the conclusion, with no numeric score: per point and per check type `covered`,
+`uncovered` or `unclear`, with the sources and levels that cover each point. A point is confident when at least one
+source covers it at the level it needs. `lab_overview.physical_world_context` and the dashboard's "Physical world
+context" section show the per-source breakdown and the confidence per check type.
+
+On real hardware, while a check waits for the person, the agent may call `propose_verdict(check_id, verdict,
+images, per_point)` (shadow mode: it passes nothing). When the person's verdict arrives AHC records, per check
+type, in `.ahc/state/vision_record.json` whether the two agreed (`agree_streak`, `total`, `disagreements`);
+a disagreement or an unclear judgment resets the streak, and any change of a slot map resets every streak.
+
+### Auto-verify (opt-in, per check type)
+
+The person can let the cameras answer some checks. It is part of the confirmed config, so they confirm it once
+and it holds across sessions:
+
+```yaml
+auto_verify:
+  checks: [deck_matches_layout, liquid_present]   # only deck_matches_layout, liquid_present, tips_mounted
+  min_streak: 5                                   # whole number >= 1, default 5
+```
+
+(`configure_devices(auto_verify={...})` writes it; `{}` turns it off; the confirm summary lists it, e.g.
+"auto-verify: deck_matches_layout, liquid_present after 5 agreements".) A check is then answered by the agent,
+from the crops of the cameras, only while all of this holds, measured by AHC and never self-reported: the check
+type is listed; auto is not paused (the dashboard's "Pause auto", which writes `.ahc/auto-pause.json`); no emergency stop
+is engaged; it is not the recovery check of every pipette; the run is confident, that is every verification point of
+every check type listed in `auto_verify.checks` is covered in `physical_world_confidence` (by sharp, aligned captures
+newer than the last motion; one uncovered or unclear point of a listed type turns auto off for every check, with
+`auto_off: "low vision confidence: <the points and why>"`, while points of unlisted types do not count); the check has
+points of its own; and the agent's `propose_verdict` judgments agreed with the person's verdicts `min_streak` times in
+a row (a track record kept per check type, separate from the confidence). Then `verify` returns `auto: true` with the points and crops, and
+the agent calls `agent_verdict(check_id, verdict, images, per_point, note)`. A pass passes the check (`judged_by:
+agent (auto, cameras)`, images kept, the gate opens after a deck check). A fail, an unclear judgment, or any
+condition no longer holding hands the check back to the person with motion still held; an auto fail is never
+recorded. When a condition fails at `verify`, the result is the person's check as before with `auto_off`
+saying which. Auto verdicts do not change the streak.
+
+Always the person's: the recovery checks after a stop, an unknown outcome or a restart, the config and the
+go-ahead, the homing go-ahead, and the stop release. The dashboard shows the run-level state, an AUTO badge per authorised check
+type (or the reason it is off), the pause button (control page only; the view-only page has none and answers
+403), and the review list: every auto verdict with its time, images and the agent's note. The stop hook lets
+`physical_world_context` through (it captures, it does not move); `agent_verdict` is not allowed while stopped.
 
 ## Dashboard and demo
 
@@ -364,14 +481,21 @@ The dashboard belongs to one task folder and names it, as an absolute path, in i
 stop bar. If its port (8770) is taken by something else, it binds a free one and says so. It shows,
 from top to bottom:
 
-- the emergency stop button and, once pressed, whether the server took the stop and what the device
-  reported;
+- the emergency stop button and, once pressed, one line per AHC server for the folder (what it
+  drives and what its device did) and whether the robot reported its run stopped;
 - the agent: what it was asked, what it is doing, its plan with each step's progress, and the checks
   waiting for you;
 - the task folder, config, layout, motion gate and last hardware event;
 - the plate, reservoirs and tips (tips returned to a rack are marked as returned, never as fresh);
 - the task's configuration and layout;
 - every hardware call, newest first.
+
+Anyone who can open the dashboard can press release. To show a run to an audience, open a
+**view-only** page next to your own: `open_dashboard(view_only=true)` (the agent calls it when you
+ask) or `ahc-dashboard --view-only`. It is the same page with no stop or release button and no
+release token, and its server refuses every POST (403). It takes the next free port, so you keep
+your control page, and each kind is reused only by its own kind. Captures are not shown on the
+dashboard, so there is nothing to hide there.
 
 Concentrations are the digital twin's estimate (complete mixing; liquid behind a `stock` alias
 = 1), not measurements. `AHC_VIEW=1 claude` also opens a live 3D view of the device when the agent
@@ -387,11 +511,36 @@ recorded, never shell commands or file contents. `AHC_FEED=0 claude` turns this 
 Press the red button on the dashboard (the agent opens it with `open_dashboard`), or run
 `uv run --project <repo> ahc-estop` in the task folder (add `--workspace <folder>` from anywhere;
 `lab_overview.emergency_stop.how` has the exact command and the folder of the server the agent uses).
-`ahc-estop` says whether a server took the stop and what the device reported.
+`ahc-estop` waits (`--wait N`, 3 s by default) for the servers and prints one line per AHC server for
+the folder, then a verdict:
+
+```
+EMERGENCY STOP engaged for /labs/dilution at 2026-10-29T14:03:11.
+Servers that took the stop (3):
+  pid 4242 (up since 13:40:02): ot2 opentrons.ot2/robot 'OT2CEP20210324', run active: the robot reports its run stopped
+  pid 4301 (up since 13:52:40): no device bound: nothing to stop
+  pid 4177 (up since 12:10:09, STALE: that process is gone, this is the last it wrote): no device bound: nothing to stop
+Verdict: the robot reports its run stopped.
+```
+
+The verdict is either that, or `NOT confirmed: <why>; the power switch is the immediate stop` (the
+robot did not confirm, another client's run replaced AHC's, a server is still stopping or died while
+stopping, or no server answered). `ahc-estop --status` shows the same lines for a stop already
+pressed (`--json` for scripts), and so does the dashboard. Each server writes its own file,
+`.ahc/estop-acks/<stop id>/<pid>-<server>.json` (stop id and press time, pid, start time, the bound
+device with its robot name or none, whether a run was active, and `halt`: `stopped`, `no_run`,
+`no_stop` for a device AHC has no stop for, `not_confirmed` with its reason, `other_run_active`,
+`pending` or `no_device`); a file whose pid is gone is shown as STALE.
 
 - The server sends the device nothing more and refuses every action, configuration change and check
   until a person releases it; reading state and `report_decision` still work. In Claude Code the
-  plugin's hook also stops the agent at its next tool call.
+  plugin's hook also stops the agent at its next tool call, and while the stop is engaged lets only
+  these calls run (an allowlist, `hooks/estop-allowed-tools.txt`, read by both hooks): Read, Grep,
+  Glob, ToolSearch, TodoWrite, SendMessage, ListAgents, and AHC's `lab_overview`, `get_state`,
+  `get_run`, `list_checks`, `describe_device`, `get_params`, `find_layout_references`, `find_robots`,
+  `capture`, `open_dashboard` and `report_decision`. Everything else is denied and ends the turn:
+  Bash, edits, web tools, subagents, AHC's actions and person tools, other MCP servers' tools, and
+  any tool the list does not name. Without python3 every call is denied.
 - On an OT-2 the stop also ends AHC's run on the robot, on a connection of its own, so it reaches a
   run that is still being set up. The robot halts only once the run's command in flight has run to
   its end: a move, an aspirate or dispense, a tip pick-up. The home at the start of `load_layout` is
@@ -449,7 +598,7 @@ OT-2 simulator; when nothing answers there, the run fails instead of skipping th
 | `src/ahc/core/` | capability layer, layouts, errors |
 | `src/ahc/devices/` | adapter interface, description files, one folder per brand |
 | `src/ahc/devices/opentrons/sim/` | `ahc-sim ot2` |
-| `src/ahc/workspace/` | task folders: config, limits, layouts, references, emergency stop |
+| `src/ahc/workspace/` | task folders: config, limits, layouts, references, emergency stop, the per-robot lock |
 | `src/ahc/verification/` | checks and the motion gate |
 | `src/ahc/plan.py` | the agent's plan and its progress |
 | `src/ahc/smoke.py` | `ahc-smoke`: scripted first runs on a real OT-2 |

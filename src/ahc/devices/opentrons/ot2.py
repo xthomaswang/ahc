@@ -57,6 +57,9 @@ class OT2Adapter(OpentronsAdapter):
       self._tip_air.pop(mount, None)
       self._unprimed.discard(mount)
 
+  def sensor_report(self) -> dict[str, Any]:
+    return {"observes": {}, "note": "OT-2: no tip or liquid sensors"}
+
   def command_count(self) -> int:
     """Run commands submitted to the robot-server, counted here: no request to the robot."""
     return self._sent
@@ -174,6 +177,15 @@ class OT2Adapter(OpentronsAdapter):
     if self.device is not None:
       await self._release(self.device)
       self.device = None
+
+  async def run_ended(self, run_id: str | None) -> bool | None:
+    """Asks the robot-server about the run (its own record: stopped, finished, gone or no longer current)."""
+    if run_id is None:
+      return None
+    try:
+      return await asyncio.to_thread(self._run_ended, run_id)
+    except Exception:  # noqa: BLE001 - the robot cannot say: not confirmed
+      return False
 
   async def halt(self) -> bool:
     """The emergency stop: stop the robot's run at once, also a run load_layout is still setting up.

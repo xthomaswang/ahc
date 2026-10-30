@@ -94,6 +94,11 @@ class Adapter(ABC):
     """The emergency stop: stop the device itself, if it has a stop this adapter can reach. False if not."""
     return False
 
+  async def run_ended(self, run_id: str | None) -> bool | None:
+    """After stop(): whether the device itself says that run ended (asked, not assumed); None for a device that keeps
+    no runs. A device that cannot answer says False."""
+    return None
+
   def require_layout(self) -> Layout:
     if self.layout is None:
       raise LabError("no_layout", "no deck layout is loaded.", "Call load_layout first.")
@@ -195,3 +200,11 @@ class Adapter(ABC):
   async def sense(self, comp: Component, check: str) -> dict[str, Any] | None:
     """Readings from the instrument's own sensors for a check, or None when it has none."""
     return None
+
+  def sensor_report(self) -> dict[str, Any]:
+    """What this instrument's own sensors can observe, for physical_world_context's instrument_context:
+    {"observes": {check: level}, "note": text}. `observes` names the checks a sensor can read ('tips_mounted' at level
+    'tip', 'liquid_present' at level 'well'); empty for an instrument with none, which is the honest default. The
+    readings themselves come through sense(). This is the one place a device adds a sensor: nothing in the vision code
+    changes. The digital twin is not a sensor and never appears here."""
+    return {"observes": {}, "note": f"{self.spec.title}: no sensors AHC reads as evidence"}

@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ahc.core.errors import LabError
-from ahc.verification.ask import pass_now
+from ahc.verification.ask import agent_now, pass_now
 
 STATES = {"pass": "passed", "fail": "failed", "pending": "pending"}
 
@@ -37,6 +37,7 @@ class Gate:
   layout_ref: Any = field(default=None, repr=False, compare=False)  # the Layout object load_layout built
   differs: str | None = None  # how the layout differs from the task folder's references, for the person
   found: str | None = None  # what the person found on the deck before this load (a failed liquid check), to look at again
+  auto: bool = False  # the pending deck check is an auto check: the agent judges it from camera images (agent_verdict)
 
   def public(self) -> dict[str, Any]:
     return {"layout": self.layout, "state": self.state, "check_id": self.check_id, "needs_person": self.needs_person}
@@ -57,8 +58,11 @@ class Gate:
       raise LabError("gate_failed", "the last deck check failed: the deck does not match the loaded layout, so nothing may move.",
                      "The person on site fixes the deck, then verify(check='deck_matches_layout') again, or load a corrected layout.")
     check = self.waiting_for_person()
-    waiting = (f"Deck check {check} waits for the person's verdict: {pass_now(check, '<ask_person from verify>')}"
-               if check else None)
+    if check and self.auto:
+      waiting = f"Deck check {check} waits for the agent's judgment of the camera images: {agent_now(check)}"
+    else:
+      waiting = (f"Deck check {check} waits for the person's verdict: {pass_now(check, '<ask_person from verify>')}"
+                 if check else None)
     if self.needs_person:
       raise LabError("gate_pending", "the person has not confirmed this layout yet, so nothing may move. "
                      + (self.differs or "No layout saved or run in this task folder to compare it with."),
@@ -69,4 +73,4 @@ class Gate:
                    "record_verdict for that check right away.")
 
   def apply(self, check_id: str, verdict: str) -> None:
-    self.state, self.check_id = STATES[verdict], check_id
+    self.state, self.check_id, self.auto = STATES[verdict], check_id, False

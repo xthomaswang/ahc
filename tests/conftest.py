@@ -160,6 +160,26 @@ async def confirm_pipettes_empty(lab, **step):
   return check
 
 
+@pytest.fixture(autouse=True)
+def no_robot_search(monkeypatch):
+  """A robot that does not answer is looked for by its name with find_robots (mDNS on the real network): never in a
+  test, unless the test names what the search finds."""
+  monkeypatch.setattr("ahc.server.search_robots", lambda timeout_s: [])
+
+
+@pytest.fixture(autouse=True)
+def robot_locks_in_tmp(monkeypatch, tmp_path_factory):
+  """A real robot's lock lives under AHC_HOME (robot_lock.py). A test that sets AHC_HOME gets that; any other gets a
+  folder of its own, so no test touches ~/.ahc and two tests (or two xdist workers) never hold one lock."""
+  from pathlib import Path
+
+  from ahc.workspace import robot_lock
+
+  own = tmp_path_factory.mktemp("ahc-locks")
+  monkeypatch.setattr(robot_lock, "ahc_home", lambda: Path(os.environ["AHC_HOME"]).expanduser()
+                      if os.environ.get("AHC_HOME") else own)
+
+
 @pytest.fixture
 def fake_robot():
   """A fake OT-2 robot-server on a free local port (tests/fake_robot.py); closed after the test."""

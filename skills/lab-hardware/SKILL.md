@@ -19,7 +19,8 @@ read `patterns.md` in this skill's folder.
    the next step. Read what you need (`find_layout_references`, `describe_device`, `get_params`).
    Call `open_dashboard` at the start of a task: it serves the run page from this server and opens
    it in the person's browser, so they can watch the run and use its stop button. The person types
-   nothing; `lab_overview.dashboard` has the URL.
+   nothing; `lab_overview.dashboard` has the URL. For an audience, `open_dashboard(view_only=true)`
+   opens a second page with no stop or release button; the person keeps their own.
 2. Report your plan with `report_decision(plan=[...])` before `load_layout` or any action (refused
    otherwise: `plan_required`): short concrete steps, e.g. "Load the layout", "The person checks the
    deck", "Add 50 uL buffer to plate columns 1-3", "Check the volumes", "Report the result".
@@ -153,6 +154,11 @@ decide: you prepare it, show it and wait.
   `no_usable_pipette`, `wrong_robot` (another robot answers at that address): stop and tell the person.
 - Tell the person how to stop this server: `lab_overview.emergency_stop.how` (the dashboard's stop
   button, or `uv run --project <repo> ahc-estop` in a terminal).
+- To let go of the robot while the session and the dashboard stay up, call `disconnect` (no emergency
+  stop): it ends the run (`run_ended_confirmed`, the robot's own answer) and notes tips left on a pipette.
+  Then nothing moves (`disconnected`) until the person's `confirm_config` and a `load_layout`.
+  `robot_in_use` (another session drives this robot): tell the person; that session must disconnect or end,
+  and they decide which one drives.
 - `load_layout` starts a run on the robot and homes it: hands and deck must be clear and the
   pipettes carry no tips. It has no dialog of its own, so fold that into the last one before it (the
   `tips_mounted` note or `confirm_config`): say in chat, in the same message before that call, that
@@ -166,7 +172,7 @@ decide: you prepare it, show it and wait.
   When it says this run still holds its tips, `drop_tips` first: the check of every pipette is
   refused while the run holds tips it knows.
 - Every `verify` waits for the person (`pending`), except `volumes_match`, which the digital twin
-  answers. The result carries `ask_person`, one sentence of what they confirm (the deck's slots,
+  answers, and a check with `auto: true` (see Auto-verify below), which you judge. The result carries `ask_person`, one sentence of what they confirm (the deck's slots,
   labware and liquids; "No tip on either pipette (ot2.left, ot2.right)"; "8 tips seated straight on
   ot2.right"; the liquid targets and minimum volume). Report `waiting_for="person"`, then call
   `record_verdict(check_id, verdict="pass", note=<ask_person>)` right away: the dialog Claude Code
@@ -199,6 +205,80 @@ decide: you prepare it, show it and wait.
   hardware the person still gives the verdict. Cameras are the person's to declare (`configure_devices`
   `cameras`, confirmed by them); never invent a device name, ask which camera is which.
 
+### Slot maps, verification points and shadow judgments (cameras with a slot map)
+
+- `map_camera(camera)` takes a reference image (deck clear, head parked away, nobody in front of the lens) and
+  gives it back with the deck guide: from above, slots 1-3 are the front row left to right, 4-6 and 7-9 the
+  rows behind, then 10, 11 and the trash 12 in the back row. Propose a box per slot you can see with
+  `map_camera(camera, slots={"2": [x0, y0, x1, y1], ...})`, in the pixels of that image, hugging each
+  labware's footprint (128 x 85 mm, long side left to right) by its guide lines and engraved number. A slot cut
+  off at the frame's edge gets its whole footprint (the box reaches past the edge); AHC knows which wells are
+  visible. Leave out slots the camera does not see. A side camera: `view="side"`. A close-up of a pipette's
+  tips: `tips:<component>`. The drawn boxes come back for you to check; the config is then pending: the person
+  confirms it (`confirm_config`, the deck is checked again) and can drag boxes on the dashboard.
+- A capture of a mapped camera says per slot the `level` AHC measured: `unclear` (too blurry, covered, too
+  small or mostly out of frame: judge nothing), `slot` (labware present, its type and liquid colour) or `well`
+  (single wells). Judge only at that level, and look at the crops (`slots[].crop`). `map` is `unclear` when
+  the frame is out of focus or covered (capture again with the head parked elsewhere) and `needs_new_map`
+  when the camera no longer lines up with its reference (the camera moved: `map_camera` again).
+- With the plan, declare what your checks need the cameras to see:
+  `report_decision(plan=[...], vision_points=[{"what": "plate:B1:B8", "level": "well", "check": "liquid_present"}])`
+  (`what`: a target, `slot:<n>` or `tips:<component>`; `level`: `slot`, `well` or `tip`). AHC adds the points
+  it derives from the loaded layout (every slot at `slot` for the deck check, `tips:<pipette>` for tips); you
+  cannot remove those.
+- `physical_world_context()` is the umbrella: what AHC can observe of the real deck, from independent sources.
+  It captures (unless a capture newer than the last motion exists) and returns `vision_context` (the cameras:
+  slot maps, alignment, quality gate), `instrument_context` (the device's own sensors; the OT-2 says "no tip or
+  liquid sensors", and the STARlet's tip presence, liquid-level detection and pressure monitoring are not read as
+  evidence yet), `points`, `physical_world_confidence` and `suggestions`. Each point lists its `sources`
+  (`{source: "vision:usb", level, fresh, covers}`; a source that cannot use the point says `state` and `why`) and a
+  `status`: `covered` (at least one source covers it at its level), `unclear` (blurred, covered or not captured:
+  capture again; `state: needs_new_map` on a source: the camera moved, `map_camera` again) or `uncovered`.
+  `physical_world_confidence.by_check` gives the same per check type with the sources and levels that cover
+  it, `by_source` what each source observes and covers, `all_confident` whether every point is covered. There is no
+  numeric score. A point at level `well` also needs those wells inside the frame (a plate cut off at the top shows
+  rows D-H only). Use it to know what can be verified before you rely on an image; it gives no verdict.
+- The digital twin (tracked volumes and tips) is not a source: it is the expectation that observations are
+  compared with, and it never adds confidence.
+- Shadow mode, on real hardware: while a check waits for the person, look at the crops and call
+  `propose_verdict(check_id, verdict="pass"|"fail"|"unclear", images=[...], per_point=[...])` before
+  `record_verdict`. Images are required. It passes nothing: the person's verdict decides. AHC records whether
+  you agreed with them (per check type; a disagreement or `unclear` resets the streak, a changed slot map
+  resets all), which later decides how much the cameras may judge on their own. Say `unclear` when the
+  images cannot tell; never guess. The recovery checks after a stop, an unknown outcome or a restart stay
+  with the person (`recovery_check`).
+
+### Auto-verify (only when `lab_overview.auto_verify` is there)
+
+The person can let the cameras answer `deck_matches_layout`, `liquid_present` or `tips_mounted` checks
+(`auto_verify` in the confirmed config, set with `configure_devices(auto_verify={"checks": [...], "min_streak": 5})`).
+AHC, not you, decides when a check is auto: the check type is listed, auto is not paused (dashboard), no
+stop is engaged, it is not the recovery check, the run is confident, the check has points of its own, and your
+`propose_verdict` judgments agreed with the person's `min_streak` times in a row (per check type).
+"The run is confident" is decided for the whole run: every point of every check type listed in `auto_verify.checks`
+must be `covered` in `physical_world_confidence` (fresh captures newer than the last motion, sharp, aligned). One
+uncovered or unclear point of a listed type turns auto off for every check, with `auto_off: "low vision confidence:
+<the points not covered and why>"`; points of check types that are not listed do not count. So a listed `tips_mounted`
+keeps auto off wherever nothing observes the tips. `lab_overview.auto_verify` says the run level and, per check
+type, AUTO or why not.
+
+- Capture first (`physical_world_context`; after any motion the old pictures are stale), then `verify`. Auto:
+  the result has `auto: true`, `points` with their `crops`, `images` and `ask_agent`; no `ask_person`. Not
+  auto: it is the person's check as always, with `auto_off` saying why (fix what it names if you can, e.g.
+  capture again with the head parked away; otherwise carry on with the person).
+- Judge the crops yourself, point by point, and call `agent_verdict(check_id, verdict, images, per_point, note)`.
+  `pass` only when every point shows what the check asks; hidden, blurred, off or in doubt is `unclear`, a
+  mismatch is `fail`. Nothing moves until the verdict.
+- `pass` passes the check (`judged_by: agent (auto, cameras)`, images kept) and opens the gate after a deck
+  check; the person reviews every auto verdict on the dashboard. `fail`, `unclear`, or auto no longer holding
+  (a motion, a stop, a blurred capture, a pause since `verify`): nothing is recorded as a verdict, the check
+  is the person's (`ask_person`, `auto_off`), motion stays held, and you go on with `record_verdict` as usual.
+  Never an auto fail. Auto verdicts do not count toward the streak; keep calling `propose_verdict` on the
+  person's checks.
+- Always the person's, whatever the config says: the recovery check of every pipette after a stop, an unknown
+  outcome or a restart (tips removed by hand), the config and the go-ahead, the homing go-ahead, and the stop
+  release.
+
 ## When something goes wrong
 
 - `completion_unknown`: a command may or may not have run on the robot. Stop and tell the person;
@@ -207,11 +287,15 @@ decide: you prepare it, show it and wait.
   touched as unknown, `tips_mounted` and `liquid_present` say unknown, and `volumes_match` fails on
   those wells.
 - `device_refused`: the device model or the robot refused the command. `backend_unreachable`: the
-  robot is off or not on this network. On real hardware stop and ask the person, and never retry a
+  robot is off or not on this network (or its address changed: when the message names where the robot
+  answers now, `configure_devices` with that `options.host` and the person confirms; never switch it
+  yourself). On real hardware stop and ask the person, and never retry a
   motion call; in simulation, change the call as the message says.
 - `emergency_stop`: the person pressed the stop. Stop at once: do not retry, do not work around it,
-  never release it. With cameras configured, `capture` the deck first: it is the one call that still
-  runs. Tell the person what was running and report `waiting_for="person"`. AHC sends
+  never release it. Read-only calls, `capture` and `report_decision` still run; nothing else does (the
+  Claude Code hook denies every other call, Bash and edits included, and ends your turn). With cameras
+  configured, `capture` the deck first. Tell the person what was running and report
+  `waiting_for="person"`. AHC sends
   nothing more (on an OT-2 it also stops its run), but the robot may first finish the command it is
   executing (a move, an aspirate, a pick-up): the robot's power switch is the immediate stop. When
   `next` or `get_state.unknown` says the robot has not confirmed that its run stopped, it may still be

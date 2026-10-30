@@ -170,6 +170,24 @@ def test_a_call_the_stop_refuses_shows_as_denied(tmp_path):
   assert calls == [("denied", "aspirate", "call:toolu_1"), ("doing", "verify", "call:toolu_2")]
 
 
+def test_the_feed_shows_a_call_as_denied_when_the_allowlist_does_not_list_it(tmp_path):
+  """The feed reads the list the stop hook reads (hooks/estop-allowed-tools.txt): what it allows shows as doing, the
+  rest as denied."""
+  from ahc.workspace import estop
+  from ahc.workspace.store import Workspace
+
+  task = tmp_path / "task"
+  (task / ".ahc").mkdir(parents=True)
+  tx = transcript(tmp_path / "t.jsonl", [human("u1", "Dilute")])
+  estop.engage(Workspace(task), by="dashboard")
+  tools = ["Read", AHC + "get_state", AHC + "report_decision", "Bash", "Write", AHC + "aspirate", AHC + "verify", "mcp__other__x"]
+  for n, tool in enumerate(tools):
+    assert _pre(task, tx, tool, f"toolu_{n}").wait(timeout=30) == 0
+  kinds = {e["tool"]: e["kind"] for e in feed(task) if e["kind"] in ("doing", "denied")}
+  assert kinds == {"Read": "doing", "get_state": "doing", "report_decision": "doing", "Bash": "denied", "Write": "denied",
+                   "aspirate": "denied", "verify": "denied", "mcp__other__x": "denied"}
+
+
 def test_parallel_calls_write_every_entry_once(tmp_path):
   tx = transcript(tmp_path / "t.jsonl", [human("u1", "Dilute"), assistant("a1", [{"type": "text", "text": "Two reads at once."}])])
   for trial in range(5):  # Claude Code runs the hooks of parallel tool calls at the same time

@@ -28,7 +28,7 @@ from ahc.devices.base import Adapter
 from ahc.devices.spec import DeviceSpec
 from ahc.core.errors import LabError
 from ahc.records import RunLog
-from ahc.verification.ask import DENIED, pass_now
+from ahc.verification.ask import DENIED, agent_now, pass_now
 
 # What the person checks on a real deck besides each labware and its position: in the check itself, in what
 # verify asks them, and where find_layout_references sends them to the deck.
@@ -48,6 +48,7 @@ CHECKS = {
 CAMERA_NOTE = ("no camera verifier: no image is judged automatically. Photos from capture can be attached with "
                "images=[...] as evidence; on real hardware the person still records the verdict")
 TWIN_JUDGE = "digital twin (what was sent, not measured)"
+AUTO_JUDGE = "agent (auto, cameras)"
 HOLDING = ("tips_mounted", "liquid_present")  # the person's checks that hold motion while they wait, or once failed
 # On real hardware the person checks the deck against this, every time.
 DECK_ON_SITE = (f"The person on site checks the deck against the layout: every slot's labware as listed, {ON_A_REAL_DECK}. "
@@ -75,10 +76,13 @@ class Verification:
   async def verify(self, check: str, device: str | None = None, targets: list[str] | None = None,
                    expect: str = "mounted", min_volume_ul: float = 0.0, person: bool = False,
                    expected: dict[str, Any] | None = None, tolerance_ul: float = 0.5,
-                   differs: str | None = None, images: list[str] | None = None) -> dict[str, Any]:
+                   differs: str | None = None, images: list[str] | None = None, auto: bool = False) -> dict[str, Any]:
     """`person`: the verdict is the person's even in simulation (a layout no reference matches). `differs`: how
     the loaded layout differs from the task folder's references, for the person checking the deck. `images`:
-    photos from capture (the server checked their paths) kept as the check's camera evidence."""
+    photos from capture (the server checked their paths) kept as the check's camera evidence. `auto` (real
+    hardware, the server decided): the agent answers from camera images (agent_verdict) instead of the person;
+    the check still holds motion while it waits, and stays a person check underneath: a fail or an unclear
+    judgment hands it to them."""
     if check not in CHECKS:
       raise LabError("unknown_check", f"no check named {check!r}.", f"Checks: {', '.join(CHECKS)}.")
     if check == "volumes_match":
@@ -106,6 +110,8 @@ class Verification:
       self.pending[check_id] = result
       result["ask_person"] = self._ask_person(check, device, targets, expect, min_volume_ul, twin)
       result["next"] = self._ask(check_id, check, device, targets, expect, min_volume_ul, person, differs)
+      if auto and not self.adapter.simulated:
+        result["auto"] = True
       if check in HOLDING:
         replaced = self._hold(check_id, check, device, twin, targets, expect, min_volume_ul)
         if replaced:
@@ -114,7 +120,26 @@ class Verification:
       self.runlog.record({"type": "verification", "check_id": old, "check": check, "verdict": "superseded",
                           "judged_by": f"nobody: check {check_id} replaced it"})
     self.runlog.record({"type": "verification", **{k: result[k] for k in ("check_id", "check", "verdict", "judged_by")},
-                        "evidence": result["evidence"], **({"supersedes": replaced[-1]} if replaced else {})})
+                        "evidence": result["evidence"], **({"supersedes": replaced[-1]} if replaced else {}),
+                        **({"auto": True} if result.get("auto") else {})})
+    return result
+
+  def mark_auto(self, check_id: str) -> None:
+    """A check that waited for the person is the agent's to judge now (the server found auto applies)."""
+    result = self.pending[check_id]
+    result["auto"] = True
+    self.runlog.record({"type": "verification", "check_id": check_id, "check": result["check"], "verdict": "pending",
+                        "judged_by": result["judged_by"], "evidence": result["evidence"], "auto": True})
+
+  def hand_to_person(self, check_id: str, judgment: str) -> dict[str, Any]:
+    """An auto check the agent could not pass (fail, unclear, or auto no longer applies): it is a plain person check
+    from now on, as verify first made it (still pending, motion held). Nothing is recorded as a verdict; the run log
+    says it waits for the person, with `judgment` (what the agent said) for the dashboard. Returns the pending
+    result."""
+    result = self.pending[check_id]
+    result.pop("auto", None)
+    self.runlog.record({"type": "verification", "check_id": check_id, "check": result["check"], "verdict": "pending",
+                        "judged_by": f"the person: {judgment}", "evidence": result["evidence"]})
     return result
 
   def _ask(self, check_id, check, device, targets, expect, min_volume_ul, person, differs=None) -> str:
@@ -156,6 +181,10 @@ class Verification:
     return f"that each container of {', '.join(targets or [])} holds at least {min_volume_ul:g} uL"
 
   # -- what the person's checks hold back ---------------------------------------------------------
+
+  def _answer(self, check_id: str) -> str:
+    """The call that answers a pending check: the agent's for an auto check, else the person's."""
+    return agent_now(check_id) if self.pending.get(check_id, {}).get("auto") else pass_now(check_id)
 
   def _hold(self, check_id: str, check: str, device: str | None, twin: dict[str, Any], targets: list[str] | None,
             expect: str, min_volume_ul: float) -> list[str]:
@@ -256,11 +285,13 @@ class Verification:
     waiting = {cid: h for cid, h in self.holds.items() if h["state"] == "pending"}
     if waiting:
       named = " and ".join(f"{h['check']} check {cid} (they check {h['asked']})" for cid, h in waiting.items())
+      auto = all(self.pending.get(c, {}).get("auto") for c in waiting)
       raise LabError("check_pending",
-                     f"{named} {'waits' if len(waiting) == 1 else 'wait'} for the person's verdict, so nothing moves "
-                     "until they answer.",
-                     f"{' '.join(pass_now(cid) for cid in waiting)} Never a verdict of your own. A new verify of the "
-                     "same check replaces the one waiting.")
+                     f"{named} {'waits' if len(waiting) == 1 else 'wait'} for "
+                     + ("the agent's judgment of the camera images, so nothing moves until it comes." if auto else
+                        "the person's verdict, so nothing moves until they answer."),
+                     f"{' '.join(self._answer(cid) for cid in waiting)}{'' if auto else ' Never a verdict of your own.'} "
+                     "A new verify of the same check replaces the one waiting.")
     failed = {cid: h for cid, h in self.holds.items() if h["state"] == "failed"}
     for cid, hold in failed.items():
       if hold["check"] == "tips_mounted" and op != "drop_tips":
@@ -293,8 +324,9 @@ class Verification:
       if cid == skip:
         continue
       if hold["state"] == "pending":
-        parts.append(f"{hold['check']} check {cid} waits for the person's verdict (they check {hold['asked']}): "
-                     f"{pass_now(cid)} Nothing moves before that.")
+        by = "the agent's judgment of the camera images" if self.pending.get(cid, {}).get("auto") else "the person's verdict"
+        parts.append(f"{hold['check']} check {cid} waits for {by} (checking {hold['asked']}): "
+                     f"{self._answer(cid)} Nothing moves before that.")
       else:
         parts.append(f"The person failed {hold['check']} check {cid}: {self._until(hold)}")
     return " ".join(parts) + (" " if parts else "")
@@ -431,7 +463,8 @@ class Verification:
       note = doubt["why"] + (f" ({note})" if note else "")
     return twin, sensors, note
 
-  def record_verdict(self, check_id: str, verdict: str, note: str = "") -> dict[str, Any]:
+  def _waiting(self, check_id: str) -> dict[str, Any]:
+    """The pending check with this id, or the refusal that says why none waits."""
     if check_id in self.superseded:
       newest = self.superseded[check_id]
       while newest in self.superseded:
@@ -440,7 +473,8 @@ class Verification:
                      f"check {check_id} was replaced by a new verify of the same check, so a verdict on it would change "
                      "nothing.",
                      (f"Check {newest} waits for the person's verdict: " + pass_now(newest, "<its ask_person>")
-                      if newest in self.pending else
+                      if newest in self.pending and not self.pending[newest].get("auto") else
+                      f"Check {newest} waits: " + agent_now(newest) if newest in self.pending else
                       "Run verify again, then record_verdict for that new check with its ask_person."))
     if check_id not in self.pending:
       raise LabError("unknown_check_id",
@@ -448,13 +482,34 @@ class Verification:
                      "the simulator (except a layout no reference matches), and a check made before the server restarted is gone.",
                      "Run verify again for a new check (after a restart: load_layout first); for a layout no reference "
                      "matches, record_verdict for the check verify gives, with its ask_person.")
+    return self.pending[check_id]
+
+  def record_verdict(self, check_id: str, verdict: str, note: str = "") -> dict[str, Any]:
+    self._waiting(check_id)
     if verdict not in ("pass", "fail"):
       raise LabError("bad_verdict", "verdict must be 'pass' or 'fail'.")
     result = {**self.pending.pop(check_id), "verdict": verdict, "judged_by": "human", "note": note}
-    result.pop("next", None)  # what the person was asked; the caller says what comes next
-    result.pop("ask_person", None)
-    result.pop("supersedes", None)
+    for key in ("next", "ask_person", "supersedes", "auto"):  # what the person was asked; the caller says what comes next
+      result.pop(key, None)
     self._settle(check_id, verdict)
     self.runlog.record({"type": "verification", "check_id": check_id, "check": result["check"],
                         "verdict": verdict, "judged_by": "human", "note": note})
+    return result
+
+  def agent_pass(self, check_id: str, note: str, images: list[str], per_point: list[dict[str, str]]) -> dict[str, Any]:
+    """An auto check the agent judged a pass from camera images: it passes, judged by the agent, with the images as
+    its evidence. The caller checked that auto still applies. Only a pass is ever recorded this way."""
+    pending = self._waiting(check_id)
+    if not pending.get("auto"):
+      raise AssertionError("agent_pass on a check verify did not mark auto")
+    self.pending.pop(check_id)
+    camera = {"images": list(images), "per_point": per_point,
+              "note": "judged by the agent from these images (auto-verify); listed on the dashboard for the person to review"}
+    result = {**pending, "verdict": "pass", "judged_by": AUTO_JUDGE, "note": note,
+              "evidence": {**pending["evidence"], "camera": camera}}
+    for key in ("next", "ask_person", "supersedes", "auto"):
+      result.pop(key, None)
+    self._settle(check_id, "pass")
+    self.runlog.record({"type": "verification", "check_id": check_id, "check": result["check"], "verdict": "pass",
+                        "judged_by": AUTO_JUDGE, "note": note, "evidence": {"camera": camera}})
     return result

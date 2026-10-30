@@ -197,6 +197,11 @@ class STARletAdapter(HamiltonAdapter):
       return {"tip_presence_per_channel": list(await self._pip(comp).sense_tip_presence())}
     return await super().invoke(comp, op, params)
 
+  def sensor_report(self) -> dict[str, Any]:
+    # The STAR has tip presence (sense() below), liquid-level detection and pressure monitoring. They come later as
+    # evidence: report them here ({"tips_mounted": "tip", "liquid_present": "well"}) once a real STARlet backend exists.
+    return {"observes": {}, "note": "STARlet: tip presence, liquid-level detection and pressure monitoring are not read as evidence yet"}
+
   async def sense(self, comp: Component, check: str) -> dict[str, Any] | None:
     if check == "tips_mounted" and self.device is not None:
       return {"tip_presence_per_channel": list(await self._pip(comp).sense_tip_presence())}

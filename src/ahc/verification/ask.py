@@ -26,6 +26,12 @@ def pass_now(check_id: str, note: str = "<ask_person>", homes: bool = False) -> 
           + (f" {HOMING}" if homes else ""))
 
 
+def agent_now(check_id: str) -> str:
+  """The next call for an auto check (the config lets the cameras answer it): the agent judges from the images."""
+  return (f"Judge it from the camera crops and call agent_verdict(check_id='{check_id}', verdict='pass'|'fail'|'unclear', "
+          "images=[...], per_point=[...]) now; fail or unclear goes to the person, who answers with record_verdict.")
+
+
 def confirm_now(summary: str = "config.confirm_summary", homes: bool = False) -> str:
   """The next call for a config (or session go-ahead) that waits for the person. `homes`: a real robot, whose
   load_layout homes it."""

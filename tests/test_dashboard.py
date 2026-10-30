@@ -13,9 +13,10 @@ import pytest
 
 from ahc.examples import STARLET_LAYOUT
 from ahc.viz.dashboard import (_expand, current_state, latest_log, log_folder, open_dashboard, replay, serve,
-                               stop_status, whoami)
+                               whoami)
 from ahc.workspace import estop
 from ahc.workspace.store import Workspace
+from ackenv import ROBOT, dead_pid, put_ack
 from conftest import load_verified
 
 pytestmark = pytest.mark.anyio
@@ -180,7 +181,8 @@ def dashboard(tmp_path):
 def test_the_page_names_the_folder_it_stops(dashboard):
   ws, port, token = dashboard
   status, _, body = _http(port, "/whoami")
-  assert status == 200 and json.loads(body) == {"app": "ahc-dashboard", "folder": str(ws.root), "pid": os.getpid()}
+  assert status == 200 and json.loads(body) == {"app": "ahc-dashboard", "folder": str(ws.root), "pid": os.getpid(),
+                                                "view_only": False}
   page = _http(port, "/")[2].decode()
   assert f"<title>AHC · {ws.root}</title>" in page  # the absolute folder, in the tab and in the stop bar
   assert f"Task folder <code>{ws.root}</code>" in page and len(token) == 32
@@ -223,21 +225,23 @@ def test_the_dashboard_button_needs_its_own_page(dashboard):
   assert status == 409 and "nothing to release" in json.loads(body)["error"]
 
 
-def test_the_stop_bar_says_whether_a_server_took_the_stop(dashboard):
+def test_the_stop_bar_says_what_each_server_did_with_the_stop(dashboard):
   ws, port, _ = dashboard
   pressed = estop.engage(ws, by="terminal")
   stop = json.loads(_http(port, "/estop")[2])
-  assert stop["engaged"] and stop["acknowledged"] is None and stop["pressed_s"] >= 0  # said plainly on the page
-  ws.runs_dir.mkdir(parents=True)
-  (ws.runs_dir / "r.jsonl").write_text("".join(json.dumps(e) + "\n" for e in [
-    {"type": "run", "run_id": "r"},
-    {"type": "estop", "state": "engaged", "id": pressed["id"], "t": "2026-10-22T10:00:01"},
-    {"type": "audit", "event": "device_halted", "detail": "the device stopped its run"}]))
+  assert stop["engaged"] and stop["servers"] == [] and stop["pressed_s"] >= 0  # said plainly on the page
+  assert stop["verdict"]["state"] == "not_confirmed" and "no AHC server has acknowledged" in stop["verdict"]["text"]
+  put_ack(ws, pressed, os.getpid(), "stopped", ROBOT, run_active=True)
+  put_ack(ws, pressed, os.getpid(), "no_device", None, server="def456")
+  put_ack(ws, pressed, dead_pid(), "pending", ROBOT, server="0a0a0a")
   stop = json.loads(_http(port, "/estop")[2])
-  assert stop["acknowledged"]["at"] == "2026-10-22T10:00:01" and stop["acknowledged"]["halt"] == "halted"
+  assert [s["halt"] for s in stop["servers"]] == ["stopped", "no_device", "pending"]
+  assert [s["stale"] for s in stop["servers"]] == [False, False, True]
+  assert "OT2-LAB" in stop["servers"][0]["line"] and "STALE" in stop["servers"][2]["line"]
+  assert stop["verdict"]["state"] == "not_confirmed"  # a server that died while stopping leaves the question open
   estop.path(ws).write_text("stop")
   stop = json.loads(_http(port, "/estop")[2])
-  assert stop["engaged"] and stop["unreadable"] == "not JSON" and stop["acknowledged"] is None
+  assert stop["engaged"] and stop["unreadable"] == "not JSON" and stop["servers"] == []
 
 
 def test_smoke_and_demo_never_claim_another_folders_dashboard(tmp_path, dashboard):
@@ -318,17 +322,68 @@ def test_the_page_survives_robot_outcomes_nobody_knows_and_every_target_form(tmp
   assert event["unknown"] and event["status"] == "refused" and state["summary"]["refused"] == 1
 
 
-def test_the_stop_bar_names_the_server_that_took_the_stop(dashboard):
-  ws, port, _ = dashboard
-  pressed = estop.engage(ws, by="dashboard")
-  ws.runs_dir.mkdir(parents=True)
-  (ws.runs_dir / "demo.jsonl").write_text("".join(json.dumps(e) + "\n" for e in [
-    {"type": "run", "run_id": "demo", "device": "opentrons.ot2", "backend": "sim"},  # e.g. an ahc-demo still up
-    {"type": "estop", "state": "engaged", "id": pressed["id"], "at": pressed["at"], "t": pressed["at"]}]))
-  ack = json.loads(_http(port, "/estop")[2])["acknowledged"]
-  assert ack["server"] == " for opentrons.ot2 (simulated)"  # a simulator's server is never taken for the robot's
-  assert estop.describe_ack(ack, 0).startswith("Acknowledged by the AHC server for opentrons.ot2 (simulated) at")
-  assert stop_status(ws)["acknowledged"]["backend"] == "sim"
+def test_the_view_only_page_has_no_controls_and_refuses_every_post(tmp_path):
+  ws = Workspace(tmp_path / "task")
+  ws.root.mkdir()
+  control, viewer = serve(ws, None, 0, open_browser=False), serve(ws, None, 0, open_browser=False, view_only=True)
+  try:
+    cport, vport = control.server_address[1], viewer.server_address[1]
+    assert cport != vport
+    own = _http(cport, "/")[2].decode()
+    page = _http(vport, "/")[2].decode()
+    assert 'id="stopbtn"' in own and 'id="releasebtn"' in own
+    for control_html in ('id="stopbtn"', 'id="releasebtn"', "EMERGENCY STOP</button>", "Release…</button>"):
+      assert control_html not in page, control_html
+    assert 'name="ahc-view" content="1"' in page and "view only</title>" in page
+    token = re.search(r'name="ahc-token" content="([0-9a-f]*)"', page).group(1)
+    assert token == ""  # no release token on the audience's page
+    assert json.loads(_http(vport, "/whoami")[2])["view_only"] is True and whoami(vport)["view_only"] is True
+    assert json.loads(_http(vport, "/estop")[2]) == {"engaged": False, "folder": str(ws.root)}  # it shows the state
+    mine = {"Origin": f"http://127.0.0.1:{vport}", "X_AHC_Control": "1", "Content-Type": "application/json"}
+    for path in ("/estop", "/estop/release", "/nothing"):
+      for headers in (mine, {}):  # with every protection the control page's own fetch carries, and without
+        assert _http(vport, path, "POST", {"confirm": True, "reason": "x"}, **headers)[0] in (403, 405), path
+    assert not estop.path(ws).exists()
+    # The same requests to the control page still stop and release (its protections are unchanged).
+    pressed = estop.engage(ws, by="test")
+    assert _http(vport, "/estop/release", "POST", {"confirm": True}, **mine, X_AHC_Token=token)[0] in (403, 405)
+    assert estop.read(ws)["engaged"] and estop.read(ws)["id"] == pressed["id"]
+    assert json.loads(_http(vport, "/estop")[2])["engaged"] is True  # the audience sees a stop
+  finally:
+    control.shutdown()
+    viewer.shutdown()
+
+
+def test_a_view_only_dashboard_is_its_own_second_server_next_to_the_control_one(tmp_path):
+  ws = Workspace(tmp_path / "task")
+  ws.root.mkdir()
+  control, where = open_dashboard(ws, None, 0, open_browser=False)
+  port = control.server_address[1]
+  try:
+    viewer, line = open_dashboard(ws, None, port, open_browser=False, view_only=True)  # that port holds the control page
+    assert viewer is not None and viewer.server_address[1] != port, line
+    assert whoami(viewer.server_address[1])["view_only"] is True and whoami(port)["view_only"] is False
+    again, line = open_dashboard(ws, None, viewer.server_address[1], open_browser=False, view_only=True)
+    assert again is None and "already running" in line  # its own kind is reused
+    asked, line = open_dashboard(ws, None, viewer.server_address[1], open_browser=False)  # a control page is no view-only one
+    assert asked is not None and asked.server_address[1] != viewer.server_address[1]
+    asked.shutdown()
+    viewer.shutdown()
+  finally:
+    control.shutdown()
+
+
+async def test_open_dashboard_view_only_starts_a_second_dashboard(tmp_path, open_lab):
+  async with open_lab(tmp_path, "sim") as lab:
+    control = await lab.call("open_dashboard", open_browser=False)
+    viewer = await lab.call("open_dashboard", open_browser=False, view_only=True)
+    again = await lab.call("open_dashboard", open_browser=False, view_only=True)
+    assert viewer["view_only"] is True and "how_to_stop" not in viewer and "how_to_stop" in control
+    assert viewer["url"] != control["url"] and viewer["started"] and again["url"] == viewer["url"] and not again["started"]
+    status, body = await anyio.to_thread.run_sync(_get, viewer["url"], "/")
+    assert status == 200 and b'id="stopbtn"' not in body
+    status, body = await anyio.to_thread.run_sync(_get, control["url"], "/")
+    assert status == 200 and b'id="stopbtn"' in body
 
 
 # -- which run the page follows, and when it waits for the person ------------------------------------

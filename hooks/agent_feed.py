@@ -10,7 +10,7 @@ written, before the server itself writes anything. Only tool names are recorded 
 AHC's, so shell commands and file contents never land in the feed.
 
 A call made while the folder's emergency stop is engaged is recorded as denied, not as being called:
-the stop hook (estop-guard.sh) refuses it (all but a capture, open_dashboard and the ToolSearch that loads them), by the same reading of .ahc/estop.json. Parallel tool calls
+the stop hook (estop-guard.sh) refuses it (all but the tools in estop-allowed-tools.txt, which both read), by the same reading of .ahc/estop.json. Parallel tool calls
 run this at once; the feed is locked while one of them reads what it holds and appends, and every call
 carries its tool_use_id, so nothing is written twice.
 
@@ -28,7 +28,7 @@ import time
 from pathlib import Path
 
 AHC_TOOL = "mcp__plugin_ahc_ahc__"
-RUN_WHILE_STOPPED = (AHC_TOOL + "capture", AHC_TOOL + "open_dashboard", "ToolSearch")  # what estop-guard.sh lets through a stop
+ALLOWED_WHILE_STOPPED = Path(__file__).with_name("estop-allowed-tools.txt")  # what estop-guard.sh lets through a stop
 TAIL_BYTES = 400_000
 FEED_TAIL_BYTES = 2_000_000
 TEXT_LIMIT = 600
@@ -138,6 +138,15 @@ def _seen(text: str) -> set[str]:
   return seen
 
 
+def run_while_stopped() -> set[str]:
+  """The tools that still run while the stop is engaged, from the list estop-guard.sh reads. Nothing if it cannot be read."""
+  try:
+    lines = ALLOWED_WHILE_STOPPED.read_text(encoding="utf-8").splitlines()
+  except (OSError, ValueError):
+    return set()
+  return {line.strip() for line in lines if line.strip() and not line.startswith("#")}
+
+
 def estop_engaged(ahc_dir: Path) -> bool:
   """The folder's emergency stop, read as estop-guard.sh and the server read it: no file is no stop, a
   JSON object whose "engaged" is false is a release, anything else counts as pressed."""
@@ -194,7 +203,7 @@ def main() -> None:
     return  # AHC's own data folder (AHC_HOME), not a task's: a session in the home folder is no AHC task
   if not ahc_dir.is_dir() and not tool.startswith(AHC_TOOL):
     return  # not an AHC task (yet): nothing to watch
-  stopped = event == "pre" and tool not in RUN_WHILE_STOPPED and estop_engaged(ahc_dir)
+  stopped = event == "pre" and tool not in run_while_stopped() and estop_engaged(ahc_dir)
   ahc_dir.mkdir(exist_ok=True)  # the first AHC call: the dashboard can show the agent from here on
   with open(feed, "a+b") as f:
     _lock(f)

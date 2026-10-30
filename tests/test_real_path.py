@@ -261,7 +261,13 @@ async def test_only_a_server_that_may_drive_a_robot_carries_its_rules(tmp_path, 
   async with open_lab(tmp_path, backend=None) as lab:
     real = lab.client.instructions
   assert "Real hardware" not in forced and "forces simulation" in forced
-  assert len(real) < 5000 and real.startswith(forced.split("\nConfig:")[0])
+  assert len(real) < 4500 and real.startswith(forced.split("\nConfig:")[0])  # detail lives in tool descriptions and the skill
+  for text in (forced, real):  # every safety rule stays in the instructions, in few words
+    for rule in ("If a call is refused with emergency_stop, stop at once: do not retry or work around it, never release it yourself",
+                 "Plan first: before load_layout or any action, report your plan", "(refused otherwise: plan_required)",
+                 "After every load_layout nothing moves until the deck check passes",
+                 "Never approve for them or invent their words."):
+      assert rule in text, rule
   for text in (forced, real):  # the person's tools: their approval in the client's dialog is the confirmation
     assert "their approval in the client's dialog is the confirmation, so call them right away; do not wait for a typed answer" in text
     assert "record_verdict(check_id, verdict='pass', note=<ask_person>)" in text and "confirm_config(summary=config.confirm_summary)" in text
@@ -278,7 +284,7 @@ async def test_only_a_server_that_may_drive_a_robot_carries_its_rules(tmp_path, 
                "never retry a motion call", "removes any tips",
                "- Never reach the robot except through these tools: no curl or other HTTP to it, no ahc-smoke; only the "
                "person releases a stop (never ahc-estop --release).",
-               "plate:col2 then plate:col3, one pass each", "call confirm_config(summary=config.confirm_summary) right away",
+               "call confirm_config(summary=config.confirm_summary) right away",
                "With no config, ask the person whether to simulate or use a real robot",
                "Each new server session also needs their go-ahead", "(lab_overview.session)"):
     assert rule in real, rule

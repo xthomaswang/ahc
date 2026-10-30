@@ -207,7 +207,7 @@ async def test_a_server_with_nothing_bound_writes_nothing_for_a_stop(tmp_path, o
   async with open_lab(tmp_path, "sim") as active, open_lab(tmp_path, backend=None) as idle:
     server = await ready(active)
     pressed = estop.engage(server.ws, by="test")
-    await until(lambda: idle.server.lab.estop is not None)  # held in memory all the same
+    await until(lambda: idle.server.lab.estop is not None and server.estop is not None)  # both latched it
     assert (await idle.call("lab_overview"))["emergency_stop"]["engaged"]
     estop.release(server.ws, by="person")
     await until(lambda: idle.server.lab.estop is None and server.estop is None)

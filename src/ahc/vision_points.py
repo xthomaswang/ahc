@@ -13,7 +13,8 @@ unclear. `declared_by` says who made a point (derived or agent).
 
 The track record (.ahc/state/vision_record.json) counts, per check type, how often the agent's image judgment
 (propose_verdict, shadow mode) agreed with the person's verdict. A disagreement or an unclear judgment resets the
-streak; a change of any camera's slot map resets every streak.
+streak; a change of any camera's slot map made by the agent (map_camera) resets every streak, while the person's own
+calibration on the dashboard (boxes saved) keeps them (VisionRecord.carry).
 """
 
 from __future__ import annotations
@@ -159,6 +160,20 @@ class VisionRecord:
     if not isinstance(data, dict) or data.get("maps") != digest or not isinstance(data.get("checks"), dict):
       return {}
     return {k: v for k, v in data["checks"].items() if isinstance(v, dict)}
+
+  def carry(self, old: str, new: str) -> bool:
+    """The person's own calibration moved the boxes: the record kept for the old maps digest now belongs to the new one
+    (no streak is reset). False when there was no record for `old`."""
+    if old == new:
+      return False
+    try:
+      data = json.loads(self.path.read_text())
+    except (OSError, ValueError):
+      return False
+    if not isinstance(data, dict) or data.get("maps") != old:
+      return False
+    write_atomic(self.path, json.dumps({**data, "maps": new}, indent=2) + "\n")
+    return True
 
   def compare(self, digest: str, check: str, agent: str, person: str, check_id: str) -> dict[str, Any]:
     """Record the agent's judgment (pass, fail or unclear) next to the person's verdict (pass or fail)."""

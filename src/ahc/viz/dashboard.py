@@ -15,10 +15,11 @@ answers only to its own page (Host and Origin checked, never framed).
 
 Anyone at a dashboard can press release, so the person keeps the control page and shows the view-only one.
 
-Cameras: a camera with a slot map shows its reference image with the boxes drawn over it, and what the cameras
-cover (the last physical_world_context: per source and per check type). The control page lets the person drag the boxes (corners resize, the body
-moves) and save; a save writes the config, which is pending until they confirm it again. The view-only page
-shows the same, with no handles and no save.
+Cameras: Deck setup > Cameras shows the live picture of each camera and what the cameras cover (the last
+physical_world_context: per source and per check type). The slot boxes and the plates' wells are calibrated on /calibration,
+a page only the dashboard the AHC server serves has (ahc.viz.calibration); the standalone ahc-dashboard has none.
+While a camera waits for the person the control page's / sends them there (/?page=run stays the run page); the
+view-only page says only that calibration is in progress.
 """
 
 from __future__ import annotations
@@ -49,6 +50,9 @@ from ahc.core.errors import LabError
 from ahc.devices.spec import LIQUID_HANDLING_OPS
 from ahc.plan import PlanProgress
 from ahc.timing import run_timing
+from ahc.calibration import read_state as calibrate_state
+from ahc.viz import calibration as calibrate
+from ahc.viz import stopbar, viewlink
 from ahc.workspace import estop
 from ahc.workspace.store import Workspace, resolve_workspace
 
@@ -163,11 +167,22 @@ def replay(path: Path | None, stock: list[str] | None = None, ahc_dir: Path | No
   progress = PlanProgress()  # rebuilt from the log exactly as the server keeps it
   gate: dict[str, Any] | None = None
   layout_info: dict[str, Any] | None = None
+  planned: dict[str, Any] | None = None  # the newest deck report_decision(layout=...) previewed
+  loaded: dict[str, Any] | None = None  # the deck load_layout put on the device
   stopped: dict[str, Any] | None = None  # the engaged emergency stop, as the server logged it
   waiting: dict[str, dict[str, Any]] = {}  # the person's checks still without a verdict, by check id
 
   for i, e in enumerate(entries[1:], 1):
     progress.apply(e)
+    if e.get("type") == "deck":  # the deck map of a previewed (planned) or a loaded layout
+      if isinstance(e.get("map"), dict):
+        shot = {"i": i, "t": e.get("t"), "name": e.get("name"), "map": e["map"], "text": e.get("text"),
+                "differs": e.get("differs")}
+        if e.get("event") == "planned":
+          planned = shot
+        elif e.get("event") == "loaded":
+          loaded = shot
+      continue
     if e.get("type") == "agent":
       decisions.append({k: e[k] for k in ("t", "decision", "why", "current_step", "waiting_for", "plan_done") if k in e})
       continue
@@ -336,11 +351,25 @@ def replay(path: Path | None, stock: list[str] | None = None, ahc_dir: Path | No
   return {"run": {k: header.get(k) for k in ("run_id", "device", "backend")}, "log": str(path) if path else None,
           "workspace": header.get("workspace") or str(ahc_dir.parent), "summary": summary, "plates": plates,
           "containers": containers, "tip_racks": racks, "events": events[-200:], "gate": gate,
-          "layout": layout_info, "estop": stopped,
+          "layout": layout_info, "estop": stopped, "deck": deck_view(planned, loaded, gate),
           # as_of: the page ticks the live clocks from it, so they never depend on the browser's time zone
           "timing": {**run_timing(entries), "as_of": datetime.now().isoformat(timespec="milliseconds")},
           "agent": agent_view(decisions, progress, gate, ahc_dir / "agent-feed.jsonl", list(waiting.values())),
           "config": workspace_config(ahc_dir / "config.yaml"), "auto": auto_state(ahc_dir)}
+
+
+def deck_view(planned: dict[str, Any] | None, loaded: dict[str, Any] | None,
+              gate: dict[str, Any] | None) -> dict[str, Any] | None:
+  """The Deck setup card: the previewed deck while it is the newest, else the loaded one. `pinned` (shown at the top of
+  the page) from the preview until the deck check has passed for the layout the card shows; a reload, or a released
+  emergency stop that renews the gate, pins it again. `differs`: how the loaded deck differs from the plan's."""
+  if planned is None and loaded is None:
+    return None
+  planning = planned is not None and (loaded is None or planned["i"] > loaded["i"])
+  shown = planned if planning else loaded
+  checked = not planning and bool(gate and gate.get("state") == "passed")
+  return {"mode": "plan" if planning else "loaded", "pinned": not checked, "checked": checked, "name": shown["name"],
+          "t": shown["t"], "text": shown["text"], "map": shown["map"], "differs": None if planning else shown["differs"]}
 
 
 def auto_state(ahc_dir: Path) -> dict[str, Any] | None:
@@ -377,11 +406,14 @@ def current_state(ws: Workspace, log: Path | Callable[[], Path | None] | None) -
   """What /state serves: the pinned run log (given as a function: once it exists), else the folder's
   newest active log; without one the agent alone once it has started, else nothing."""
   path = log() if callable(log) else (log or latest_log(ws.runs_dir))
+  state = None
   if path is not None and path.is_file():
-    return replay(path)
-  if (ws.dir / "agent-feed.jsonl").is_file():
-    return replay(None, ahc_dir=ws.dir)
-  return None
+    state = replay(path)
+  elif (ws.dir / "agent-feed.jsonl").is_file():
+    state = replay(None, ahc_dir=ws.dir)
+  if state is not None:  # where the server's 3D live view is (None: not running, or its server is gone)
+    state["view"] = viewlink.read(ws)
+  return state
 
 
 def agent_view(decisions: list[dict[str, Any]], progress: PlanProgress, gate: dict[str, Any] | None,
@@ -448,12 +480,13 @@ def workspace_config(path: Path) -> dict[str, Any] | None:
     out["auto_verify"] = config.auto_verify.data()
   if config.cameras:
     out["cameras"] = [{"name": c.name, "device": c.device, "sees": c.sees(),
-                       "slot_map": {k: c.slot_map[k] for k in ("size", "view", "slots")} if c.slot_map else None}
+                       "slot_map": {k: c.slot_map[k] for k in ("size", "view", "slots")} if c.slot_map else None,
+                       **({"source": c.source} if c.is_robot else {})}
                       for c in config.cameras]
     seen = _json(path.parent / "state" / "physical_world.json")
     if seen and any(c.slot_map for c in config.cameras):
       out["physical_world"] = {k: seen.get(k) for k in ("checked_at", "vision_context", "instrument_context", "points",
-                                                       "physical_world_confidence", "suggestions")}
+                                                       "physical_world_confidence", "suggestions", "plate_calibration")}
   return out
 
 
@@ -486,33 +519,6 @@ def run_image(ws: Workspace, relative: str) -> bytes | None:
     return path.read_bytes()
   except (OSError, ValueError):
     return None
-
-
-def save_slots(ws: Workspace, name: str, slots: Any) -> tuple[int, dict[str, Any]]:
-  """The person's dragged boxes into the config: the camera's own slots, moved or resized, none added or dropped.
-  The config's digest changes, so it is pending until they confirm it again."""
-  from ahc.workspace.config import HEADER, parse_config, parse_slot_map
-
-  try:
-    config = parse_config(ws.config_path.read_text())
-  except (OSError, LabError) as exc:
-    return 409, {"error": f"the config cannot be read: {getattr(exc, 'message', exc)}"}
-  camera = next((c for c in config.cameras if c.name == name and c.slot_map), None)
-  if camera is None:
-    return 404, {"error": f"no camera {name!r} with a slot map"}
-  if not isinstance(slots, dict) or set(slots) != set(camera.slot_map["slots"]):
-    return 400, {"error": "save the boxes of the slots the map has, no more and no fewer"}
-  try:
-    new = parse_slot_map({**camera.slot_map, "slots": slots}, name)
-  except LabError as exc:
-    return 400, {"error": exc.message}
-  if new == camera.slot_map:
-    return 200, {"saved": False, "reason": "no box changed", "status": config.status(False)[0]}
-  cameras = [replace(c, slot_map=new) if c.name == name else c for c in config.cameras]
-  config = replace(config, cameras=cameras)
-  ws.write_config(config.data(), HEADER)
-  status, why = config.status(False)
-  return 200, {"saved": True, "status": status, "reason": why}
 
 
 PAGE = r"""<!doctype html>
@@ -568,9 +574,23 @@ code{font:12px ui-monospace,SFMono-Regular,Menlo,monospace}.dev{color:var(--mute
 .det{color:var(--ink2);font-size:12px;margin-top:2px}.msg{color:var(--ink2);font-size:12px;margin-top:3px}
 .tag{display:inline-block;font-size:11px;padding:0 6px;border-radius:8px;background:var(--chip);color:var(--ink2);margin-left:6px}
 .tag.tr::before{content:"↻ ";color:var(--warning)}
-.racks{display:flex;gap:18px;flex-wrap:wrap}.racks svg circle.free{fill:var(--axis)}
-.racks svg circle.used{fill:none;stroke:var(--axis);stroke-width:1}
-.racks svg circle.returned{fill:none;stroke:var(--ink2);stroke-width:1;stroke-dasharray:1.2 1}
+.racks{display:flex;gap:18px;flex-wrap:wrap}.racks svg circle.free,.deck svg circle.free{fill:var(--axis)}
+.racks svg circle.used,.deck svg circle.used{fill:none;stroke:var(--axis);stroke-width:1}
+.racks svg circle.returned,.deck svg circle.returned{fill:none;stroke:var(--ink2);stroke-width:1;stroke-dasharray:1.2 1}
+.deck{grid-column:1/-1;min-width:0}.deck td,.deck th{text-align:left}.deck.pinned{border:2px solid var(--meter)}.deck svg circle.liq{fill:var(--meter)}
+.deck svg circle.dry{fill:none;stroke:var(--axis);stroke-width:1}.deck .deckmap{margin:10px 0 4px}.deck .deckmap svg{display:block}
+.deck svg text{font-size:11px}.deck .legend .swatch{vertical-align:-1px}.deck .legend{margin:4px 0}
+.deck [hidden]{display:none!important}.deck .tabs{display:flex;gap:6px;margin:8px 0 4px}
+.deck .tabs button{float:none;padding:4px 12px;font-size:13px}.deck .tabs button.on{background:var(--ink);color:var(--surface);border-color:var(--ink)}
+.deck .twin{margin:6px 0;padding:6px 10px;border-left:3px solid var(--warning);background:var(--chip);font-size:13px}
+.deck .p3 iframe{display:block;width:100%;max-width:100%;height:520px;border:1px solid var(--border);border-radius:6px;background:var(--surface);margin-top:6px}
+@media (max-width:600px){.deck .p3 iframe{height:360px}}
+.deck .p4 .camlive{margin:10px 0 14px}.deck .p4 .camhead{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 6px}
+.deck .camframe{position:relative;width:100%;max-width:960px;background:var(--grid);border-radius:6px;overflow:hidden;min-height:90px}
+.deck .camframe img{display:block;width:100%;height:100%;object-fit:fill}.deck .camframe .camph{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;padding:8px;text-align:center}
+.deck .camframe .camover{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
+.deck .camover text{fill:#fff;stroke:#000;stroke-width:3px;paint-order:stroke}.deck .camover .box{fill:rgba(0,200,0,.10);stroke:#0ca30c;stroke-width:2}
+.deck .camover .box.tips{stroke:#fab219;fill:rgba(250,178,25,.12)}.deck .camboxes{font-size:12px;color:var(--ink2);margin-left:auto}
 #tip{position:fixed;pointer-events:none;background:var(--surface);border:1px solid var(--border);border-radius:8px;
 padding:6px 9px;font-size:12px;box-shadow:0 2px 8px rgba(0,0,0,.12);display:none}#tip b{font-size:14px}
 button{font:inherit;font-size:12px;background:var(--chip);color:var(--ink2);border:1px solid var(--border);
@@ -578,21 +598,7 @@ border-radius:6px;padding:2px 8px;cursor:pointer;float:right}
 table{border-collapse:collapse;width:100%;font-size:12px;font-variant-numeric:tabular-nums}
 td,th{padding:3px 6px;border-bottom:1px solid var(--grid);text-align:right}th:first-child,td:first-child{text-align:left}
 .empty{color:var(--muted);padding:40px 0;text-align:center}
-.stopbar{position:sticky;top:0;z-index:5;display:flex;align-items:center;gap:12px;padding:10px 24px;
-background:var(--page);border-bottom:1px solid var(--border);flex-wrap:wrap}
-.stopbtn{float:none;font-size:15px;font-weight:700;letter-spacing:.04em;padding:10px 18px;border-radius:8px;
-background:var(--critical);color:#fff;border:2px solid var(--critical);cursor:pointer}
-.stopbtn:hover{filter:brightness(1.08)}.stopbtn::before{content:"■ "}
-.stopbar .state{color:var(--ink2);font-size:13px}
-.stopbar.engaged{background:var(--critical);color:#fff}.stopbar.engaged .state{color:#fff;font-weight:600;font-size:15px}
-.stopbar.engaged .stopbtn{display:none}
-.releasebtn{float:none;font-size:13px;padding:6px 12px;border-radius:8px;background:#fff;color:var(--critical);
-border:2px solid #fff;cursor:pointer;display:none}.stopbar.engaged .releasebtn{display:inline-block}
-.stopbar .folder{margin-left:auto;color:var(--ink2);font-size:12px;overflow-wrap:anywhere}.stopbar.engaged .folder{color:#fff}
-.stopbar .servers{flex-basis:100%;font-size:12px}.stopbar .servers:empty{display:none}
-.stopbar .servers div{padding:1px 0;overflow-wrap:anywhere}.stopbar.engaged .servers{color:#fff}
-.stopbar .note{flex-basis:100%;font-weight:700;color:var(--critical)}.stopbar .note:empty{display:none}
-.stopbar.engaged .note{color:#fff;text-decoration:underline}
+__AHC_STOPBAR_CSS__
 .st.stop::before{content:"■ ";color:var(--critical)}.st.released::before{content:"✓ ";color:var(--good)}
 .agent{grid-column:1/-1}.agent .label{color:var(--ink2);font-size:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 .agent .decision{font-size:20px;font-weight:600;margin:6px 0 2px}.agent .why{color:var(--ink2)}
@@ -628,25 +634,18 @@ border-radius:8px;padding:6px 10px;font-size:12px;max-width:100%;overflow:hidden
 .kv{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;font-size:12px;margin:4px 0 10px}.kv .k{color:var(--muted)}
 h3{font-size:12px;font-weight:600;color:var(--ink2);margin:12px 0 4px}
 #configcard td,#configcard th{text-align:left}
-#cameracard td,#cameracard th{text-align:left}#cameracard svg{display:block;border-radius:6px;background:var(--grid)}
-#cameracard svg text{fill:#fff;stroke:#000;stroke-width:3px;paint-order:stroke;font-size:15px;pointer-events:none}
-#cameracard .handle{fill:#fff;stroke:#0b0b0b;stroke-width:2;cursor:nwse-resize}#cameracard .box{fill:rgba(0,200,0,.10);stroke:#0ca30c;stroke-width:2;cursor:move}
-#cameracard .box.tips{stroke:#fab219;fill:rgba(250,178,25,.12)}#cameracard .camhead{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:12px 0 6px}
-#cameracard .camhead button{float:none}#cameracard .camnote{color:var(--ink2);font-size:12px}
 #autocard .autorow{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;margin:6px 0}#autocard .camnote{color:var(--ink2);font-size:12px}
 #autocard .autobadge{font-size:11px;font-weight:700;letter-spacing:.04em;padding:1px 8px;border-radius:10px;background:var(--chip);color:var(--ink2)}
 #autocard .autobadge.auto{background:var(--good);color:#fff}#autocard .review{border-top:1px solid var(--grid);padding:8px 0}
 #autocard .thumbs{display:flex;gap:6px;flex-wrap:wrap;margin:4px 0}#autocard .thumbs img{height:64px;border-radius:4px;border:1px solid var(--border);display:block}
 </style></head><body>
-<div class="stopbar" id="stopbar">__AHC_STOPBTN__
-<span class="state" id="stopstate">__AHC_IDLE__</span>
-__AHC_RELEASEBTN__
-<span class="folder" title="The task folder this page shows">Task folder <code>__AHC_FOLDER__</code></span>
-<span class="note" id="stopnote"></span><div class="servers" id="stopservers"></div></div>
+__AHC_STOPBAR_HTML__
 <header><h1>AHC · live run</h1><span class="sub" id="sub">waiting for a run log…</span>
 <span class="live"><span class="dot" id="dot"></span><span id="livetext">connecting</span></span></header>
 <main>
+<section class="banner" id="calbanner" style="display:none;grid-column:1/-1;margin:0"></section>
 <section class="card agent" id="agent"></section>
+<section class="card deck" id="deckcard" style="display:none"></section>
 <section class="status" id="status"></section>
 <section class="kpis" id="kpis"></section>
 <div class="col"><section class="card" id="platecard"><div class="empty">No layout loaded yet.</div></section>
@@ -654,7 +653,7 @@ __AHC_RELEASEBTN__
 <section class="card"><h2>Tips <span class="sub">· hollow = used, dashed = returned after use</span></h2><div class="racks" id="racks"></div></section>
 <section class="card" id="configcard"></section>
 <section class="card" id="autocard" style="display:none"></section>
-<section class="card" id="cameracard" style="display:none"></section></div>
+</div>
 <div class="col"><section class="card"><h2>Hardware calls <span class="sub">· newest first</span></h2><ul id="timeline"></ul></section></div>
 </main><div id="tip"></div>
 <script>
@@ -839,65 +838,206 @@ function configCard(st){const card=document.getElementById("configcard");card.re
   const wrap=el("div",{class:"tablewrap"});wrap.append(tb);card.append(wrap);
   const liq=(L.layout||{}).liquids;if(liq&&Object.keys(liq).length)card.append(el("div",{class:"legend"},"Starting liquids: "+Object.entries(liq).map(([k,v])=>`${k} ${fmt(v)} uL`).join(", ")))}
 
-// Cameras: the reference image with its boxes. The control page drags them (a corner resizes, the body moves) and saves;
-// the config is then pending until the person confirms it again. Never rebuilt while a box is unsaved.
-const camWork={};
-function cameraCard(cfg){const card=document.getElementById("cameracard");
-  const cams=((cfg||{}).cameras||[]).filter(c=>c.slot_map);
-  if(!cams.length){card.style.display="none";card.replaceChildren();return}
-  if(Object.values(camWork).some(w=>w.dirty))return;
-  card.style.display="";card.replaceChildren(el("h2",{},"Cameras"));
-  const vis=cfg.physical_world||{},seen=(vis.vision_context||{}).cameras||{};
-  cams.forEach(c=>{const m=c.slot_map,[W,H]=m.size,work=JSON.parse(JSON.stringify(m.slots));camWork[c.name]={dirty:false};
-    const head=el("div",{class:"camhead"});head.append(el("b",{},c.name),el("span",{class:"dev"},`${c.device} · sees ${c.sees}`));
-    const cam=seen[c.name];if(cam&&cam.status&&cam.status!=="ok")head.append(el("span",{class:"tag"},cam.status.replace(/_/g," ")));
-    const msg=el("span",{class:"camnote"}),save=el("button",{},"Save boxes"),undo=el("button",{},"Undo");save.disabled=undo.disabled=true;
-    if(!VIEW)head.append(save,undo);head.append(msg);card.append(head);
-    const pad=Math.round(Math.max(W,H)*0.12),svg=sv("svg",{viewBox:`${-pad} ${-pad} ${W+2*pad} ${H+2*pad}`,role:"img","aria-label":`${c.name} reference with slot boxes`});
-    svg.style.width="100%";svg.style.maxHeight="540px";svg.style.touchAction="none";
-    svg.append(sv("image",{href:`/camera/${encodeURIComponent(c.name)}/reference.jpg`,x:0,y:0,width:W,height:H}));
-    svg.append(sv("rect",{x:0,y:0,width:W,height:H,fill:"none",stroke:"var(--axis)","stroke-width":1}));
-    const r=Math.max(5,Math.round(W/110)),parts={},pt=ev=>{const p=svg.createSVGPoint();p.x=ev.clientX;p.y=ev.clientY;const q=p.matrixTransform(svg.getScreenCTM().inverse());return[q.x,q.y]};
-    const draw=()=>Object.entries(work).forEach(([k,b])=>{const p=parts[k];p.rect.setAttribute("x",b[0]);p.rect.setAttribute("y",b[1]);
-      p.rect.setAttribute("width",b[2]-b[0]);p.rect.setAttribute("height",b[3]-b[1]);p.label.setAttribute("x",Math.max(b[0],0)+6);p.label.setAttribute("y",Math.max(b[1],0)+20);
-      p.handles.forEach((h,i)=>{h.setAttribute("cx",i%3?b[2]:b[0]);h.setAttribute("cy",i<2?b[1]:b[3])})});
-    const touched=()=>{camWork[c.name].dirty=true;save.disabled=undo.disabled=false;msg.textContent="Unsaved: the config will wait for the person's confirmation.";draw()};
-    Object.keys(work).forEach(k=>{const tips=k.startsWith("tips:"),g=sv("g"),rect=sv("rect",{class:"box"+(tips?" tips":"")}),
-      label=sv("text",{});label.textContent=tips?k.slice(5):"slot "+k;g.append(rect,label);const handles=[];
-      if(!VIEW){rect.addEventListener("pointerdown",ev=>{ev.preventDefault();rect.setPointerCapture(ev.pointerId);const o=pt(ev),b0=work[k].slice();
-          rect.onpointermove=e=>{const q=pt(e);work[k]=[b0[0]+q[0]-o[0],b0[1]+q[1]-o[1],b0[2]+q[0]-o[0],b0[3]+q[1]-o[1]];touched()};
-          rect.onpointerup=()=>{rect.onpointermove=rect.onpointerup=null}});
-        [[0,1],[2,1],[2,3],[0,3]].forEach(([ix,iy],i)=>{const h=sv("circle",{class:"handle",r});handles.push(h);g.append(h);
-          h.addEventListener("pointerdown",ev=>{ev.preventDefault();ev.stopPropagation();h.setPointerCapture(ev.pointerId);
-            h.onpointermove=e=>{const q=pt(e),b=work[k].slice();b[ix]=q[0];b[iy]=q[1];
-              if(b[2]-b[0]>=12&&b[3]-b[1]>=12){work[k]=b;touched()}};h.onpointerup=()=>{h.onpointermove=h.onpointerup=null}})})}
-      parts[k]={rect,label,handles};svg.append(g)});
-    draw();card.append(svg);
-    undo.onclick=()=>{Object.keys(work).forEach(k=>work[k]=m.slots[k].slice());camWork[c.name].dirty=false;save.disabled=undo.disabled=true;msg.textContent="";draw()};
-    save.onclick=async()=>{save.disabled=true;msg.textContent="Saving…";
-      try{const r=await fetch(`/cameras/${encodeURIComponent(c.name)}/slots`,{method:"POST",headers:{"X-AHC-Control":"1","X-AHC-Token":TOKEN,"Content-Type":"application/json"},body:JSON.stringify({slots:work})});
-        const j=await r.json();if(!r.ok){msg.textContent=`Not saved (${r.status}): ${j.error||""}`;save.disabled=false;return}
-        camWork[c.name].dirty=false;undo.disabled=true;
-        msg.textContent=j.saved?"Saved. The config is pending until the person confirms it again (confirm_config).":"Nothing changed."}
-      catch(e){msg.textContent="Not saved: the dashboard did not answer.";save.disabled=false}}});
-  const pts=vis.points||[];card.append(el("h3",{},"Physical world context"+(vis.checked_at?` · checked ${vis.checked_at.slice(11,19)}`:"")));
-  if(!pts.length){card.append(el("div",{class:"dev"},"Nothing checked yet: the agent runs physical_world_context once the plan is reported and a layout is loaded."));return}
+// Deck setup: the deck the plan reports (or the loaded one) as a top view from the deck map the server recorded, seen from the
+// front of the robot (front at the bottom, left on the left; PyLabRobot's y grows toward the back, so it is flipped here).
+// Pinned at the top until the deck check passes for the current layout; then it stays, expanded, in its place.
+// Two tabs: the 2D top view (the default while setting up) and the 3D live view of the digital twin (the default once the
+// deck is checked): PyLabRobot's viewer in an iframe, on the link the server wrote in .ahc/state/view.json. The card is built
+// once and only its 2D part is redrawn on a poll, so the iframe is never recreated or reloaded; it is made when the 3D tab is
+// first shown and then only hidden (a hidden iframe is not rendered, so its WebGL loop costs nothing and its camera is kept).
+const dash=t=>String(t).replace(/([A-P]\d+)[-:]([A-P]\d+)/g,"$1–$2");
+const fitText=(t,wpx,px)=>{t=String(t);const n=Math.floor(wpx/(px*0.57));return n<=1?"":t.length<=n?t:t.slice(0,Math.max(n-1,1))+"…"};
+const fitAny=(t,w,px)=>{for(const v of [].concat(t)){const f=fitText(v,w,px);if(f===String(v))return f}return fitText([].concat(t).at(-1),w,px)};
+const liquidText=lw=>(lw.liquids||[]).map(g=>`${g.wells?dash(g.wells)+" ":""}${fmt(g.ul)} µL`).join(", ");
+function deckSvg(m,avail){
+  const [x0,y0,x1,y1]=m.view,vw=x1-x0,vh=y1-y0,s=Math.min(avail/vw,1.1),W=Math.round(vw*s),H=Math.round(vh*s);
+  const X=x=>(x-x0)*s,Y=(y,h)=>(y1-y-h)*s,svg=sv("svg",{width:W,height:H,viewBox:`0 0 ${W} ${H}`,role:"img","aria-label":"Deck setup, seen from the front of the robot"});
+  svg.style.maxWidth="100%";svg.style.height="auto";
+  const rect=(o,a)=>sv("rect",{x:X(o.x),y:Y(o.y,o.h),width:o.w*s,height:o.h*s,...a});
+  const text=(t,x,y,a={})=>{const e=sv("text",{x,y,...a});e.textContent=t;if(a.fill)e.style.fill=a.fill;return e};
+  const FS=11,LH=13;
+  svg.append(rect({x:0,y:0,w:m.size.x,h:m.size.y},{fill:"var(--surface)",stroke:"var(--grid)","stroke-width":1}));
+  (m.fixed||[]).forEach(f=>{const r=rect(f,{rx:3,fill:"var(--chip)",stroke:"var(--axis)","stroke-width":1});svg.append(r);
+    const cx=X(f.x)+f.w*s/2,cy=Y(f.y,f.h)+f.h*s/2,tall=f.h>f.w;
+    const label=fitText(f.label,(tall?f.h:f.w)*s-6,FS);
+    if(label){const t=text(label,cx,cy+4,{"text-anchor":"middle"});if(tall)t.setAttribute("transform",`rotate(-90 ${cx} ${cy})`);svg.append(t)}});
+  const lines=(o,list,top)=>{ // text lines inside a box, as many as fit; each cut to the box
+    let y=Y(o.y,o.h)+top+LH-3;list.forEach(([t,c])=>{const f=fitAny(t,o.w*s-8,FS);if(f){svg.append(text(f,X(o.x)+5,y,{fill:c||"var(--ink2)"}));y+=LH}})};
+  const room=(o,top,need)=>Math.max(0,Math.floor((o.h*s-top-need)/LH));
+  const drawLabware=(lw,head)=>{
+    const g=sv("g"),box=rect(lw,{rx:4,fill:"var(--surface)",stroke:"var(--ink2)","stroke-width":1.2});g.append(sv("title"));g.firstChild.textContent=
+      `${lw.name} · ${lw.type}\n${lw.where}`+(liquidText(lw)?"\nholds "+liquidText(lw):"")+(lw.tips_text&&lw.tips_text!=="all fresh"?"\ntips "+dash(lw.tips_text):"");
+    g.append(box);svg.append(g);
+    const grid=lw.kind==="plate"||lw.kind==="tip_rack";
+    const body=[[lw.alias?`${lw.alias} (${lw.name})`:lw.name,"var(--ink)"],[lw.type],[liquidText(lw)]]
+      .concat(lw.tips_text&&lw.tips_text!=="all fresh"?[["tips "+dash(lw.tips_text)]]:[]).filter(l=>l[0]);
+    const all=head.concat(body),px=lw.h*s;
+    let n=room(lw,3,grid?36:0);if(grid&&n<2){n=room(lw,3,0)}
+    const withGrid=grid&&room(lw,3,36)>=2,shown=all.slice(0,Math.max(n,1));
+    lines(lw,shown,3);
+    if(grid){const top=Y(lw.y,lw.h)+3+(withGrid?shown.length*LH:0)+2,gh=Y(lw.y,lw.h)+px-top-4,gw=lw.w*s-10;
+      if(withGrid&&gh>=12){
+        const cw=gw/lw.cols,ch=gh/lw.rows,r=Math.max(1,Math.min(cw,ch)*0.38);
+        const left=lw.a1[0]<lw.x+lw.w/2,back=lw.a1[1]>lw.y+lw.h/2,filled=new Set(),spent=new Set((lw.tips||{}).empty||[]),back_=new Set((lw.tips||{}).returned||[]);
+        (lw.liquids||[]).forEach(q=>q.ids.forEach(i=>filled.add(i)));
+        for(let c=0;c<lw.cols;c++)for(let ri=0;ri<lw.rows;ri++){
+          const id="ABCDEFGHIJKLMNOP"[ri]+(c+1),ci=left?c:lw.cols-1-c,rr=back?ri:lw.rows-1-ri;
+          const cls=lw.kind==="tip_rack"?(back_.has(id)?"returned":spent.has(id)?"used":"free"):(filled.has(id)?"liq":"dry");
+          svg.append(sv("circle",{cx:X(lw.x)+5+ci*cw+cw/2,cy:top+rr*ch+ch/2,r,class:cls}))}}
+      // A1 corner marker: the triangle sits in the corner nearest well A1 (back left on a standard deck)
+      const cx=lw.a1[0]<lw.x+lw.w/2?X(lw.x):X(lw.x)+lw.w*s,cy=lw.a1[1]>lw.y+lw.h/2?Y(lw.y,lw.h):Y(lw.y,lw.h)+px,dx=cx<=X(lw.x)+1?1:-1,dy=cy<=Y(lw.y,lw.h)+1?1:-1;
+      svg.append(sv("polygon",{points:`${cx},${cy} ${cx+dx*10},${cy} ${cx},${cy+dy*10}`,fill:"var(--warning)"}))}
+    else if(lw.kind==="container"&&(lw.liquids||[]).length){
+      const b=rect({x:lw.x,y:lw.y,w:lw.w,h:lw.h},{rx:4,fill:"var(--meter)","fill-opacity":.35});g.append(b)}
+  };
+  if(m.tracks){const t=m.tracks,every=t.width*s<15;
+    t.ticks.forEach(k=>{const x=X(k.x);svg.append(sv("line",{x1:x,x2:x,y1:Y(0,0),y2:Y(0,0)-6,stroke:"var(--axis)"}));
+      if(k.track===1||k.track===t.last||!every||k.track%5===0)svg.append(text(String(k.track),x+t.width*s/2,Y(0,0)-10,{"text-anchor":"middle"}))});
+    svg.append(sv("line",{x1:X(t.ticks[0].x),x2:X(t.ticks[t.ticks.length-1].x+t.width),y1:Y(0,0),y2:Y(0,0),stroke:"var(--axis)"}));
+    svg.append(text("track",X(t.ticks[0].x)-32,Y(0,0)-10));
+    (m.carriers||[]).forEach((c,i)=>{
+      const next=(m.carriers[i+1]||{x:m.view[2]}).x,wide=Math.max((next-c.x)*s-4,c.w*s);
+      for(let tk=c.track;tk<=c.track_end+1;tk++){const k=t.ticks[tk-t.first];if(k)svg.append(sv("line",{x1:X(k.x),x2:X(k.x),y1:Y(c.y,c.h),y2:Y(c.y,0),stroke:"var(--grid)","stroke-dasharray":"2 3"}))}
+      svg.append(rect(c,{rx:4,fill:"var(--chip)",stroke:"var(--axis)","stroke-width":1}));
+      const title=[[c.name,"var(--ink)"],[`tracks ${c.track}–${c.track_end}`],[c.type]],room_=Math.floor((Y(c.y,c.h)-4)/LH),used=title.slice(0,Math.max(room_,0));
+      used.forEach(([tx,col],k)=>{const f=fitText(tx,wide,FS);if(f)svg.append(text(f,X(c.x),Y(c.y,c.h)-5-(used.length-1-k)*LH,{fill:col||"var(--ink2)"}))});
+      c.sites.forEach(site=>{
+        const head=[[site.front?[`site ${site.site} · front`,`site ${site.site}`,`${site.site}`]:[`site ${site.site}`,`${site.site}`],"var(--ink)"],
+          [[`VENUS pos ${site.venus_position}`,`VENUS ${site.venus_position}`,`V${site.venus_position}`]]];
+        const lw=(m.labware||[]).find(l=>l.name===site.labware);
+        if(lw)drawLabware(lw,head);
+        else{svg.append(rect(site,{rx:4,fill:"none",stroke:"var(--axis)","stroke-dasharray":"3 3"}));lines(site,head.concat([["empty","var(--muted)"]]).slice(0,Math.max(room(site,3,0),1)),3)}})})}
+  if(m.slots){
+    m.slots.forEach(sl=>{
+      svg.append(rect(sl,{rx:4,fill:sl.trash?"var(--chip)":"none",stroke:"var(--axis)","stroke-dasharray":sl.labware||sl.trash?"":"3 3"}));
+      if(sl.trash)svg.append(text("12 · trash",X(sl.x)+6,Y(sl.y,sl.h)+16,{fill:"var(--ink2)","font-weight":600}));
+      else if(!sl.labware){svg.append(text(String(sl.slot),X(sl.x)+6,Y(sl.y,sl.h)+16,{fill:"var(--muted)","font-weight":600}));
+        const e=fitText("empty",sl.w*s-8,FS);if(e)svg.append(text(e,X(sl.x)+sl.w*s/2,Y(sl.y,sl.h)+sl.h*s/2+4,{"text-anchor":"middle",fill:"var(--muted)"}))}});
+    (m.labware||[]).forEach(lw=>drawLabware(lw,[[`slot ${lw.slot}`,"var(--ink)"]]))}
+  svg.append(text("front",X(m.view[0])+4,H-4,{fill:"var(--ink2)","font-weight":600}));
+  return svg}
+function deckWhere(m,lw){
+  if(lw.slot)return[`slot ${lw.slot}`];
+  const c=(m.carriers||[]).find(c=>c.name===lw.carrier),site=c?c.sites.find(x=>x.site===lw.site):null;
+  return c?[`track ${c.track} · ${c.name}`,`site ${lw.site}${site&&site.front?" · front":""} (VENUS pos ${site?site.venus_position:"?"})`]:[lw.where]}
+function deckBody(d,host,avail){host.replaceChildren();
+  const m=d.map;
+  host.append(el("div",{class:"dev"},d.pinned?(d.mode==="plan"?"The person sets the deck up like this, then the agent calls load_layout and the deck check runs.":"Loaded. Waiting for the deck check; nothing moves until it passes."):"The deck check passed for this layout."));
+  if(d.differs&&d.differs.length){const b=el("div",{class:"banner"}),shown=d.differs.slice(0,4),more=d.differs.length-shown.length;
+    b.append(el("span",{},"differs from the plan's layout: "+shown.join("; ")+(more?`; and ${more} more`:"")+"."));host.append(b)}
+  const wrap=el("div",{class:"deckmap"});wrap.append(deckSvg(m,avail));host.append(wrap);
+  host.append(el("div",{class:"legend"},m.kind==="tracks"?"Seen from the front of the robot: front at the bottom, left on the left. Site 0 is a carrier's front-most site; VENUS numbers the sites the other way round (position 1 is the back-most). ▲ marks well A1."
+    :"Seen from the front of the robot: front at the bottom, left on the left. Slot 1 is front left, slot 12 the trash. ▲ marks well A1."));
+  const lg=el("div",{class:"legend"}),sw=(cls,t)=>{const i=el("span",{class:"item"}),s=sv("svg",{width:10,height:10,class:"swatch"});s.append(sv("circle",{cx:5,cy:5,r:3.4,class:cls}));i.append(s,el("span",{},t));lg.append(i)};
+  sw("free","fresh tip");sw("used","empty spot");sw("returned","returned tip");sw("liq","well with liquid");sw("dry","empty well");host.append(lg);
+  const tb=el("table"),hr=el("tr");["Where","Labware","Holds"].forEach(x=>hr.append(el("th",{},x)));tb.append(hr);
+  (m.labware||[]).forEach(lw=>{const r=el("tr"),held=[liquidText(lw),lw.tips_text&&lw.tips_text!=="all fresh"?"tips "+dash(lw.tips_text):""].filter(Boolean).join("; ");
+    const a=(lw.aliases||[]).map(x=>x.alias+(x.wells?" = "+dash(x.wells):"")).join(", ");
+    const w=deckWhere(m,lw),nm=el("td"),wh=el("td");wh.append(...w.map(x=>el("div",{},x)));
+    nm.append(el("div",{},lw.name+(a?` (${a})`:"")),el("div",{class:"dev"},lw.type));r.append(wh,nm,el("td",{},held||"–"));tb.append(r)});
+  const tw=el("div",{class:"tablewrap"});tw.append(tb);host.append(tw)}
+let deckParts=null,deckData=null;
+const deckPref={get(){try{return localStorage.getItem("ahc-deck-tab")}catch(e){return null}},set(v){try{localStorage.setItem("ahc-deck-tab",v)}catch(e){}}};
+function deckSkeleton(card){
+  const head=el("h2",{},"Deck setup"),sub=el("span",{class:"sub"}),tabs=el("div",{class:"tabs",role:"tablist"});head.append(sub);
+  const b2=el("button",{role:"tab",type:"button"},"Top view (2D)"),b3=el("button",{role:"tab",type:"button"},"3D live"),b4=el("button",{role:"tab",type:"button"},"Cameras");tabs.append(b2,b3,b4);
+  const p2=el("div",{class:"p2",role:"tabpanel"}),p3=el("div",{class:"p3",role:"tabpanel"}),p4=el("div",{class:"p4",role:"tabpanel"}),label=el("div",{class:"twin"}),note=el("div",{class:"dev"});
+  p3.append(label,note);card.append(head,tabs,p2,p3,p4);
+  deckParts={card,sub,b2,b3,b4,p2,p3,p4,label,note,frame:null,camSig:null};
+  [[b2,"2d"],[b3,"3d"],[b4,"cams"]].forEach(([b,t])=>b.onclick=()=>{deckPref.set(t);deckShow(t)})}
+function deckTabs(){const D=deckData;return[...(D.d?["2d","3d"]:[]),...(D.cams.length?["cams"]:[])]}
+function deckShow(tab){const P=deckParts,have=deckTabs();if(!have.includes(tab))tab=have[0];
+  [[P.b2,"2d"],[P.b3,"3d"],[P.b4,"cams"]].forEach(([b,t])=>{b.hidden=!have.includes(t);b.className=tab===t?"on":"";b.setAttribute("aria-selected",String(tab===t))});
+  P.p2.hidden=tab!=="2d";P.p3.hidden=tab!=="3d";P.p4.hidden=tab!=="cams";if(tab==="3d")deck3d();if(tab==="cams")camsPanel();camPoll(tab==="cams")}
+function deck3d(){const P=deckParts,{view,real}=deckData;
+  P.label.textContent="Digital twin: AHC's simulated state of the deck, not a camera image.";P.label.hidden=!real;
+  if(view&&view.url){
+    if(!P.frame){P.frame=el("iframe",{title:"3D live view of the deck (digital twin)",sandbox:"allow-scripts allow-same-origin",referrerpolicy:"no-referrer"});P.p3.append(P.frame)}
+    if(P.frame.dataset.src!==view.url){P.frame.dataset.src=view.url;P.frame.src=view.url}  // the same link again: nothing happens
+    P.frame.hidden=false;P.note.textContent=""}
+  else{if(P.frame)P.frame.hidden=true;
+    P.note.textContent=view&&view.error?view.error:"Nothing to show yet: the 3D view starts with the first deck the agent reports (while the AHC server runs)."}}
+
+// Cameras tab: the latest live frame of each camera, its age and status, and the slot boxes over it on request. The page asks
+// the AHC server's dashboard for frames only while this tab is visible (the server stops a camera ~30 s after the last ask);
+// frames stay in memory there and are for the person only: they are not captures and not evidence. The panels are built once
+// per set of cameras, so a poll never rebuilds them.
+const camLive={timer:null,busy:{},panels:{}};
+function camsPanel(){const P=deckParts,{cams,live,pw,recal}=deckData,sig=JSON.stringify([cams,live,recal]);
+  if(P.camSig!==sig){P.camSig=sig;P.p4.replaceChildren();camLive.panels={};P.pwSig=null;P.pwHost=el("div");
+    if(recal){const d=el("div",{class:"dev"});d.append("Camera boxes and plate wells are calibrated on the calibration page: ",el("a",{href:"/calibration",id:"recalibrate"},"Recalibrate"),".");P.p4.append(d)}
+    if(!live)P.p4.append(el("div",{class:"dev"},"Live camera frames come from the AHC server's own dashboard (the page open_dashboard opens), not from this one. Open that page to watch the cameras."));
+    else{P.p4.append(el("div",{class:"dev"},"Live view for the person: about one frame a second from a Mac camera, one every few seconds from the robot's camera (not while the robot moves). Not saved, and not evidence: capture takes the pictures the agent and the checks use."));
+      cams.forEach(c=>{const box=el("div",{class:"camlive"}),head=el("div",{class:"camhead"}),m=c.slot_map,stat=el("span",{class:"badge"},"…"),age=el("span",{class:"dev"});
+        head.append(el("b",{},c.name),el("span",{class:"dev"},c.source==="robot"?`the built-in camera of the robot ${c.device}`:c.device),stat,age);
+        const frame=el("div",{class:"camframe"}),img=el("img",{alt:`live view of camera ${c.name}`}),ph=el("div",{class:"camph dev"},"No frame yet.");img.hidden=true;frame.append(img,ph);
+        let boxes=null;
+        if(m){const [W,H]=m.size;frame.style.aspectRatio=`${W} / ${H}`;
+          const lab=el("label",{class:"camboxes"}),cb=el("input",{type:"checkbox"});lab.append(cb," slot boxes");head.append(lab);
+          boxes=sv("svg",{viewBox:`0 0 ${W} ${H}`,preserveAspectRatio:"none",class:"camover","aria-hidden":"true"});boxes.style.display="none";
+          Object.entries(m.slots).forEach(([k,b])=>{const tips=k.startsWith("tips:"),g=sv("g"),t=sv("text",{x:Math.max(b[0],0)+6,y:Math.max(b[1],0)+Math.max(14,W/42),"font-size":Math.max(12,W/42)});
+            t.textContent=tips?k.slice(5):"slot "+k;g.append(sv("rect",{class:"box"+(tips?" tips":""),x:b[0],y:b[1],width:b[2]-b[0],height:b[3]-b[1]}),t);boxes.append(g)});
+          frame.append(boxes);cb.onchange=()=>{boxes.style.display=cb.checked?"":"none"}}
+        box.append(head,frame);P.p4.append(box);camLive.panels[c.name]={img,ph,stat,age,t:null,ageAt:null,at:0}})}
+    P.p4.append(P.pwHost)}
+  const ps=JSON.stringify(pw||null);if(P.pwSig!==ps){P.pwSig=ps;P.pwHost.replaceChildren(pwcSection(pw))}}
+function camPoll(on){
+  if(!on||document.hidden||!deckData||!deckData.live){clearInterval(camLive.timer);camLive.timer=null;return}
+  if(camLive.timer)return;  // already asking: a redraw of the page does not restart it
+  const run=()=>Object.entries(camLive.panels).forEach(async([n,p])=>{
+    if(p.ageAt!==null){p.age.textContent=` · ${Math.max(0,Math.round(p.ageAt+(performance.now()-p.at)/1000))} s ago`}
+    if(camLive.busy[n])return;camLive.busy[n]=true;
+    try{const r=await fetch(`/camera/${encodeURIComponent(n)}/live.json`,{cache:"no-store"});if(!r.ok)throw new Error(r.status);const j=await r.json();
+      p.stat.textContent=j.status==="live"?"live":j.status==="starting"?"starting…":j.message||j.status;p.stat.className="badge "+(j.status==="live"?"working":j.status==="error"||j.status==="unavailable"?"wait":"");
+      if(j.age_s!==null&&j.age_s!==undefined){p.ageAt=j.age_s;p.at=performance.now();p.age.textContent=` · ${Math.round(j.age_s)} s ago`}
+      if(j.t&&j.t!==p.t){p.t=j.t;const im=new Image();im.onload=()=>{p.img.src=im.src;p.img.hidden=false;p.ph.hidden=true};im.src=`/camera/${encodeURIComponent(n)}/live.jpg?t=${j.t}`}
+      if(j.status!=="live"&&!j.t)p.ph.textContent=j.message||"No frame yet."}
+    catch(e){p.stat.textContent="the dashboard did not answer";p.stat.className="badge wait"}
+    finally{camLive.busy[n]=false}});
+  run();camLive.timer=setInterval(run,1000)}
+document.addEventListener("visibilitychange",()=>{if(deckParts)camPoll(!deckParts.p4.hidden)});
+function deckCard(d,view,real,cams,live,pw,cal){const card=document.getElementById("deckcard");cams=cams||[];
+  if(!d&&!cams.length){card.style.display="none";camPoll(false);return}
+  if(!deckParts)deckSkeleton(card);
+  deckData={d,view,real:real||!!(view&&view.real_hardware),cams,live:!!live,pw,recal:!VIEW&&!!(cal&&cal.serves)};
+  const pinned=!!(d&&d.pinned);
+  card.style.display="";card.style.order=pinned?"-1":"0";card.className="card deck"+(pinned?" pinned":"");
+  deckParts.sub.textContent=!d?"":d.mode==="plan"?" · the plan's deck":` · loaded deck${d.name?" · "+d.name:""}`+(d.checked?" · checked ✓":"");
+  if(d)deckBody(d,deckParts.p2,Math.max(card.clientWidth-34,260));else deckParts.p2.replaceChildren();
+  const pref=deckPref.get();deckShow(["2d","3d","cams"].includes(pref)?pref:(d&&d.checked&&view&&view.url?"3d":"2d"))}
+
+// Physical world context: what the cameras (and the instrument's sensors) cover of the verification points, from the last
+// physical_world_context; it sits under the live panels of Deck setup > Cameras. The slot boxes and plates are calibrated on /calibration.
+function pwcSection(vis){const box=el("div",{class:"pwc"});vis=vis||{};
+  const pts=vis.points||[];box.append(el("h3",{},"Physical world context"+(vis.checked_at?` · checked ${vis.checked_at.slice(11,19)}`:"")));
+  if(!pts.length){box.append(el("div",{class:"dev"},"Nothing checked yet: the agent runs physical_world_context once the plan is reported and a layout is loaded."));return box}
   // The sources: what each observes and covers; then the conclusion per check type; then every point with the sources that cover it.
   const conf=vis.physical_world_confidence||{},bySource=conf.by_source||{},inst=vis.instrument_context||{};
   const srcs=el("div",{class:"legend"});
   Object.entries(bySource).forEach(([n,v])=>srcs.append(el("div",{},`${n}: covers ${v.covers} of ${v.observes} points it observes`)));
-  srcs.append(el("div",{},`instrument:${inst.device||"?"}: ${inst.note||"no sensors"}`));card.append(srcs);
+  srcs.append(el("div",{},`instrument:${inst.device||"?"}: ${inst.note||"no sensors"}`));box.append(srcs);
   const cls={covered:"pass",uncovered:"fail",unclear:"pending"};
   const checks=el("div",{class:"autorow"});
   Object.entries(conf.by_check||{}).forEach(([c,v])=>{const p=v.points||{};
     checks.append(el("span",{class:"st "+(cls[v.status]||"audit"),title:(v.sources||[]).map(x=>`${x.source} (${x.level})`).join(", ")},`${c.replace(/_/g," ")}: ${v.status}`),
-      el("span",{class:"dev"},`${p.covered||0} covered, ${p.unclear||0} unclear, ${p.uncovered||0} uncovered`))});card.append(checks);
+      el("span",{class:"dev"},`${p.covered||0} covered, ${p.unclear||0} unclear, ${p.uncovered||0} uncovered`))});box.append(checks);
   const tb=el("table"),hr=el("tr");["Point","Check","Level","Status","Sources"].forEach(x=>hr.append(el("th",{},x)));tb.append(hr);
   pts.forEach(p=>{const row=el("tr"),st=el("td"),s=el("span",{class:"st "+(cls[p.status]||"audit"),title:p.why||""},p.status),
       cov=(p.sources||[]).filter(e=>e.covers).map(e=>`${e.source} (${e.level})`).join(", ");
     st.append(s);row.append(el("td",{title:p.why||""},p.what),el("td",{},p.check),el("td",{},p.level),st,el("td",{},cov||"–"));tb.append(row)});
-  const wrap=el("div",{class:"tablewrap"});wrap.append(tb);card.append(wrap);
-  if((vis.suggestions||[]).length)card.append(el("div",{class:"legend"},"To cover the rest: "+vis.suggestions.join("; ")))}
+  const wrap=el("div",{class:"tablewrap"});wrap.append(tb);box.append(wrap);
+  if((vis.suggestions||[]).length)box.append(el("div",{class:"legend"},"To cover the rest: "+vis.suggestions.join("; ")))
+  const plates=Object.entries(vis.plate_calibration||{});
+  if(plates.length)box.append(el("div",{class:"legend"},"Plates: "+plates.map(([n,v])=>`${n} ${v.state==="calibrated"?"calibrated":"waiting for the person"} (camera ${v.camera}, slot ${v.slot})`).join("; ")));
+  return box}
+// Calibration: a camera or a plate waits for the person (the control page links to the calibration page; the view-only page
+// says only that it is in progress).
+function calBanner(cal){const host=document.getElementById("calbanner");
+  const n=cal?[...(cal.waiting_for_person||[]),...Object.entries(cal.plates||{}).filter(([k,v])=>v==="requested").map(([k])=>k)]:[];
+  if(!n.length){host.style.display="none";host.replaceChildren();return}
+  host.style.display="";host.replaceChildren();
+  if(VIEW||!cal.serves){host.append("Calibration is in progress: the person is calibrating "+n.join(", ")+".");return}
+  host.append("Calibration waits for the person ("+n.join(", ")+"): ",el("a",{href:"/calibration"},"open the calibration page"),".")}
 
 // Auto-verify: AUTO or why it is off per authorised check, the pause (control page only), and the agent's verdicts to review.
 function autoCard(a){const card=document.getElementById("autocard");
@@ -925,37 +1065,7 @@ function autoCard(a){const card=document.getElementById("autocard");
     (r.per_point||[]).forEach(pp=>item.append(el("div",{class:"dev"},`${pp.what}: ${pp.verdict}`+(pp.note?` · ${pp.note}`:""))));card.append(item)})}
 
 const TOKEN=document.querySelector('meta[name="ahc-token"]').content,VIEW=document.querySelector('meta[name="ahc-view"]').content==="1";
-const ELSEWHERE="Use the robot's own stop or its power switch, or ahc-estop in the task folder.";
-// A press that did not arrive is said at once and stays until a stop shows engaged; never silent.
-function note(text){const n=document.getElementById("stopnote");n.textContent=text;clearTimeout(note.t);
-  if(text&&!text.startsWith("STOP NOT SENT"))note.t=setTimeout(()=>{n.textContent=""},20000)}
-async function control(path,body){const stop=path==="/estop";
-  const headers={"X-AHC-Control":"1","Content-Type":"application/json"};if(!stop)headers["X-AHC-Token"]=TOKEN;
-  let r;try{r=await fetch(path,{method:"POST",headers,body:JSON.stringify(body||{})})}
-  catch(err){note(stop?"STOP NOT SENT: the dashboard did not answer. "+ELSEWHERE:"Release not sent: the dashboard did not answer.");return false}
-  if(r.ok){note("");return true}
-  let why="";try{why=(await r.json()).error||""}catch(err){}
-  note(stop?`STOP NOT SENT (${r.status} ${why}). `+ELSEWHERE:`Not released (${r.status}): ${why}`);return false}
-const stopBtn=document.getElementById("stopbtn"),releaseBtn=document.getElementById("releasebtn");  // absent on the view-only page
-if(stopBtn)stopBtn.onclick=async()=>{await control("/estop",{reason:"pressed on the dashboard"});pollStop()};
-if(releaseBtn)releaseBtn.onclick=async()=>{
-  if(!confirm("Release the emergency stop?\n\nOnly when the deck is safe. The agent must check the deck again before anything moves."))return;
-  await control("/estop/release",{confirm:true});pollStop()};
-const IDLE=VIEW?"View only: the stop and its release are on the person's own page.":"Stops the hardware commands of this task folder at once; only a person releases it.";
-async function pollStop(){const bar=document.getElementById("stopbar"),state=document.getElementById("stopstate"),list=document.getElementById("stopservers");
-  try{const r=await fetch("/estop",{cache:"no-store"});const e=await r.json();
-  if(e.engaged){bar.className="stopbar engaged";
-    let text=`■ EMERGENCY STOP ENGAGED · pressed ${(e.at||"").replace("T"," ")} (${e.by})`;
-    if(e.unreadable)text+=` · the stop file is not one AHC wrote (${e.unreadable}), so it counts as pressed`;
-    // One line per AHC server that took the stop (its own acknowledgement), then what the person may rely on.
-    text+=` · ${e.verdict?e.verdict.text:"no verdict"}`;
-    state.textContent=text+" · nothing runs until a person releases it";
-    list.replaceChildren(...(e.servers||[]).map(s=>el("div",{},s.line)));
-    if(document.getElementById("stopnote").textContent.startsWith("STOP NOT SENT"))note("")}
-  else{bar.className="stopbar";list.replaceChildren();state.textContent=e.released_at?`Released ${(e.released_at||"").replace("T"," ")} by ${e.released_by}; the deck must be checked again before anything moves.`:IDLE}}
-  catch(err){state.textContent="The dashboard does not answer"+(VIEW?".":": this button cannot stop anything now. "+ELSEWHERE)}
-  clearTimeout(pollStop.t);pollStop.t=setTimeout(pollStop,500)}
-pollStop();
+__AHC_STOPBAR_JS__
 
 // Live clocks: the server says what time it was when it read the log (as_of); the page adds the time since.
 const dur=s=>{s=Math.max(0,Math.round(s));const h=Math.floor(s/3600),m=Math.floor(s%3600/60),r=s%60;
@@ -976,11 +1086,11 @@ function render(st){last=st;const sub=document.getElementById("sub");
   if(!st.plates.length){const card=document.getElementById("platecard");card.replaceChildren(el("div",{class:"empty"},"No plate in the loaded layout yet."))}
   else{const p=st.plates[0];
     const cs=Object.values(p.wells).filter(d=>d.v>0&&d.c>0).map(d=>d.c);LO=Math.min(0.01,...cs);plate(p)}  // floor keeps the scale steady while a series grows
-  reservoirs(st.containers);racks(st.tip_racks);timeline(st.events);agentPanel(st.agent,st.timing);statusRow(st);configCard(st);cameraCard(st.config);autoCard(st.auto)}
+  reservoirs(st.containers);racks(st.tip_racks);timeline(st.events);agentPanel(st.agent,st.timing);statusRow(st);deckCard(st.deck,st.view,!!st.run.backend&&st.run.backend!=="sim",(st.config||{}).cameras,st.live,(st.config||{}).physical_world,st.calibration);configCard(st);calBanner(st.calibration);autoCard(st.auto)}
 async function tick(){try{const r=await fetch("/state",{cache:"no-store"});if(r.status===204){document.getElementById("livetext").textContent="waiting for a run";}
   else{const st=await r.json();const tm=st.timing||{};
     TIM={t:tm,at:performance.now(),live:!!tm.run&&!tm.run.done&&["working","waiting"].includes((st.agent||{}).state)};
-    const key=JSON.stringify([st.summary,st.events.length,(st.events.at(-1)||{}).i,st.agent,st.config,st.auto,st.gate,st.estop,tm.steps,tm.split,tm.run&&tm.run.done]);
+    const key=JSON.stringify([st.summary,st.events.length,(st.events.at(-1)||{}).i,st.agent,st.config,st.auto,st.gate,st.deck,st.view,st.live,st.calibration,st.estop,tm.steps,tm.split,tm.run&&tm.run.done]);
     if(key!==tick.key){tick.key=key;render(st)}clocks();document.getElementById("dot").className="dot on";document.getElementById("livetext").textContent="live"}}
   catch(e){document.getElementById("dot").className="dot";document.getElementById("livetext").textContent="disconnected"}
   setTimeout(tick,500)}
@@ -989,11 +1099,36 @@ let resizeTimer;addEventListener("resize",()=>{clearTimeout(resizeTimer);resizeT
 </script></body></html>"""
 
 
+def stop_note(ws: Workspace) -> str | None:
+  """What the stop cannot do on real hardware: the `emergency_stop` sentence of the first device in the confirmed
+  config whose backend is not `sim` and whose description file has one for that backend. Read from the config and the
+  description files only; None when there is none or the config cannot be read."""
+  from ahc.devices.spec import load_device
+  from ahc.workspace.config import parse_config
+
+  try:
+    config = parse_config(ws.config_path.read_text())
+    if config.status(forced_sim=False)[0] != "confirmed":
+      return None
+    for device in config.devices:
+      if device.backend != "sim":
+        note = (load_device(device.model).raw.get("emergency_stop") or {}).get(device.backend)
+        if note:
+          return str(note)
+  except (OSError, LabError, ValueError, TypeError, AttributeError):
+    return None
+  return None
+
+
 def stop_status(ws: Workspace) -> dict[str, Any]:
-  """What the stop bar shows: the folder's stop as every reader sees it (estop.read), and for an engaged
-  stop each AHC server's own acknowledgement (with a line to show) and the verdict on them."""
+  """What the stop bar shows: the folder's stop as every reader sees it (estop.read), the note on what the stop cannot
+  do (stop_note) when a real device has one, and for an engaged stop each AHC server's own acknowledgement (with a
+  line to show) and the verdict on them."""
   record = estop.read(ws)
   out: dict[str, Any] = {**(record or {"engaged": False}), "folder": str(ws.root)}
+  note = stop_note(ws)
+  if note:
+    out["note"] = note
   if record and record.get("engaged"):
     try:
       out["pressed_s"] = max(0, round(time.time() - estop.path(ws).stat().st_mtime))
@@ -1005,31 +1140,26 @@ def stop_status(ws: Workspace) -> dict[str, Any]:
   return out
 
 
-STOP_BUTTON = ('<button class="stopbtn" id="stopbtn" title="Stops every command of this task folder\'s server at once">'
-               'EMERGENCY STOP</button>')
-RELEASE_BUTTON = '<button class="releasebtn" id="releasebtn">Release…</button>'
-IDLE_TEXT = "Stops the hardware commands of this task folder at once; only a person releases it."
-VIEW_ONLY_TEXT = "View only: the stop and its release are on the person's own page."
-
-
 def render_page(ws: Workspace, token: str, view_only: bool = False) -> str:
   """The page: with the stop and release buttons, or (view_only) without them and without the release token."""
-  return (PAGE.replace("<title>AHC · __AHC_FOLDER__</title>", "<title>AHC · __AHC_FOLDER__ · view only</title>" if view_only
+  page = (PAGE.replace("<title>AHC · __AHC_FOLDER__</title>", "<title>AHC · __AHC_FOLDER__ · view only</title>" if view_only
                        else "<title>AHC · __AHC_FOLDER__</title>")
-          .replace("__AHC_STOPBTN__", "" if view_only else STOP_BUTTON)
-          .replace("__AHC_RELEASEBTN__", "" if view_only else RELEASE_BUTTON)
-          .replace("__AHC_IDLE__", VIEW_ONLY_TEXT if view_only else IDLE_TEXT)
-          .replace("__AHC_VIEW__", "1" if view_only else "0")
-          .replace("__AHC_FOLDER__", html.escape(str(ws.root)))
-          .replace("__AHC_TOKEN__", "" if view_only else token))
+          .replace("__AHC_STOPBAR_CSS__", stopbar.CSS).replace("__AHC_STOPBAR_HTML__", stopbar.HTML)
+          .replace("__AHC_STOPBAR_JS__", stopbar.JS))
+  return stopbar.fill(page, ws, token, view_only)
 
 
 def serve(ws: Workspace, log: Path | Callable[[], Path | None] | None, port: int,
-          open_browser: bool, view_only: bool = False) -> http.server.ThreadingHTTPServer:
+          open_browser: bool, view_only: bool = False, live: Any = None,
+          calibration: Any = None) -> http.server.ThreadingHTTPServer:
   """The dashboard of one task folder on 127.0.0.1:<port> (0: a free port; the one bound is
   httpd.server_address[1]). Its stop button writes that folder's estop.json. `log` pins a run log, or a
   function that gives one once it exists; without it the page follows the folder's newest active log.
-  view_only: the same page without the stop and release buttons, and every POST refused."""
+  view_only: the same page without the stop and release buttons, and every POST refused.
+  live: the AHC server's live camera feeds (ahc.livecam.LiveCameras); only the dashboard the server itself serves has
+  them, so the standalone ahc-dashboard has none and says where live frames come from.
+  calibration: the AHC server's Calibration (ahc.calibration), likewise: it serves /calibration and sends the control page
+  there while a camera waits for the person."""
   token = secrets.token_hex(16)  # per process: the release comes from this page, not a stray request
   hosts: set[str] = set()
   own_origins: set[str] = set()
@@ -1038,10 +1168,12 @@ def serve(ws: Workspace, log: Path | Callable[[], Path | None] | None, port: int
     def log_message(self, *args):  # keep the terminal for the demo narration
       pass
 
-    def _send(self, status: int, body: bytes = b"", ctype: str | None = None) -> None:
+    def _send(self, status: int, body: bytes = b"", ctype: str | None = None, location: str | None = None) -> None:
       self.send_response(status)
       if ctype:
         self.send_header("Content-Type", ctype)
+      if location:
+        self.send_header("Location", location)
       self.send_header("Cache-Control", "no-store")
       self.send_header("X-Frame-Options", "DENY")  # never inside another page: no clicks steered onto the buttons
       self.send_header("Content-Security-Policy", "frame-ancestors 'none'")
@@ -1074,16 +1206,19 @@ def serve(ws: Workspace, log: Path | Callable[[], Path | None] | None, port: int
         payload = {}
       if not isinstance(payload, dict):
         payload = {}
-      edit = re.fullmatch(r"/cameras/([a-z][a-z0-9_]{0,31})/slots", self.path)
-      if edit:  # the person's dragged boxes: from this page, with its token, like a release
+      if self.path.startswith("/calibration/"):  # the person's calibration, from this page with its token, like a release
+        if calibration is None:
+          return self._json(404, {"error": "calibration is done on the AHC server's own dashboard"})
         if self.headers.get("Origin") not in own_origins or \
             not hmac.compare_digest(self.headers.get("X-AHC-Token") or "", token):
-          return self._json(403, {"error": "save from the dashboard page"})
+          return self._json(403, {"error": "calibrate on the calibration page"})
         try:
-          status, body = save_slots(ws, edit.group(1), payload.get("slots"))
+          answer = calibrate.post(calibration, self.path, payload)
         except OSError as exc:
-          return self._json(500, {"error": f"could not write the config: {exc}"})
-        return self._json(status, body)
+          return self._json(500, {"error": f"could not write the calibration: {exc}"})
+        except TimeoutError:
+          return self._json(504, {"error": "the AHC server did not answer in time (a picture from the camera, perhaps)"})
+        return self._json(*(answer or (404, {"error": "not found"})))
       if self.path in ("/auto/pause", "/auto/resume"):  # the person's switch, from this page with its token, like a release
         if self.headers.get("Origin") not in own_origins or \
             not hmac.compare_digest(self.headers.get("X-AHC-Token") or "", token):
@@ -1129,7 +1264,26 @@ def serve(ws: Workspace, log: Path | Callable[[], Path | None] | None, port: int
         state = current_state(ws, log)
         if state is None:
           return self._send(204)
-        return self._json(200, state)
+        return self._json(200, {**state, "live": live is not None,
+                                "calibration": calibrate.brief(calibration, None if calibration else calibrate_state(ws))})
+      shown_live = re.fullmatch(r"/camera/([a-z][a-z0-9_]{0,31})/live\.(json|jpg)", route)
+      if shown_live:  # the live camera view: asked for by this page only (Host and Origin checked above), kept in memory
+        if live is None:
+          return self._json(404, {"error": "live camera frames come from the AHC server's own dashboard"})
+        if shown_live.group(2) == "jpg":
+          frame = live.frame(shown_live.group(1))
+          return self._send(200, frame, "image/jpeg") if frame else self._send(404)
+        info = live.view(shown_live.group(1))
+        return self._json(200, info) if info is not None else self._json(404, {"error": "no such camera"})
+      if route.startswith("/calibration"):
+        if calibration is None or view_only:  # only the control dashboard of the AHC server itself
+          return self._json(404, {"error": "calibration is on the control dashboard the AHC server serves"})
+        if route == "/calibration":
+          return self._send(200, calibrate.render_page(ws, token).encode(), "text/html; charset=utf-8")
+        answer = calibrate.get(calibration, route)
+        if answer is None:
+          return self._send(404)
+        return self._send(*answer) if len(answer) == 3 else self._json(*answer)
       shown = re.fullmatch(r"/camera/([a-z][a-z0-9_]{0,31})/reference\.jpg", route)
       if shown:
         data = reference_image(ws, shown.group(1))
@@ -1139,6 +1293,9 @@ def serve(ws: Workspace, log: Path | Callable[[], Path | None] | None, port: int
         data = run_image(ws, image.group(1))
         return self._send(200, data, "image/jpeg") if data else self._send(404)
       if route in ("/", "/index.html"):
+        run_page = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("page") == ["run"]
+        if calibration is not None and not view_only and not run_page and calibration.redirect():
+          return self._send(302, location="/calibration")  # a camera waits for the person; ?page=run is the run page
         return self._send(200, render_page(ws, token, view_only).encode(), "text/html; charset=utf-8")
       return self._send(404)
 
@@ -1165,14 +1322,15 @@ def whoami(port: int, timeout: float = 1.0) -> dict[str, Any] | None:
 
 def open_dashboard(ws: Workspace, log: Path | Callable[[], Path | None] | None, port: int,
                    open_browser: bool, reuse: bool = True,
-                   view_only: bool = False) -> tuple[http.server.ThreadingHTTPServer | None, str]:
+                   view_only: bool = False, live: Any = None,
+                   calibration: Any = None) -> tuple[http.server.ThreadingHTTPServer | None, str]:
   """For ahc-smoke, ahc-demo and ahc-dashboard: this folder's dashboard, never another folder's. A
   dashboard for this folder already on `port` follows the run too (unless `reuse` is off); anything
   else there is left alone, and the next free port serves this folder. A view-only dashboard is its
   own kind: it never reuses a control page, nor a control page a view-only one. Returns the server
   started (None when one was already there) and a line for the person."""
   try:
-    httpd = serve(ws, log, port, open_browser, view_only)
+    httpd = serve(ws, log, port, open_browser, view_only, live, calibration)
     return httpd, f"http://127.0.0.1:{httpd.server_address[1]}/"
   except OSError:
     pass
@@ -1185,7 +1343,7 @@ def open_dashboard(ws: Workspace, log: Path | Callable[[], Path | None] | None, 
            if other is not None else f"port {port} is taken by something that is not this folder's dashboard")
   for candidate in [*range(port + 1, port + 21), 0]:
     try:
-      httpd = serve(ws, log, candidate, open_browser, view_only)
+      httpd = serve(ws, log, candidate, open_browser, view_only, live, calibration)
     except OSError:
       continue
     return httpd, f"http://127.0.0.1:{httpd.server_address[1]}/ ({taken})"

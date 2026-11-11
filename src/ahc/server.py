@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import copy
 import hashlib
 import inspect
 import ipaddress
@@ -41,10 +42,13 @@ from ahc import auto_verify as auto
 from ahc import physical_world as pw
 from ahc import vision_points as vpoints
 from ahc import cameras as cams
+from ahc.calibration import Calibration
+from ahc.livecam import LiveCameras
 from ahc.core.capability import LiquidHandling
 from ahc.core import deck_state
 from ahc.core.errors import LabError
-from ahc.core.layout import deck_differences
+from ahc.core.deckmap import deck_map
+from ahc.core.layout import Layout, deck_differences
 from ahc.devices.base import Adapter
 from ahc.devices.hamilton.starlet import STARletAdapter
 from ahc.devices.opentrons.ot2 import OT2Adapter
@@ -54,13 +58,14 @@ from ahc.plan import MAX_STEPS, PlanProgress
 from ahc.records import RunLog
 from ahc.timing import run_timing
 from ahc.verification import CHECKS, Gate, Verification
-from ahc.verification.ask import HOMING, agent_now, confirm_now, pass_now
+from ahc.verification.ask import agent_now, before_load, confirm_now, pass_now
 from ahc.verification.checks import ON_A_REAL_DECK
 from ahc.instrument_context import InstrumentContext
 from ahc.vision_context import VisionContext
 from ahc.vision_points import VisionRecord
 from ahc.viz import dashboard as run_dashboard
-from ahc.workspace import (CameraEntry, Config, DeviceEntry, Workspace, apply_limits, parse_auto_verify, parse_cameras, parse_config,
+from ahc.viz import viewlink
+from ahc.workspace import (CameraEntry, Config, DeviceEntry, Workspace, apply_limits, check_robot_cameras, parse_auto_verify, parse_cameras, parse_config,
                            parse_devices, parse_slot_map, resolve_workspace, simulation_config, slots_text, template_text)
 from ahc.workspace.config import HEADER
 from ahc.workspace import estop
@@ -73,6 +78,7 @@ ADAPTERS = {"hamilton.starlet": STARletAdapter, "opentrons.ot2": OT2Adapter}
 SIMULATORS = {"opentrons.ot2": ot2_sim}
 DEFAULT_SIM_MODEL = "hamilton.starlet"
 REPO = Path(__file__).resolve().parents[2]  # the checkout the plugin runs with `uv run --project`
+ROBOT_BUSY_WAIT_S = 30.0  # a capture of the robot's camera waits this long for a running call to end
 DASHBOARD_PORT = 8770  # the first port open_dashboard tries; the next free ones follow
 DECK_OPS = ("load_layout", "pick_up_tips", "aspirate", "dispense", "mix", "drop_tips")  # calls that change the deck
 DEFAULT_PORT = 31950  # the OT-2 robot-server's port when an entry names none
@@ -81,8 +87,8 @@ ROBOT_SEARCH_S = 3.0  # how long a robot that does not answer is looked for by i
 ROBOT_SEARCH_BOUND_S = 10.0  # ... and the most the call waits for that search, mDNS lookups included
 ROBOT_SEARCH_KEPT_S = 30.0  # a search result is reused for this long, so a robot that stays off is not searched at every call
 # The stop went out but the robot never said its run stopped (not yet, or it refused): never "stopped" before it does.
-STOP_UNCONFIRMED = ("The emergency stop was sent to the robot, which has not confirmed that its run stopped: it may still "
-                    "be executing its last command, and the power switch is the immediate stop")
+# Each adapter words it for its own device (Adapter.STOP_UNCONFIRMED); this is the robot's.
+STOP_UNCONFIRMED = Adapter.STOP_UNCONFIRMED
 
 
 DECK_GUIDE = ("OT-2 deck seen from above: slots 1-3 are the front row left to right, 4-6 the row behind, 7-9 the next, "
@@ -113,11 +119,12 @@ def check_entry(entry: DeviceEntry) -> None:
 
 
 async def probe_entry(entry: DeviceEntry) -> tuple[DeviceEntry, dict[str, Any]]:
-  """A real device, read before the person is asked to confirm it: who answers at that address and what
-  its mounts carry (read-only: no run, no motion). Returns the entry with robot_name and mounts filled in
-  from the robot itself, and the identity to show the person. Refuses a different robot, mounts the entry
-  states that the robot does not carry, and a robot with no pipette AHC drives."""
-  probe = getattr(ADAPTERS[entry.model], "probe_identity", None)
+  """A real device, read before the person is asked to confirm it: who answers at that address and, for a robot, what
+  its mounts carry (read-only: no run, no motion). Returns the entry with the device's identity option (a robot's name,
+  an instrument's serial) and mounts filled in from the device itself, and the identity to show the person. Refuses a
+  different device, mounts the entry states that the robot does not carry, and a robot with no pipette AHC drives."""
+  cls = ADAPTERS[entry.model]
+  probe = getattr(cls, "probe_identity", None)
   if entry.backend == "sim" or probe is None:
     return entry, {}
   try:
@@ -126,12 +133,20 @@ async def probe_entry(entry: DeviceEntry) -> tuple[DeviceEntry, dict[str, Any]]:
     if exc.code != "backend_unreachable":
       raise
     raise LabError(exc.code, exc.message + " Nothing was written.",
-                   (exc.hint + " " if exc.hint else "") + "configure_devices reads the robot's name and pipettes before "
-                   "it writes the config, so the robot must be on and reachable; ask the person.") from exc
+                   (exc.hint + " " if exc.hint else "") + cls.PROBE_NEEDS) from exc
   if not identity:
     return entry, {}
-  where = f"{entry.options.get('host')}:{entry.options.get('port') or DEFAULT_PORT}"
-  name, expected = identity.get("name"), entry.options.get("robot_name")
+  return pin_identity(entry, identity), identity
+
+
+def pin_identity(entry: DeviceEntry, identity: dict[str, Any]) -> DeviceEntry:
+  """The entry with what the device answered written into it (its name or serial, a robot's mounts), after the checks
+  that nothing else answered: refuses a different device, mounts the entry states that the robot does not carry, and a
+  robot with no pipette AHC drives."""
+  cls = ADAPTERS[entry.model]
+  where = (f"{entry.options.get('host')}:{entry.options.get('port') or DEFAULT_PORT}" if entry.options.get("host")
+           else entry.id)
+  name, expected = identity.get(cls.IDENTITY_FIELD), cls.pinned(entry.options)
   if expected and name != expected:
     raise LabError("wrong_robot", f"{where} is the robot {name!r}, not {expected!r}; nothing was written.",
                    "Check the robot's address and name with the person.")
@@ -153,8 +168,8 @@ async def probe_entry(entry: DeviceEntry) -> tuple[DeviceEntry, dict[str, Any]]:
                      "makes the robot usable.")
     options["mounts"] = found
   if name and not expected:
-    options["robot_name"] = name
-  return replace(entry, options=options), identity
+    options[cls.IDENTITY_OPTION] = name
+  return replace(entry, options=options)
 
 
 def _mounts_text(mounts: dict[str, Any]) -> str:
@@ -200,6 +215,19 @@ def _tips_count(mounted: Any) -> str:
   return ", ".join(f"{'an unknown number' if n == 'unknown' else n} on {c}" for c, n in mounted.items())
 
 
+def _lower(text: str) -> str:
+  return text[:1].lower() + text[1:]
+
+
+def _upper(text: str) -> str:
+  return text[:1].upper() + text[1:]
+
+
+def _stop_sent(adapter: Any) -> str:
+  """The stop's first clause when the device has not confirmed it, in the adapter's words, to read mid-sentence."""
+  return _lower(adapter.STOP_UNCONFIRMED.partition(": ")[0])
+
+
 def _mounts_summary(d: DeviceEntry) -> str:
   """", mounts left X, right Y" for a device whose model has mounts, else "". An empty mount reads "empty", one
   AHC does not drive "X (not driven)". Never raises: a broken option is shown as written."""
@@ -222,10 +250,14 @@ def confirm_summary(config: Config) -> str:
   for d in config.devices:
     text = f"{d.id} = {d.model}, backend {d.backend}"
     if d.backend != "sim":
-      name = d.options.get("robot_name")
-      text += (f", robot {name!r}" if name else ", robot (no name)")
-      if d.options.get("host"):
-        text += f" at {d.options['host']}:{d.options.get('port') or DEFAULT_PORT}"
+      cls = ADAPTERS.get(d.model)
+      if cls is not None:  # the adapter says which device the person confirms and where it is reached
+        text += cls.describe_entry(d.options)
+      else:
+        name = d.options.get("robot_name")
+        text += (f", robot {name!r}" if name else ", robot (no name)")
+        if d.options.get("host"):
+          text += f" at {d.options['host']}:{d.options.get('port') or DEFAULT_PORT}"
     text += _mounts_summary(d)
     devices.append(text)
   limits = []
@@ -237,7 +269,7 @@ def confirm_summary(config: Config) -> str:
         limits.append(f"{address} {key} {json.dumps(bound, sort_keys=True)}".replace("  ", " "))
   text = "; ".join(devices) + "; task limits: " + (", ".join(limits) or "none")
   if config.cameras:
-    text += "; cameras: " + ", ".join(f"{c.name} {c.device!r}" + (f" (sees {c.sees()})" if c.slot_map else "")
+    text += "; cameras: " + ", ".join(f"{c.name} {c.what()}" + (f" (sees {c.sees()})" if c.slot_map else "")
                                       for c in config.cameras)
   if config.auto_verify:
     text += "; auto-verify: " + config.auto_verify.summary()
@@ -248,11 +280,11 @@ INSTRUCTIONS = """\
 Lab hardware MCP (AHC): call lab_overview first (this task's workspace, config, next step), then open_dashboard so the person can watch and stop the run.
 Config: {config}
 The person's tools (confirm_config, record_verdict): their approval in the client's dialog is the confirmation, so call them right away; do not wait for a typed answer. A pending check (verify gives ask_person): record_verdict(check_id, verdict='pass', note=<ask_person>). The config: confirm_config(summary=config.confirm_summary). Denied means not confirmed: stop, ask the person what they see, record_verdict(verdict='fail') with their words as the note. Never approve for them or invent their words. A client with no approval dialog on each call: ask in chat first.
-Flow: lab_overview -> find_layout_references -> report_decision(plan=[...]) -> load_layout -> verify(check='deck_matches_layout') -> pick_up_tips / aspirate / dispense / mix / drop_tips -> verify -> report_decision(plan_done=true). get_params(device, op) only for device-specific behaviour.
+Flow: lab_overview -> find_layout_references -> report_decision(plan=[...], layout=...) (the person sets the deck up from it before load_layout) -> load_layout -> verify(check='deck_matches_layout') -> pick_up_tips / aspirate / dispense / mix / drop_tips -> verify -> report_decision(plan_done=true). get_params(device, op) only for device-specific behaviour.
 Plan first: before load_layout or any action, report your plan as short concrete steps with report_decision (refused otherwise: plan_required). Every later call names its step with plan_step.
 After every load_layout nothing moves until the deck check passes: the simulator judges it in simulation, the person on site on real hardware. A layout matching none saved or run in this task folder needs the person in simulation too (verify gives ask_person).
 Address a component as <device id>.<component> (starlet.pip, ot2.right). Targets, volumes and limits are described with each tool's parameters and checked server-side before anything moves. Results marked simulated are not measurements.
-With cameras: capture(label, plan_step) around the steps you want to check, and look; physical_world_context says what they can verify (lab-hardware skill).
+With cameras: capture(label, plan_step) around the steps you want to check, and look; physical_world_context says what they can verify (lab-hardware skill). On real hardware load_layout waits until the person calibrated each camera on the dashboard's calibration page (calibration_required; lab_overview.calibration).
 Tell the person watching what you decide with report_decision: the plan, a changed plan, a refusal that changes your course, and waiting for the person's approval (waiting_for='person', just before the call they approve). One line each.
 If a call is refused with emergency_stop, stop at once: do not retry or work around it, never release it yourself, tell the person and wait (report_decision with waiting_for='person'). Read-only calls, capture and report_decision still run, nothing else."""
 
@@ -266,11 +298,11 @@ CONFIG_PERSON = ("With no config, ask the person whether to simulate or use a re
                  "has never run an experiment (lab_overview.session).")
 REAL_HARDWARE = """
 Real hardware (a person on site):
-- Find the robot with find_robots or ask the person for its address; never probe addresses yourself. configure_devices reads its name and mounts: the person confirms that identity.
-- load_layout starts a run and homes the robot: hands and deck must be clear. Fold that into the dialog before it (the tips_mounted note or confirm_config): say in chat, in the same message before that call, that approving also means hands and deck are clear and the robot homes next. With no such dialog, ask in chat.
+- Find the robot with find_robots or ask the person for its address; never probe addresses yourself. configure_devices reads its name and mounts: the person confirms that identity. A STARlet is found by asking the person for its USB host's ssh name (options.bridge).
+- load_layout starts a run and homes the robot: hands and deck must be clear. Fold that into the dialog before it (the tips_mounted note or confirm_config): say in chat, in the same message before that call, that approving also means hands and deck are clear and the robot homes next. With no such dialog, ask in chat. A STARlet's load initializes it instead (every arm moves).
 - Every verify on real hardware waits for the person, except volumes_match (the digital twin's answer): it returns pending with ask_person; report waiting_for='person', then record_verdict right away (auto: true: agent_verdict).
 - On any device error (device_refused, completion_unknown, mount_mismatch, wrong_robot) or motion nobody expected: stop and ask the person; never retry a motion call.
-- After an emergency stop, an unknown outcome or a restart with tips on, the person removes any tips: load_layout waits for their pass on verify(check='tips_mounted', expect='none') without device.
+- After an emergency stop, an unknown outcome or a restart with tips on, the person removes any tips: load_layout waits for their pass on verify(check='tips_mounted', expect='none') without device. Tips that stay on: recover_tips (ask first).
 - Never reach the robot except through these tools: no curl or other HTTP to it, no ahc-smoke; only the person releases a stop (never ahc-estop --release)."""
 
 
@@ -333,7 +365,7 @@ Specialized = Annotated[dict[str, Any] | None, Field(description="Device-specifi
 DeviceList = Annotated[list[dict[str, Any]], Field(description="The person's choice, e.g. [{'id': 'starlet', 'model': 'hamilton.starlet', 'backend': 'sim'}]; one device for now.")]
 Plan = Annotated[list[str] | None, Field(description="Your plan as short concrete steps; replaces the previous plan. Omit to keep it.")]
 PlanStep = Annotated[int, Field(description="The step of your reported plan this call belongs to (1-based); report the plan first with report_decision.")]
-CameraList = Annotated[list[dict[str, Any]] | None, Field(description="Optional: the task's cameras, [{'name': 'top', 'device': 'USB Camera'}]; device is the camera's exact name on this computer (macOS AVFoundation). Omitted = keep the config's cameras; [] = none. A camera that keeps its name and device keeps its slot map (map_camera writes one).")]
+CameraList = Annotated[list[dict[str, Any]] | None, Field(description="Optional: the task's cameras, [{'name': 'top', 'device': 'USB Camera'}]; device is the camera's exact name on this computer (macOS AVFoundation). The OT-2's own built-in camera: {'name': 'deck', 'source': 'robot', 'device': '<the OT-2 device id, e.g. ot2>'} (real robot only; a USB camera must be plugged into the Mac, not the robot). Omitted = keep the config's cameras; [] = none. A camera that keeps its name and device keeps its slot map (map_camera writes one).")]
 AutoVerifyArg = Annotated[dict[str, Any] | None, Field(description="Optional, the person's choice: {'checks': ['deck_matches_layout', 'liquid_present'], 'min_streak': 5}. Lets the cameras answer those checks, judged by you from images, once your image judgments agreed with the person's that many times in a row (default 5). Only deck_matches_layout, liquid_present and tips_mounted are allowed. Omitted = keep the config's; {} = off. Part of what the person confirms.")]
 TaskLimits = Annotated[dict[str, Any] | None, Field(description="Optional, tighten only: {'starlet.pip': {'volume_ul': {'max': 200}}}.")]
 
@@ -396,23 +428,45 @@ class Lab:
     self.dashboard: dict[str, Any] | None = None  # the run dashboard open_dashboard serves or found: url, httpd (ours) or None
     self.view_dashboard: dict[str, Any] | None = None  # the same for the view-only one (no stop or release), for an audience
     self.last_motion = 0.0  # when a call that moves the robot last started or ended (time.time()): older captures show an older deck
+    self.live = LiveCameras(self)  # the dashboard's live camera view: feeds start when a page asks, stop when it stops asking
     self.vision_seen: dict[str, dict[str, Any]] = {}  # camera -> its latest capture's analysis: {t, path, analysis}
     self.vision_points: list[dict[str, str]] = []  # the points the agent declared (report_decision vision_points)
     self.vision_result: dict[str, Any] | None = None  # the last physical_world_context, with when
+    self.loop: asyncio.AbstractEventLoop | None = None  # the server's loop, for the dashboard's threads (set by open_dashboard)
+    self.calibration = Calibration(self)  # the person's slot and plate calibration (the /calibration page)
     self.proposals: dict[str, dict[str, Any]] = {}  # check id -> the agent's image judgment (propose_verdict), until the person's verdict
     self.auto_checks: dict[str, dict[str, Any]] = {}  # check id -> what verify asked of an auto check (agent_verdict judges it again)
+    # The deck report_decision(layout=...) previewed, built on a scratch deck with no device: load_layout without a
+    # layout loads it, the dashboard draws it. planned_name: the saved layout it was read from, if any.
+    self.planned_layout: dict[str, Any] | None = None
+    self.planned_name: str | None = None
+    self.planned: Layout | None = None  # the scratch Layout built from planned_layout
+    self.preview: dict[str, Any] | None = None  # what the run log holds for it: {"name", "text", "map"}
     self.view = None
+    self._view_lock = asyncio.Lock()
     if view:
       from ahc.viz.viewer import LiveView  # optional: pulls in the 3D viewer's web servers
       self.view = LiveView("AHC")
 
-  async def run(self, fn: Callable[[], Awaitable[dict[str, Any]]]) -> dict[str, Any]:
-    async with self.lock:
+  async def run(self, fn: Callable[[], Awaitable[dict[str, Any]]], wait: float | None = None) -> dict[str, Any]:
+    """One call at a time. `wait`: give up (robot_busy) when the turn does not come within that many seconds."""
+    if wait is not None:
+      try:
+        await asyncio.wait_for(self.lock.acquire(), wait)
+      except asyncio.TimeoutError:
+        raise LabError("robot_busy", f"another call (one that moves the robot, perhaps) was still running after {wait:g} s; "
+                       "a picture from the robot's camera is not taken while it runs.",
+                       "Wait for that call to end, then capture again.") from None
+    else:
+      await self.lock.acquire()
+    try:
       self._call_began = (datetime.now(), time.monotonic())  # a call's time counts from its turn, not its queueing
       try:
         return await fn()
       finally:
         self._call_began = None
+    finally:
+      self.lock.release()
 
   # -- emergency stop -------------------------------------------------------------------------
 
@@ -505,7 +559,7 @@ class Lab:
     """This server's own acknowledgement of the stop (estop.py): the device bound, whether a run was active, what the
     device's stop did. Never raises into the stop."""
     device = None if adapter is None else {"id": adapter.spec.id, "model": adapter.spec.model, "backend": adapter.backend,
-                                           "robot": adapter.options.get("robot_name")}
+                                           "robot": adapter.pinned(adapter.options)}
     try:
       estop.write_ack(self.ws, stop, self._server, self._started,
                       {"device": device, "run_active": run_active, "halt": halt, "detail": detail})
@@ -513,11 +567,12 @@ class Lab:
       print(f"ahc: stop acknowledgement not written ({type(exc).__name__}: {exc})", file=sys.stderr)
 
   async def _halt_device(self, adapter) -> None:
-    """The emergency stop reaching the device: the OT-2's run is stopped; other devices have no stop
-    this layer can reach yet. Logged either way."""
+    """The emergency stop reaching the device: the adapter's halt() stops what it can reach (an OT-2's run, a real
+    STARlet's link); a device with no stop this layer can reach is said to have none.
+    The acknowledgement and the run log carry what the adapter says it did (HALTED, or its own halted_text)."""
     stop = self.estop
     try:
-      halted = await adapter.halt()
+      halted = await adapter.halt(stop)
     except Exception as exc:  # noqa: BLE001 - the stop must be reported, never raised into the watcher
       if stop is not None:
         other = getattr(exc, "code", None) == "other_run_active"
@@ -528,17 +583,15 @@ class Lab:
                             "command; the power switch is the immediate stop."})
       self._save_deck()
       return
+    said = getattr(adapter, "halted_text", None) or adapter.HALTED  # what this device's stop did, in its own words
     if stop is not None:
-      none_to_stop = type(adapter).halt is Adapter.halt  # the base class: this device has no stop to reach
+      none_to_stop = not adapter.has_stop  # this device (or this backend of it) has no stop to reach
       self._acknowledge(stop, "stopped" if halted else "no_stop" if none_to_stop else "no_run", adapter,
                         run_active=True if halted else None if none_to_stop else False,
-                        detail="the robot accepted the stop and its run reports stopped; the command in flight may have "
-                               "finished first" if halted else "no device-level stop for this device" if none_to_stop
+                        detail=said if halted else "no device-level stop for this device" if none_to_stop
                         else "nothing was running on the device")
     if halted:
-      self._note({"type": "audit", "event": "device_halted",
-                  "detail": "the robot accepted the stop and its run reports stopped; the command in flight may have "
-                            "finished first"})
+      self._note({"type": "audit", "event": "device_halted", "detail": said})
     else:
       self._note({"type": "audit", "event": "device_not_halted",
                   "detail": "no device-level stop for this device, or nothing was running on it"})
@@ -565,9 +618,12 @@ class Lab:
     """This task folder's run dashboard, served from this process (it ends with the server): started on the first
     free port from 8770, or this folder's own dashboard that is already running. Asked again, the same one.
     view_only: the page without stop or release, a second dashboard on a port of its own next to the control one."""
+    self.loop = asyncio.get_running_loop()
+
     def start() -> tuple[Any, str]:  # blocking: binds a port and may probe one
       return run_dashboard.open_dashboard(self.ws, lambda: self.runlog.path if self.runlog else None,
-                                          DASHBOARD_PORT, open_browser=False, view_only=view_only)
+                                          DASHBOARD_PORT, open_browser=False, view_only=view_only, live=self.live,
+                                          calibration=self.calibration)
     shown = self.view_dashboard if view_only else self.dashboard
     if shown is not None and shown["httpd"] is None:  # another process's: still this folder's, still there?
       port = int(shown["url"].rsplit(":", 1)[1].strip("/"))
@@ -589,14 +645,26 @@ class Lab:
     else:
       self.dashboard = shown
     opened = False
+    await self.ensure_view()
+    calibrating = not view_only and self.calibration.redirect()  # a camera waits for the person: the page opens there
+    where = shown["url"].rstrip("/") + "/calibration" if calibrating else shown["url"]
     if open_browser:
       try:  # the person's browser; a machine with none must not fail the tool
-        opened = bool(await asyncio.to_thread(webbrowser.open, shown["url"]))
+        opened = bool(await asyncio.to_thread(webbrowser.open, where))
       except Exception:  # noqa: BLE001
         opened = False
-    return {"url": shown["url"], "started": started, "browser_opened": opened,
-            **({"view_only": True, "note": "no stop or release on this page; the person keeps the control dashboard"}
-               if view_only else {"how_to_stop": "the stop button on this page"})}
+    out: dict[str, Any] = {"url": shown["url"], "started": started, "browser_opened": opened,
+                           **({"view_only": True, "note": "no stop or release on this page; the person keeps the control dashboard"}
+                              if view_only else {"how_to_stop": "the stop button on this page"})}
+    if calibrating:
+      out["calibration"] = {"url": where, "cameras": self.calibration.for_person(),
+                            "note": "A camera needs the person's calibration before load_layout: the dashboard sends them to "
+                                    "the calibration page and the browser opened there. Tell them; the run page stays at "
+                                    f"{shown['url'].rstrip('/')}/?page=run."}
+    elif not view_only and (needing := self.calibration.outstanding()):
+      out["calibration"] = {"note": "Camera(s) " + ", ".join(c.name for c in needing) + " have no slot map: map_camera first; "
+                                    "the person calibrates them on the calibration page after that."}
+    return out
 
   def stop_dashboard(self) -> None:
     """Ends the dashboard this server serves (one another process serves is left alone)."""
@@ -625,6 +693,9 @@ class Lab:
         await self._unbind("the server shut down")
         if self.view is not None:
           await self.view.stop()
+        viewlink.remove(self.ws)
+        self.calibration.forget()
+        await asyncio.to_thread(self.live.stop)
     # Together: a call in flight that holds the lock must not keep the dashboard open (or the other way round).
     await asyncio.gather(device(), asyncio.to_thread(self.stop_dashboard))
 
@@ -793,16 +864,18 @@ class Lab:
     """
     overrides = {k: self.options[k] for k in ("host", "port") if k in self.options}
     if backend != "sim":
-      confirmed = {"host": entry.options.get("host"), "port": entry.options.get("port") or DEFAULT_PORT}
-      differ = {k: v for k, v in overrides.items() if str(v).strip().lower() != str(confirmed[k]).strip().lower()}
-      if differ:
-        given = ", ".join(f"{k} {v}" for k, v in differ.items())
-        raise LabError("endpoint_override",
-                       f"this server was started with {given} (--host/--port or AHC_OT2_HOST/AHC_OT2_PORT), but the "
-                       f"person confirmed the robot at {confirmed['host']}:{confirmed['port']}; a real robot is driven "
-                       "only at its confirmed address.",
-                       "Tell the person: start the server without --host/--port and without AHC_OT2_HOST/AHC_OT2_PORT "
-                       "(they are for simulators). Another robot is written with configure_devices and confirmed by the person.")
+      cls = ADAPTERS[entry.model]
+      if "host" in cls.OPTIONS.get(backend, ()):  # a device reached at host:port; another is not reached that way
+        confirmed = {"host": entry.options.get("host"), "port": entry.options.get("port") or DEFAULT_PORT}
+        differ = {k: v for k, v in overrides.items() if str(v).strip().lower() != str(confirmed[k]).strip().lower()}
+        if differ:
+          given = ", ".join(f"{k} {v}" for k, v in differ.items())
+          raise LabError("endpoint_override",
+                         f"this server was started with {given} (--host/--port or AHC_OT2_HOST/AHC_OT2_PORT), but the "
+                         f"person confirmed the robot at {confirmed['host']}:{confirmed['port']}; a real robot is driven "
+                         "only at its confirmed address.",
+                         "Tell the person: start the server without --host/--port and without AHC_OT2_HOST/AHC_OT2_PORT "
+                         "(they are for simulators). Another robot is written with configure_devices and confirmed by the person.")
       return dict(entry.options)
     sim = SIMULATORS.get(entry.model)
     if sim is None:  # simulated in this process (the STARlet): nothing to reach
@@ -841,6 +914,17 @@ class Lab:
       options["check_endpoint"] = lambda h, p: sim.check_endpoint(ws, h, p)
     return options
 
+  def link_identity(self, entry: DeviceEntry) -> dict[str, Any] | None:
+    """The identity of a real device whose adapter takes one connection at a time (EXCLUSIVE_LINK), read from the link
+    this server already holds to it, so configure_devices does not open a second one: the bound adapter must be real, of
+    the entry's model, reaching the same place, and know who the device is. None: probe it."""
+    cls = ADAPTERS[entry.model]
+    adapter = self.adapter
+    if (not cls.EXCLUSIVE_LINK or entry.backend == "sim" or adapter is None or adapter.simulated
+        or type(adapter) is not cls or not adapter.reaches(entry.options)):
+      return None
+    return adapter.identity() or None
+
   async def _unbind(self, why: str) -> bool:
     """Drop the device, best effort: one that cannot be stopped (the robot off or rebooted) must not
     wedge the server, so a failed stop is recorded and the device dropped anyway. Then the robot is free for another
@@ -857,6 +941,7 @@ class Lab:
                      "detail": f"{why}; stopping the device failed ({type(exc).__name__}: {exc}). Its last run may "
                                "still be active on the robot; it is dropped here anyway."}, defer=True)
     self.spec = self.adapter = self.lh = self.verification = self.gate = None
+    self.clear_preview()  # drawn for another device
     self._bound = self._limits = None
     self._recheck = False
     self.tips_on, self._tips_why, self._run_id = {}, None, None
@@ -880,13 +965,13 @@ class Lab:
 
   def claim_robot(self) -> None:
     """A real robot is driven by at most one server (one session) at a time: load_layout, which starts a run, takes an
-    exclusive lock keyed by the robot's name under AHC_HOME (robot_lock.py). It stays until the device is let go of:
+    exclusive lock keyed by the device's name or serial (the adapter's pinned identity) under AHC_HOME (robot_lock.py). It stays until the device is let go of:
     disconnect, the server ending, a new config. Simulators are per task already: no lock."""
     adapter = self.adapter
     if adapter.simulated or self._robot_lock is not None:
       return
     host, port = getattr(adapter, "host", None), getattr(adapter, "port", None)
-    name = adapter.options.get("robot_name") or (f"{host}:{port}" if host else self.spec.model)
+    name = adapter.pinned(adapter.options) or (f"{host}:{port}" if host else self.spec.model)
     lock = RobotLock(str(name))
     who = {"workspace": str(self.ws.root), "session_started": self._started, "claude_session": claude_session(),
            "endpoint": f"{host}:{port}" if host else None}
@@ -923,7 +1008,7 @@ class Lab:
               "next": "Already disconnected at " + str(self.disconnected["at"]).replace("T", " ") + ". " + self.next_step()}
     adapter = self.adapter
     run, real, tips = adapter.run_id(), not adapter.simulated, dict(self._tips_noted())
-    robot = adapter.options.get("robot_name")
+    robot = adapter.pinned(adapter.options)
     stopped = await self._unbind("the agent disconnected the device")
     ended = await adapter.run_ended(run) if run is not None else None  # asked: stop() returning is not the robot's word
     self._go_ahead = None
@@ -933,17 +1018,21 @@ class Lab:
     elif ended is False:
       first = ("The robot has NOT confirmed that its run ended" + ("" if stopped else " (the stop failed)") + ": it may "
                "still be executing its last command. Tell the person; the Opentrons App or the power switch ends it.")
+    elif adapter.LET_GO and run is None and real:  # a device that keeps no run: the adapter says what letting go meant
+      first = adapter.LET_GO
     else:
       first = "No run was open on the device."
-    leftover = (f" Tips may still be on the pipettes ({_tips_count(tips)}): the person removes them by hand; load_layout then "
-                "waits for their pass on verify(check='tips_mounted', expect='none')." if real and tips else "")
+    leftover = (f" Tips may still be on the pipettes ({_tips_count(tips)}): the person removes them by hand;"
+                f"{self._recover_hint(lower=True)} load_layout then waits for their pass on verify(check='tips_mounted', "
+                "expect='none')." if real and tips else "")
     return {"disconnected": True, "run_ended_confirmed": ended, "tips_left": tips,
             "next": f"{first} The server, the dashboard and the run log stay up.{leftover} To drive again: the person's "
                     "go-ahead (confirm_config(summary=config.confirm_summary)), then load_layout; lab_overview has the details."}
 
   def require_connected(self, op: str) -> None:
-    """After disconnect only load_layout runs, and that only with the person's go-ahead (require_go_ahead)."""
-    if self.disconnected is None or op == "load_layout":
+    """After disconnect only load_layout (and recover_tips, which opens its own link) runs, and that only with the
+    person's go-ahead (require_go_ahead)."""
+    if self.disconnected is None or op in ("load_layout", "recover_tips"):  # recover_tips opens a link of its own
       return
     raise LabError("disconnected", f"the device was disconnected at {str(self.disconnected['at']).replace('T', ' ')} "
                    "(disconnect), so nothing moves until the person gives their go-ahead again and a layout is loaded.",
@@ -1035,7 +1124,7 @@ class Lab:
     other = self.ws.tips_left()
     if other is not None and (other.get("run") is None or other.get("run") != self.live_run()):
       return False
-    robot = self.adapter.options.get("robot_name")
+    robot = self.adapter.pinned(self.adapter.options)
     note = {"at": time.strftime("%Y-%m-%dT%H:%M:%S"), "why": self._tips_why or self._found_why() or why,
             "device": self.spec.model, **({"robot": robot} if robot else {}), "run": self.live_run(),
             "mounted": dict(self._tips_noted() if mounted is None else mounted), **self.endpoint()}
@@ -1159,12 +1248,14 @@ class Lab:
     """Why the live run cannot vouch for its tips (while _doubt_key() is not None)."""
     adapter = self.adapter
     if adapter.outcome_unknown:
-      return f"the outcome of {adapter.outcome_unknown.get('op')} on the robot is unknown"
+      # A record with "says" is not about one call (a lost link, a stop found on the device's host, an initialization
+      # that failed): the adapter's own sentence.
+      return adapter.outcome_unknown.get("says") or f"the outcome of {adapter.outcome_unknown.get('op')} on the robot is unknown"
     if self.interrupted:
       return f"the emergency stop interrupted {self.interrupted.get('op')}"
     if adapter.halted:
-      return "the emergency stop stopped the robot's run"
-    return "the emergency stop was sent to the robot, which has not confirmed that its run stopped"
+      return _lower(adapter.STOPPED)
+    return _stop_sent(adapter)
 
   def tips_note(self) -> str | None:
     """Real hardware: why tips may be on the pipettes that the robot no longer knows of, or None. A note another
@@ -1174,12 +1265,14 @@ class Lab:
       return None
     key = self._doubt_key()
     if key is not None and key != self._tips_cleared:
+      forgets = self.adapter.FORGETS_TIPS  # a robot's run forgets its tips; an instrument's channels keep theirs
       if self.tips_on:
         return (f"Tips may still be on the pipettes: {_tips_count(self.tips_on)} "
-                f"({self._tips_why or self._run_doubt()}), and the robot no longer knows them.")
+                f"({self._tips_why or self._run_doubt()}), and "
+                + ("the robot no longer knows them." if forgets else "this server can no longer vouch for them."))
       doubt = self._run_doubt()
-      return (f"{doubt[0].upper()}{doubt[1:]}: no tips were on as far as this server knows, but the robot no longer "
-              "keeps track of them.")
+      return (f"{_upper(doubt)}: no tips were on as far as this server knows, but "
+              + ("the robot no longer keeps track of them." if forgets else "this server can no longer vouch for that."))
     note = self.ws.tips_left()
     live = self.live_run()
     if note is None or (live is not None and note.get("run") == live):
@@ -1205,7 +1298,7 @@ class Lab:
     so the person checks that robot's pipettes; '' for the bound robot's own note, or one that names no robot."""
     name, where = note.get("robot"), note.get("endpoint")
     if self.adapter is not None:
-      mine = self.adapter.options.get("robot_name")
+      mine = self.adapter.pinned(self.adapter.options)
       if (name == mine) if name and mine else where == self.endpoint().get("endpoint"):
         return ""
     if not name and not where:
@@ -1233,6 +1326,98 @@ class Lab:
     except Exception as exc:  # noqa: BLE001 - references that cannot be read leave the layout to the person
       return {"unreadable": f"{type(exc).__name__}: {exc}"}
 
+  def can_recover_tips(self) -> bool:
+    """A real device whose adapter can put tips left on its channels back or into the waste (recover_tips)."""
+    adapter = self.adapter
+    recovers = getattr(adapter, "recovers_tips", None)
+    return adapter is not None and not adapter.simulated and recovers is not None and bool(recovers())
+
+  def _recover_hint(self, lower: bool = False) -> str:
+    """For a device that has recover_tips: tips that do not come off by hand have a way out. '' for every other device,
+    so their texts stay as they are. `lower`: continues a sentence."""
+    if not self.can_recover_tips():
+      return ""
+    text = ("If they do not come off by hand, recover_tips puts them back into the rack they came from or into the "
+            "tip waste: ask the person which first.")
+    return " " + (text[0].lower() + text[1:] if lower else text)
+
+  async def recover_tips(self, device: str, tips: str, mode: str | None, layout: dict[str, Any] | None,
+                         name: str | None) -> dict[str, Any]:
+    """Tips left on a real device's channels (a stop, an unknown outcome, a restart) that do not come off by hand: the
+    adapter puts them back where they came from or into the waste, over a link of its own. Never initializes, never
+    saves a layout, never clears the doubt: the person's tips check and load_layout still follow."""
+    comp = self.spec.component(device)
+    adapter = self.adapter
+    if not self.can_recover_tips():
+      raise LabError("recovery_not_supported", f"{self.spec.model} ({adapter.backend}) cannot put tips back or discard them "
+                     "after a stop: this call is for a real instrument whose tips do not come off by hand.",
+                     "The person removes the tips by hand; then verify(check='tips_mounted', expect='none') without "
+                     "device and record_verdict with its ask_person, and load_layout.")
+    if self.tips_note() is None and adapter.device is not None:
+      # A loaded device whose run knows its tips. With nothing loaded there is no drop_tips to send the agent to, and a
+      # load refuses while the sensor reports tips: then the adapter's own sensor read decides (no tip: nothing moves).
+      raise LabError("no_recovery_needed", "this run knows its tips; nothing is in doubt.", "Use drop_tips.")
+    if mode is None:
+      if adapter.options.get("tip_waste") is not True:
+        raise LabError("no_tip_waste", "this deck's config names no tip waste, so the only choice is back into the rack.",
+                       "Ask the person; then call recover_tips again with mode='return'.")
+      mode = "discard"
+    chosen = layout
+    if chosen is None and name:
+      chosen = self.ws.read_layout(name)
+    if chosen is None:
+      last = self.last_deck()
+      if last is not None and last["unknown"]:
+        raise LabError("layout_incomplete", "the last deck of this task folder leaves out what the stop made unknown "
+                       f"({', '.join(last['unknown'])}), so it cannot name the tip spots the tips came from.",
+                       "Pass a layout that has the racks where they physically are, with the tip states as they are now "
+                       "(the spots the mounted tips came from as tips_empty); it must match a deck this task folder "
+                       "already ran.")
+      chosen = last["layout"] if last is not None else None
+    if chosen is None:
+      raise LabError("layout_required", "give the layout of the deck as it stands (or the name of a saved one): the tips "
+                     "go back into spots it names.",
+                     "Pass layout= (racks where they physically are, the spots the mounted tips came from as tips_empty) "
+                     "or name= of a saved layout; find_layout_references lists them.")
+    # No deck check stands behind this move, so the deck must be one this folder knew: the rule that lets a layout skip
+    # the person's confirmation in simulation.
+    match = self.reference_match(chosen)
+    if "matches" not in match:
+      raise LabError("layout_unknown", "this layout's labware types and positions match no layout saved or run in this "
+                     f"task folder, and nothing here has confirmed the deck. {differs_text(match)}",
+                     "Recover on the deck this task folder already ran (the same labware types in the same positions, "
+                     "tip states as they are now), or the person removes the tips another way.")
+    result = await adapter.recover_tips(comp, chosen, mode, tips)
+    return {**result, "next": self._recovered_next(result, mode)}
+
+  @staticmethod
+  def _recovered_next(result: dict[str, Any], mode: str) -> str:
+    """What the agent tells the person after recover_tips, and the steps that still stand (the doubt is not cleared)."""
+    after = [i + 1 for i, sensed in enumerate(result.get("sensed_after") or []) if sensed]
+    if after:
+      return (f"The instrument still senses a tip on channel(s) {', '.join(map(str, after))} after the recovery. Tell the "
+              "person plainly, and that they must look at the instrument. Do not call recover_tips again or anything "
+              "else that moves; go on only as they say.")
+    if not result.get("moved"):
+      return (f"No tip is sensed on the channels ({result.get('note') or 'nothing was moved'}): nothing moved. The "
+              "check that the pipettes are empty is still the person's: verify(check='tips_mounted', expect='none') "
+              "without device and record_verdict, then load_layout.")
+    if result.get("sensed_after") is None:
+      return ("The move was sent, but the tip sensor could not be read afterwards, so AHC does not know whether the "
+              "channels are empty. Tell the person plainly, and that they must look at the channels and the rack. Do "
+              "not call recover_tips again or anything else that moves; go on only as they say.")
+    spots = ", ".join(map(str, result.get("spots") or []))
+    if result.get("mode", mode) == "return":
+      done = (f"The tips were put back into {spots}: those spots now hold used tips, and any liquid the tips held is "
+              "still in them.")
+      declare = f"declaring {spots} as tips_returned"
+    else:
+      done = "The tips went into the tip waste, with any liquid they held."
+      declare = f"declaring {spots} as tips_empty"
+    return (f"{done} Tell the person. Then the person's check that the pipettes are empty: verify(check='tips_mounted', "
+            "expect='none') without device and record_verdict right away with its ask_person; recover_tips does not "
+            f"clear the doubt. Then load_layout, {declare} in that layout.")
+
   def require_tips_known(self) -> None:
     """Real hardware: load_layout starts a new run on the robot, which forgets any tips on the pipettes, so its
     next pick-up would drive them into a rack. Refused while tips may be on (tips_unconfirmed)."""
@@ -1243,9 +1428,10 @@ class Lab:
       raise LabError("tips_unconfirmed",
                      f"{doubt} load_layout starts a new run on the robot, whose next pick-up would drive any tip still "
                      "on into a rack, so it waits for the person.",
-                     "Tell the person exactly that: they remove any tips by hand (or there are none). Then call "
-                     "verify(check='tips_mounted', expect='none') without device and record_verdict for it with its "
-                     "ask_person right away. load_layout goes ahead once they pass it. " + HOMING)
+                     "Tell the person exactly that: they remove any tips by hand (or there are none)." + self._recover_hint()
+                     + " Then call verify(check='tips_mounted', expect='none') without device and record_verdict for it with its "
+                     "ask_person right away. load_layout goes ahead once they pass it. "
+                     + before_load(self._load_moves(), self._load_needs()))
     if self.tips_on:
       raise LabError("tips_unconfirmed",
                      f"{_tips_count(self.tips_on)} in this run: load_layout starts a new run on the robot, which "
@@ -1278,11 +1464,12 @@ class Lab:
       return ""
     waiting = self._pending_tips_check()
     if waiting:
-      return (f"{doubt} Tips check {waiting} waits for the person's verdict: {pass_now(waiting, homes=True)} "
-              "load_layout waits for it. ")
-    return (f"{doubt} Tell the person exactly that; they remove any tips by hand (or there are none). "
+      return (f"{doubt} Tips check {waiting} waits for the person's verdict: "
+              f"{pass_now(waiting, homes=True, moves=self._load_moves(), needs=self._load_needs())} load_layout waits for it. ")
+    return (f"{doubt} Tell the person exactly that; they remove any tips by hand (or there are none)."
+            f"{self._recover_hint()} "
             "verify(check='tips_mounted', expect='none') without device gives ask_person for it; record_verdict right "
-            "away, and load_layout waits for the pass. " + HOMING + " ")
+            "away, and load_layout waits for the pass. " + before_load(self._load_moves(), self._load_needs()) + " ")
 
   def tips_warning(self, result: dict[str, Any]) -> dict[str, Any]:
     """A pending deck or tips check carries what the person is told about tips the robot no longer knows of."""
@@ -1310,7 +1497,8 @@ class Lab:
                         for d in self.config.devices],
                limits=self.config.limits, confirmed_by=(self.config.confirmation or {}).get("by"))
     if self.config.cameras:
-      out["cameras"] = [{"name": c.name, "device": c.device, **({"sees": c.sees()} if c.slot_map else {})}
+      out["cameras"] = [{"name": c.name, "device": c.device, **({"source": c.source} if c.is_robot else {}),
+                         **({"sees": c.sees()} if c.slot_map else {})}
                         for c in self.config.cameras]
     if self.config.auto_verify:
       out["auto_verify"] = self.config.auto_verify.data()
@@ -1342,23 +1530,37 @@ class Lab:
       return {"go_ahead": "given", "why": "the person approved confirm_config for this config in this session"}
     robot = self._real_robot()
     if robot is not None:
-      return {"go_ahead": "needed", "why": f"the real robot {robot} homes on load_layout"}
+      return {"go_ahead": "needed", "why": ADAPTERS[config.devices[0].model].go_ahead_why(robot)}
     if self.ran_experiment():
       return {"go_ahead": "not needed", "why": "a simulation in a folder that has run an experiment before"}
     return {"go_ahead": "needed", "why": "this folder has never run an experiment"}
 
   def _real_robot(self) -> str | None:
-    """The real device this session drives ('name' at host:port), or None when it simulates: the bound
-    adapter once the config is confirmed, else the config's entry."""
+    """The real device this session drives, as its adapter names it ('name' at host:port for a robot), or None when it
+    simulates: the bound adapter once the config is confirmed, else the config's entry."""
     entry = self.config.devices[0]
     bound = self.adapter is not None and self.config.status(self.forced_sim)[0] == "confirmed"
     real = not self.adapter.simulated if bound else entry.backend != "sim"
     if not real:
       return None
-    name = entry.options.get("robot_name")
-    where = (f" at {entry.options['host']}:{entry.options.get('port') or DEFAULT_PORT}"
-             if entry.options.get("host") else "")
-    return (repr(name) if name else f"{entry.id} ({entry.model})") + where
+    return ADAPTERS[entry.model].named(entry.id, entry.model, entry.options)
+
+  def _load_device(self, config_first: bool = False) -> Any:
+    """What the person is told about load_layout comes from the bound adapter, else from the config entry's adapter
+    class. `config_first`: the entry's, for a config that waits for the person while another device may still be bound."""
+    entry = self.config.devices[0] if self.config is not None and self.config.devices else None
+    cls = ADAPTERS.get(entry.model) if entry is not None else None
+    if self.adapter is not None and not (config_first and cls is not None):
+      return self.adapter
+    return cls or Adapter
+
+  def _load_moves(self, config_first: bool = False) -> str:
+    """What load_layout does to the real device (its adapter's LOAD_MOVES), as the person is told before it."""
+    return self._load_device(config_first).LOAD_MOVES
+
+  def _load_needs(self, config_first: bool = False) -> str:
+    """What the person's approval before load_layout also means (its adapter's LOAD_NEEDS)."""
+    return self._load_device(config_first).LOAD_NEEDS
 
   def ran_experiment(self) -> bool:
     if not self._ran:
@@ -1373,7 +1575,8 @@ class Lab:
                    f"this server session has no go-ahead from the person yet ({session['why']}), so nothing moves "
                    "before they give it; every new session asks once (a restarted server, a resumed or reconnected "
                    "session is a new one).",
-                   confirm_now("<config.confirm_summary>", homes=self._real_robot() is not None))
+                   confirm_now("<config.confirm_summary>", homes=self._real_robot() is not None,
+                               moves=self._load_moves(), needs=self._load_needs()))
 
   def _go_ahead_step(self) -> str:
     """The go-ahead, first in next while a confirmed config waits for it (confirming a pending config gives it too)."""
@@ -1383,7 +1586,8 @@ class Lab:
     if session["go_ahead"] != "needed":
       return ""
     return (f"This session needs the person's go-ahead before anything moves ({session['why']}): "
-            + confirm_now(homes=self._real_robot() is not None) + " ")
+            + confirm_now(homes=self._real_robot() is not None, moves=self._load_moves(),
+                          needs=self._load_needs()) + " ")
 
   def model(self) -> str | None:
     return self._device_and_backend()[0]
@@ -1416,11 +1620,12 @@ class Lab:
     # A robot-side outcome nobody knows (a device error after the command may have reached the robot, or the
     # emergency stop cutting a call short) comes first: the person checks before anything else.
     unknown = getattr(self.adapter, "outcome_unknown", None) or self.interrupted
-    outcome = (f"The outcome of {unknown.get('op')} on the robot is unknown: stop and tell the person; they check "
-               "tips and wells; then load_layout again with the volumes they report." if unknown else "")
+    outcome = f"{self._unknown_head(unknown)}; then load_layout again{self._volumes(unknown)}." if unknown else ""
     halted = getattr(self.adapter, "halted", False)
     halting = halted or getattr(self.adapter, "halt_requested", False)
-    stop = "The emergency stop stopped the robot's run" if halted else STOP_UNCONFIRMED
+    # The device's own words for its stop, when it is real; a simulated device is told in the robot's.
+    words = self.adapter if self.adapter is not None and not self.adapter.simulated else Adapter
+    stop = words.STOPPED if halted else words.STOP_UNCONFIRMED
     if self.estop is not None:
       return "The emergency stop is engaged: stop, tell the person and wait. Only the person releases it." + (
         " " + outcome if outcome else "")
@@ -1437,6 +1642,21 @@ class Lab:
     held = self.verification.holding(skip=self._pending_tips_check() if tips else None) if self.verification else ""
     return (go + tips + held + self._next_by_state(held=bool(held)) + self._tips_later()).rstrip()
 
+  @staticmethod
+  def _unknown_head(unknown: dict[str, Any]) -> str:
+    """An outcome nobody knows, as the agent is told it, and what the person checks. A record with "says" is not about
+    one call (a lost link, a stop on the device's host, a failed initialization): the adapter's own sentence, and the
+    person checks the instrument as well as its tips."""
+    if unknown.get("says"):
+      return (f"{_upper(unknown['says'])}: stop and tell the person; they check the instrument and the tips on its "
+              "channels")
+    return f"The outcome of {unknown.get('op')} on the robot is unknown: stop and tell the person; they check tips and wells"
+
+  @staticmethod
+  def _volumes(unknown: dict[str, Any] | None) -> str:
+    """The person's report of volumes comes with a call whose wells are in doubt, not with a link or a stop."""
+    return " with the volumes they report" if unknown and not unknown.get("says") else ""
+
   def _tips_later(self) -> str:
     """No device bound yet (the config waits, or none): a robot's tips note, as what comes once one is."""
     doubt = self.tips_note() if self.adapter is None else None
@@ -1446,11 +1666,10 @@ class Lab:
   def _after_doubt(self, unknown: dict[str, Any] | None, stop: str | None) -> str:
     """Real hardware after a stop or an unknown outcome: what the person checks, then a new run (load_layout,
     which waits for their pass that the pipettes are empty)."""
-    first = (f"The outcome of {unknown.get('op')} on the robot is unknown: stop and tell the person; they check tips "
-             "and wells." if unknown else "")
+    first = f"{self._unknown_head(unknown)}." if unknown else ""
     if stop:
       first = f"{first} {stop}.".strip()
-    volumes = " with the volumes they report" if unknown else ""
+    volumes = self._volumes(unknown)
     waiting = self._pending_tips_check()
     # The person's other checks that hold motion (of one pipette, of liquid) still do.
     held = self.verification.holding(skip=waiting) if self.verification else ""
@@ -1458,13 +1677,15 @@ class Lab:
       return (f"{first} {held}The person confirmed the pipettes are empty: load_layout again{volumes}; the deck is "
               "checked before anything moves.")
     if waiting:
-      return (f"{first} {held}Tips check {waiting} waits for the person's verdict: {pass_now(waiting, homes=True)} "
-              f"Then load_layout again{volumes}.")
+      return (f"{first} {held}Tips check {waiting} waits for the person's verdict: "
+              f"{pass_now(waiting, homes=True, moves=self._load_moves(), needs=self._load_needs())} Then load_layout again{volumes}.")
     count = f" ({_tips_count(self.tips_on)})" if self.tips_on else ""
-    return (f"{first} {held}The person removes any tips left on the pipettes{count} by hand: verify(check='tips_mounted', "
+    hint = self._recover_hint()
+    return (f"{first} {held}The person removes any tips left on the pipettes{count} by hand"
+            + (f".{hint} Once they are off:" if hint else ":") + " verify(check='tips_mounted', "
             "expect='none') without device gives ask_person for it (it replaces a waiting check of one pipette); "
             f"record_verdict right away, and load_layout waits for the pass; then load_layout again{volumes}; the deck "
-            "is checked before anything moves. " + HOMING)
+            "is checked before anything moves. " + before_load(self._load_moves(), self._load_needs()))
 
   def _next_by_state(self, held: bool = False) -> str:
     """What comes next by the config, the deck check and the plan; `held`: a person's check holds motion, so
@@ -1478,10 +1699,11 @@ class Lab:
       return plan + "load_layout starts the simulation (configure_devices picks another model before that)."
     if status == "pending" and self.config is not None and self.config.devices:
       real = any(d.backend != "sim" for d in self.config.devices)
+      says = ADAPTERS[next(d for d in self.config.devices if d.backend != "sim").model].IDENTITY_SAYS if real else ""
       return ("The config waits for the person's approval"
-              + (": tell them the robot's identity from configure_devices (name, serial, software, the pipette on each "
-                 "mount) in the same message" if real else "")
-              + ". " + confirm_now(homes=real))
+              + (f": tell them the robot's identity from configure_devices ({says}) in the same message" if real else "")
+              + ". " + confirm_now(homes=real, moves=self._load_moves(config_first=True),
+                                   needs=self._load_needs(config_first=True)))
     if status in ("none", "pending"):
       return ("Ask the person whether to simulate or use a real robot, and which of available_models; write their "
               "choice with configure_devices; then " + confirm_now())
@@ -1497,7 +1719,7 @@ class Lab:
                       "gives ask_person for it; record_verdict right away.")
       return sim + f"The deck check is {self.gate.state}: verify(check='deck_matches_layout') before anything moves."
     if self.gate is None:
-      return sim + "find_layout_references; " + plan.lower() + "load_layout, then verify(check='deck_matches_layout')."
+      return sim + self.calibration.next_text() + "find_layout_references; " + plan.lower() + "load_layout, then verify(check='deck_matches_layout')."
     if not self.plan.steps:
       return sim + "Report your plan with report_decision(plan=[...]) before any action."
     return sim + ("" if held else "Liquid handling is open; describe_device(component) for limits.")
@@ -1581,6 +1803,71 @@ class Lab:
   def loaded_layout(self) -> Any:
     return getattr(self.adapter, "layout", None)
 
+  def _view_record(self, url: str | None = None, error: str | None = None) -> None:
+    """Tell the dashboards where the 3D view is (.ahc/state/view.json), or why there is none."""
+    viewlink.write(self.ws, url, error, bool(self.adapter is not None and not self.adapter.simulated))
+
+  async def show_deck(self, root: Any) -> str | None:
+    """Put a deck in the live view (starting the viewer on the first one) and tell the dashboards. A viewer that
+    cannot start never fails the call that asked: the reason goes to the dashboard's 3D tab. Returns the viewer link."""
+    if self.view is None:
+      return None
+    try:
+      self.view.title = f"AHC · {self.spec.title}"
+      async with self._view_lock:  # open_dashboard runs beside the other tools: one change of the view at a time
+        url = await self.view.show(root)
+    except Exception as exc:  # noqa: BLE001 - a missing dependency, a port error: the dashboard works without it
+      self._view_record(error=f"the 3D view could not start ({type(exc).__name__}: {exc})")
+      return None
+    self._view_record(url=url)
+    return url
+
+  async def ensure_view(self) -> None:
+    """The dashboard is open: make the live view ready (no --view needed, and no browser tab of its own: the page
+    embeds it, on ports the system gives). A deck already reported or loaded is shown at once; with none there is
+    nothing to show, and the viewer starts with the first one."""
+    if self.view is None:
+      try:
+        from ahc.viz.viewer import LiveView, free_port  # optional: pulls in the 3D viewer's web servers
+
+        self.view = LiveView("AHC", open_browser=False, port=free_port(), ws_port=free_port())
+      except Exception as exc:  # noqa: BLE001
+        self._view_record(error=f"the 3D view is not available ({type(exc).__name__}: {exc})")
+        return
+    if self.view.viewer is None and self.adapter is not None:
+      root = self.adapter.view_root()
+      if root is None and self.planned is not None:
+        root = self.adapter.preview_root(self.planned.deck)
+      if root is not None:
+        await self.show_deck(root)
+
+  async def build_preview(self, given: dict[str, Any] | str) -> tuple[dict[str, Any], str | None, Layout, Any]:
+    """The deck a layout describes (a layout dict, or the name of a saved one), built on a scratch deck: nothing
+    touches the device, so it works before load_layout, in simulation or on a real robot, also while the emergency
+    stop is engaged. Returns (layout, saved name, Layout, scratch deck); a layout the brand cannot build is refused
+    with the build's own error, and nothing is recorded."""
+    if self.adapter is None:
+      self.require_device()
+    name = given if isinstance(given, str) else None
+    layout = self.ws.read_layout(given) if isinstance(given, str) else given
+    built, deck = await self.adapter.preview_layout(layout)
+    return layout, name, built, deck
+
+  def clear_preview(self) -> None:
+    """The previewed deck is spent (a load succeeded) or belongs to another device: a later load_layout with no
+    layout is refused until the deck is reported again."""
+    self.planned_layout = self.planned_name = self.planned = self.preview = None
+
+  def keep_preview(self, layout: dict[str, Any], name: str | None, built: Layout) -> dict[str, Any]:
+    """Make the previewed deck the plan's: recorded in the run log (the dashboard reads it there), and what
+    load_layout loads when it is given no layout."""
+    entry = {"type": "deck", "event": "planned", "name": name, "layout": layout, "map": deck_map(built),
+             "text": built.describe()}
+    self.record(entry)
+    self.planned_layout, self.planned_name, self.planned = copy.deepcopy(layout), name, built
+    self.preview = {"name": name, "text": entry["text"], "map": entry["map"]}
+    return entry
+
   def reference_path(self, camera: CameraEntry) -> Path:
     return self.ws.dir / camera.slot_map["reference"]
 
@@ -1593,9 +1880,33 @@ class Lab:
                 "slots": []}
       layout = self.loaded_layout()
       labware = {k: v["type"] for k, v in vpoints.layout_slots(layout).items()} if layout is not None else None
-      return vision.analyze(path, slot_map, reference, labware)
+      return vision.analyze(path, slot_map, reference, labware, plates=self.calibration.calibrated_plates(camera.name))
     except Exception as exc:  # noqa: BLE001 - a picture that cannot be analysed is still a picture
       return {"status": "unclear", "why": f"the image could not be analysed ({type(exc).__name__}: {exc})", "slots": []}
+
+  async def snapshot(self, camera: CameraEntry, dest: Path, requested: float) -> cams.CameraFailure | None:
+    """One picture from a camera into `dest`; None when it worked, else the failure. Never raises one: a camera that
+    does not work is a capture failure, not a device error, and says nothing about what the robot did. A Mac camera
+    that has a live view gives its next frame newer than the request and than the last motion; the robot's camera is
+    asked of the robot's server, never while a motion call runs, one request at a time."""
+    if camera.is_robot:
+      try:
+        data = await asyncio.to_thread(self.live.picture, camera)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(data)
+      except cams.CameraFailure as failure:
+        dest.unlink(missing_ok=True)
+        return failure
+      except Exception as exc:  # noqa: BLE001
+        dest.unlink(missing_ok=True)
+        return cams.CameraFailure("capture_failed", f"{type(exc).__name__}: {exc}")
+      return None
+    why = await asyncio.to_thread(self.live.grab_mac, camera, dest, lambda: max(requested, self.last_motion))
+    return None if why is None else cams.CameraFailure("capture_failed", why)
+
+  def wants_robot_camera(self, names: list[str] | None) -> bool:
+    """Does a capture of these cameras (all when None) include one on the robot?"""
+    return any(c.is_robot and (names is None or c.name in names) for c in (self.config.cameras if self.config else []))
 
   async def take_pictures(self, label: str, plan_step: int | None, cameras: list[str] | None, final: bool,
                           blobs: list[tuple[str, str, bytes]]) -> dict[str, Any]:
@@ -1624,7 +1935,8 @@ class Lab:
       raise LabError("bad_label", "label is empty.", "Say in a few words what you want to see.")
     if plan_step is not None:
       self.plan.check(plan_step)
-    cams.require_ffmpeg()
+    if any(not declared[n].is_robot for n in names):
+      cams.require_ffmpeg()  # the robot's camera needs none
     step = plan_step if plan_step is not None else self.plan.current
     run = self.open_runlog({})
     folder = self.ws.runs_dir / run.run_id / cams.step_folder(self.plan.steps, step, final)
@@ -1633,19 +1945,20 @@ class Lab:
       camera = declared[name]
       started = time.time()
       path = cams.unique_path(folder, name, started)
-      why = await asyncio.to_thread(cams.capture_frame, camera.device, path)
-      if why is not None:
-        failures.append({"camera": name, "device": camera.device, "error": why})
+      failure = await self.snapshot(camera, path, started)
+      if failure is not None:
+        failures.append({"camera": name, "device": camera.device, "error": failure.why,
+                         **({"code": failure.code, "hint": failure.hint} if camera.is_robot else {})})
         continue
       image = {"camera": name, "device": camera.device, "path": str(path)}
-      try:
-        blobs.append((name, camera.device, await asyncio.to_thread(cams.downscaled, path)))
+      try:  # the robot's picture is 640 px wide: shown as it is; a Mac camera's is scaled to MAX_WIDTH
+        blobs.append((name, camera.device, path.read_bytes() if camera.is_robot else await asyncio.to_thread(cams.downscaled, path)))
       except OSError as exc:  # the file is on disk, only the preview failed
         image["preview_error"] = str(exc)
       row = {"time": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(started)), "run_id": run.run_id,
              "camera": name, "device": camera.device, "file": path.name, "label": label.strip(),
              "plan_step": plan_step, "final": final}
-      if camera.slot_map:
+      if camera.slot_map and not self.calibration.skipped(name):  # a skipped camera takes photos, and covers nothing
         analysis = await asyncio.to_thread(self.analyze_capture, camera, path)
         self.vision_seen[name] = {"t": started, "path": str(path), "analysis": analysis}
         image.update(map=analysis["status"], **{k: analysis[k] for k in ("image_size", "frame_sharpness", "alignment") if k in analysis})
@@ -1660,19 +1973,27 @@ class Lab:
       self.write_auto_state()
     result: dict[str, Any] = {"run_id": run.run_id, "folder": str(folder), "label": label.strip(), "plan_step": plan_step,
                               "final": final, "images": images, "failures": failures}
+    if self.calibration.stale:
+      result["calibration_changed"] = self.calibration.stale
     if self.estop is not None:
       result["note"] = "The emergency stop is engaged: this capture is evidence only, nothing moves."
     if not images:
+      coded = {f["code"] for f in failures if f.get("code")}
+      if len(coded) == 1 and all(f.get("code") for f in failures):  # only the robot's camera, one kind of failure: its own code and hint
+        raise LabError(coded.pop(), "no camera gave an image: " + "; ".join(f"{f['camera']}: {f['error']}" for f in failures),
+                       failures[0]["hint"] or "Tell the person. Do not retry in a loop.")
       raise LabError("capture_failed", "no camera gave an image: " + "; ".join(f"{f['camera']}: {f['error']}" for f in failures),
                      "Tell the person: check that the cameras are plugged in and not used by another app, and that this "
-                     "terminal may use the camera (macOS asks once). Do not retry in a loop.")
+                     "terminal may use the camera (macOS asks once)"
+                     + ("; for the robot's camera, " + "; ".join(sorted({f['hint'] for f in failures if f.get('hint')})) if any(f.get("hint") for f in failures) else "")
+                     + ". Do not retry in a loop.")
     return result
 
   def vision_cameras(self) -> dict[str, dict[str, Any]]:
     """Each mapped camera with its latest analysis; one from before the last motion shows an older deck: not used."""
     out = {}
     for c in (self.config.cameras if self.config else []):
-      if c.slot_map:
+      if c.slot_map and not self.calibration.skipped(c.name):  # skipped by the person this session: no coverage
         seen = self.vision_seen.get(c.name)
         fresh = seen is not None and seen["t"] > self.last_motion
         out[c.name] = {"map": c.slot_map, "analysis": seen["analysis"] if fresh else None, "captured": seen is not None,
@@ -1682,7 +2003,7 @@ class Lab:
   def context_sources(self) -> list[Any]:
     """The physical-world context sources now (ahc.physical_world). A balance, a plate reader or room sensors join here.
     The digital twin is not one: it is what observations are compared with."""
-    sources: list[Any] = [VisionContext(self.vision_cameras())]
+    sources: list[Any] = [VisionContext(self.vision_cameras(), self.calibration.plate_status())]
     if self.adapter is not None and self.spec is not None:
       sources.append(InstrumentContext(self.spec.prefix, self.adapter.sensor_report()))
     return sources
@@ -1692,7 +2013,13 @@ class Lab:
     physical_world_confidence, suggestions}."""
     layout, sources = self.loaded_layout(), self.context_sources()
     result = pw.evaluate(points, lambda what: vpoints.resolve(what, layout), sources)
-    return {**{f"{s.kind}_context": s.describe() for s in sources}, **result}
+    out = {**{f"{s.kind}_context": s.describe() for s in sources}, **result}
+    plates = self.calibration.plates_public()
+    if plates:
+      out["plate_calibration"] = {n: {"state": p["state"], "camera": p["camera"], "slot": p["slot"],
+                                      **({"waiting_for": "person", "why": p["why"]} if p["state"] == "requested" else {})}
+                                  for n, p in plates.items()}
+    return out
 
   def vision_points_now(self) -> list[dict[str, str]]:
     """The run's verification points: needs a plan and a loaded layout."""
@@ -1710,7 +2037,9 @@ class Lab:
 
   def physical_world_overview(self) -> dict[str, Any]:
     """lab_overview's part: each source in a line, what the last check concluded per check type, the record."""
-    sources: dict[str, str] = {f"vision:{c.name}": c.sees() or "no slot map yet (map_camera)" for c in self.config.cameras}
+    sources: dict[str, str] = {
+      f"vision:{c.name}": (c.sees() or "no slot map yet (map_camera)") if not self.calibration.skipped(c.name) or not c.slot_map
+      else "skipped by the person this session: it takes photos, and covers nothing" for c in self.config.cameras}
     if self.adapter is not None and self.spec is not None:
       sources[f"instrument:{self.spec.prefix}"] = self.adapter.sensor_report()["note"]
     result = self.vision_result
@@ -1721,7 +2050,8 @@ class Lab:
           sources[name] += f"; covers {seen['covers']} of {seen['observes']} points it observes"
     if any(c.slot_map for c in self.config.cameras):
       out["summary"] = (pw.summary_line(result["result"], result["at"][11:19]) if result else
-                        "not checked yet: physical_world_context captures and checks the verification points")
+                        ("calibration changed: " if self.calibration.stale else "")
+                        + "not checked yet: physical_world_context captures and checks the verification points")
       if result:
         out["confidence"] = {k: v["status"] for k, v in result["result"]["physical_world_confidence"]["by_check"].items()}
       streaks = {k: v["agree_streak"] for k, v in self.vision_record().items()}
@@ -1743,6 +2073,8 @@ class Lab:
   def auto_confidence(self, rows: list[dict[str, Any]]) -> str | None:
     """Run level: why auto is off for every check (a point of a listed check type is uncovered or unclear), else None.
     Points of check types the config does not list are not in `rows`, so they never block it."""
+    if self.calibration.stale:  # the person calibrated since the last check: nothing counts until physical_world_context runs again
+      return self.calibration.stale
     why = pw.reasons(rows)
     return None if why is None else "low vision confidence: " + why
 
@@ -1994,7 +2326,7 @@ class Lab:
                        "have finished the command in flight, the digital twin may not show it, and the tips may be "
                        "left down in a well. Nothing runs until the person releases it.",
                        "Stop now and tell the person. Do not retry, work around it or release it yourself. The person "
-                       "checks the tips and wells before anything else.")
+                       "checks the tips and wells before anything else." + self._recover_hint())
     else:
       after = self.lh._twin_volumes() if self.lh else {}
       moved = {k: round(after[k] - v, 3) for k, v in before.items() if k in after and abs(after[k] - v) > 1e-6}
@@ -2087,14 +2419,15 @@ class Lab:
     stop["how"] = (f"The emergency stop for this server: {stop_way}. Tell the person; a stop pressed for another folder "
                    "does not reach it.")
     if self.adapter is not None and not self.adapter.simulated:  # what the stop can and cannot do on a real robot
-      stop["how"] += (" On a real OT-2 it ends AHC's run, but the robot first finishes the command it is executing (a "
-                      "move, an aspirate, a pick-up); the power switch is the immediate stop.")
+      stop["how"] += " " + self.adapter.STOP_NOTE  # what the stop can and cannot do, in this device's words
     out: dict[str, Any] = {"workspace": root, "forced_simulation": self.forced_sim, "config": self.config_status(),
                            "session": self.session(), "emergency_stop": stop,
                            "dashboard": ({"url": self.dashboard["url"]} if self.dashboard else
                                          {"url": None, "hint": "Call open_dashboard so the person can watch and stop the run."})}
     if self.config is not None and self.config.cameras:
       out["physical_world_context"] = self.physical_world_overview()
+      if (calibration := self.calibration.overview()) is not None:
+        out["calibration"] = calibration
     if self.config is not None and self.config.auto_verify:
       out["auto_verify"] = self.auto_line()
     project = os.environ.get("CLAUDE_PROJECT_DIR")
@@ -2179,22 +2512,28 @@ class Lab:
         spots = layout.resolve_tips(list(call["tips"]))  # named tips: these spots are unknown, not the whole rack
       except LabError:
         pass
+    forgets = adapter.FORGETS_TIPS
     if failed:
       kind = str(failed.get("error") or "a device error").split(":")[0]
       cause = f"The outcome of {op} on the robot is unknown ({kind} after it was sent)"
     elif cut:
       cause = f"The emergency stop interrupted {op} on the robot, which may have finished it"
     elif halted:
-      cause = "The emergency stop stopped the robot's run, and the robot forgets which tips are on when it stops"
+      cause = adapter.STOPPED + (", and the robot forgets which tips are on when it stops" if forgets else "")
     else:
-      cause = "Once its run stops, the robot forgets which tips are on"
+      cause = ("Once its run stops, the robot forgets which tips are on" if forgets
+               else "The command in flight may still change what the channels hold")
     what = (["the tips on the pipettes"] + ([f"the liquid in {layout.where(wells)}"] if wells else [])
             + (["the tips left in the racks"] if racks else []))
     listed = what[0] if len(what) == 1 else ", ".join(what[:-1]) + " and " + what[-1]
-    why = (f"{cause}, so {listed} are not known here: the person checks them on the robot (and removes any tips "
-           "from the pipettes), then load_layout again" + (" with the volumes they report." if wells else "."))
+    if failed and failed.get("says"):  # not about one call: the adapter's sentence, and the instrument is checked too
+      why = (f"{_upper(failed['says'])}. {_upper(listed)} are not known here: the person checks the instrument and "
+             "them (and removes any tips from the pipettes), then load_layout again.")
+    else:
+      why = (f"{cause}, so {listed} are not known here: the person checks them on the robot (and removes any tips "
+             "from the pipettes), then load_layout again" + (" with the volumes they report." if wells else "."))
     if unconfirmed:  # the robot may still be moving: that comes first
-      why = f"{STOP_UNCONFIRMED}. {why}"
+      why = f"{adapter.STOP_UNCONFIRMED}. {why}"
     return {"why": why, "wells": wells, "racks": racks, "spots": spots}
 
   def state(self, device: str | None) -> dict[str, Any]:
@@ -2313,6 +2652,7 @@ def create_server(workspace=None, backend: str | None = None, device: str | None
                description="Open the run dashboard for this task folder, served by this server (it ends with the server), and give the person its URL: "
                            "they watch the run there and its red button is the emergency stop. Call it at the start of a task. Asked again, it returns the same one. "
                            "view_only=true opens a second page for an audience, with no stop or release button (the person keeps the control page). "
+                           "It also readies the live 3D view of the deck, embedded in the page's Deck setup card (3D tab; simulated or real, the digital twin, not a camera): it starts on a free port with the first deck you report, and opens no browser tab of its own. "
                            "Moves nothing; it also works while the emergency stop is engaged.")
   async def open_dashboard(open_browser: Annotated[bool, Field(description="Open the page in the person's browser too")] = True,
                            view_only: Annotated[bool, Field(description="A page without stop or release controls, for an audience")] = False) -> dict[str, Any]:
@@ -2335,7 +2675,12 @@ def create_server(workspace=None, backend: str | None = None, device: str | None
         check_entry(e)
       identities = {}
       for i, e in enumerate(entries):  # a real device: who answers there, before the person is asked
-        entries[i], identity = await probe_entry(e)
+        held = lab.link_identity(e)  # a device that takes one connection and this server holds it: ask that link
+        if held is not None:
+          ADAPTERS[e.model].check_identity(held, e.options)
+          entries[i], identity = pin_identity(e, held), held
+        else:
+          entries[i], identity = await probe_entry(e)
         if identity:
           identities[e.id] = identity
       for e in entries:  # limits that would loosen the description file's, or name a component this device lacks
@@ -2345,8 +2690,9 @@ def create_server(workspace=None, backend: str | None = None, device: str | None
                        "Leave slot_map out: a camera whose name and device stay keeps its map; map_camera writes or changes one.")
       chosen = parse_cameras(cameras) if cameras is not None else None
       authorised = parse_auto_verify(auto_verify)  # refuses a check a camera may not answer: config_invalid
-      if chosen:  # each camera must exist on this computer now
-        await asyncio.to_thread(cams.require_devices, [c.device for c in chosen])
+      check_robot_cameras(entries, chosen or [])  # a robot camera is a configured OT-2's own, on real hardware (the kept ones too, below)
+      if chosen and any(not c.is_robot for c in chosen):  # each Mac camera must exist on this computer now
+        await asyncio.to_thread(cams.require_devices, [c.device for c in chosen if not c.is_robot])
       text = lab.ws.read_config_text()
       previous, unreadable = None, False
       if text:
@@ -2356,12 +2702,13 @@ def create_server(workspace=None, backend: str | None = None, device: str | None
           unreadable = True  # its limits are unknown: whatever replaces it waits for the person
       dropped: list[str] = []
       if chosen and previous:  # a camera that keeps its name and device keeps its slot map
-        maps = {(c.name, c.device): c.slot_map for c in previous.cameras if c.slot_map}
-        chosen = [replace(c, slot_map=maps.get((c.name, c.device))) for c in chosen]
-        dropped = [c.name for c in previous.cameras if c.slot_map and not any((c.name, c.device) == (n.name, n.device) for n in chosen)]
+        maps = {(c.name, c.device, c.source): c.slot_map for c in previous.cameras if c.slot_map}
+        chosen = [replace(c, slot_map=maps.get((c.name, c.device, c.source))) for c in chosen]
+        dropped = [c.name for c in previous.cameras if c.slot_map and not any((c.name, c.device, c.source) == (n.name, n.device, n.source) for n in chosen)]
       elif chosen is not None and previous:
         dropped = [c.name for c in previous.cameras if c.slot_map]
       kept = chosen if chosen is not None else (previous.cameras if previous else [])  # omitted: the cameras stay
+      check_robot_cameras(entries, kept)
       config = Config(devices=entries, limits=limits or {}, sim=previous.sim if previous else {}, cameras=kept,
                       auto_verify=authorised if auto_verify is not None else (previous.auto_verify if previous else None))
       if previous is not None and previous.confirmation and previous.confirmation.get("digest") == config.digest():
@@ -2406,11 +2753,18 @@ def create_server(workspace=None, backend: str | None = None, device: str | None
       for e in lab.config.devices:  # never confirm limits that would loosen the description file's
         apply_limits(replace(device_spec(e.model, e.options), id=e.id), lab.config.limits)
         check_entry(e)
-        if e.backend == "robot" and not e.options.get("robot_name"):
-          raise LabError("robot_name_required",
-                         f"the {e.id} entry names no robot_name, so another robot answering at that address would be "
-                         "driven without anyone noticing.",
-                         "Write the entry again with configure_devices: it reads the name from the robot. Then the person confirms it.")
+        cls = ADAPTERS[e.model]
+        if e.backend != "sim" and not cls.pinned(e.options):  # every real entry names the one device it means
+          if cls.IDENTITY_OPTION == "robot_name":
+            raise LabError("robot_name_required",
+                           f"the {e.id} entry names no robot_name, so another robot answering at that address would be "
+                           "driven without anyone noticing.",
+                           "Write the entry again with configure_devices: it reads the name from the robot. Then the person confirms it.")
+          raise LabError(f"{cls.IDENTITY_OPTION}_required",
+                         f"the {e.id} entry names no {cls.IDENTITY_OPTION}, so another device reached the same way would "
+                         "be driven without anyone noticing.",
+                         "Write the entry again with configure_devices: it reads it from the device. Then the person "
+                         "confirms it.")
       current = confirm_summary(lab.config)
       if summary != current:
         raise LabError("summary_mismatch",
@@ -2511,20 +2865,26 @@ def create_server(workspace=None, backend: str | None = None, device: str | None
 
   @server.tool(annotations=MOTION,
                description="Load a deck layout (labware, positions, starting liquids, aliases) and save it in .ahc/layouts/, or load a saved one by name. "
+                           "With neither layout nor name it loads the layout you reported with report_decision(layout=...), which the person has set the deck up from, once (layout_required if you reported none or it was already loaded: a reload needs the deck reported again); a layout that differs from it is loaded and the result lists differs_from_preview. "
                            "See lab_overview for the format and find_layout_references for this workspace's earlier layouts. Resets the simulated device; "
                            "on a real robot it starts a new run and homes the robot, so hands and deck must be clear: say so in chat, in the same message before the dialog right ahead of it (the tips_mounted note or confirm_config), or ask in chat. "
-                           "On real hardware, and in simulation when its labware types and positions match no layout saved or run in this task folder, a layout is saved only once the person confirms it.")
+                           "A real STARlet is initialized by the first load of a session and by the first load after a stop, an error or a disconnect (every arm moves); a later load on the same link moves nothing. "
+                           "On real hardware, and in simulation when its labware types and positions match no layout saved or run in this task folder, a layout is saved only once the person confirms it. With cameras configured on a real robot it is refused (calibration_required) until the person has calibrated, confirmed as still right, or skipped each camera on the calibration page (lab_overview.calibration); a load clears the plate calibrations of the earlier layout.")
   async def load_layout(plan_step: PlanStep,
-                        layout: Annotated[dict[str, Any] | None, Field(description="Device-specific layout; see lab_overview.layout_format.example")] = None,
+                        layout: Annotated[dict[str, Any] | None, Field(description="Device-specific layout; see lab_overview.layout_format.example. Omit it (and name) to load the layout reported with report_decision(layout=...), once")] = None,
                         name: Annotated[str | None, Field(description="With layout: save it under this name (default layout-N). Without layout: load that saved layout.")] = None) -> dict[str, Any]:
-    async def load(chosen):
+    async def load(chosen, layout, name, from_plan):  # layout, name: as given, or the plan's (then no layout is passed)
       if chosen is None:
-        raise LabError("layout_required", "give a layout, or the name of a saved one.",
-                       "find_layout_references lists the saved layouts.")
+        raise LabError("layout_required", "give a layout, or the name of a saved one, or report the deck first.",
+                       "Report the deck again with report_decision(layout=...): the person sets it up from the Deck "
+                       "setup card, and the next load_layout with no layout loads it, once. To continue from the last "
+                       "run's deck, report find_layout_references' last_deck.layout. find_layout_references also lists "
+                       "the saved layouts.")
       if layout is not None and name is not None and lab.ws.layout_path(name).is_file() \
           and lab.ws.read_layout(name) != layout:
         raise LabError("layout_exists", f"a different layout is already saved as {name!r}.",
                        "Pick another name; saved layouts are never overwritten.")
+      lab.calibration.require_done()  # cameras configured: the person calibrated, confirmed or skipped each, this session
       lab.claim_robot()  # real hardware: one server per robot; refused (robot_in_use) while another holds it
       lab.require_tips_known()  # real hardware: a new run forgets the tips on the pipettes
       # A deck no layout saved or run in this folder matches (the built-in example, the agent's own, one written
@@ -2551,10 +2911,18 @@ def create_server(workspace=None, backend: str | None = None, device: str | None
       lab.gate = Gate(layout=saved_as, needs_person=needs_person, pending_layout=layout if hold else None,
                       layout_ref=built, differs=differs_text(match) if layout is not None else None, found=found or None)
       lab.gate_changed("layout loaded")
+      lab.calibration.on_load()  # the plates calibrated for the earlier layout are not this one's
       if not lab.adapter.simulated:
         lab.last_motion = time.time()  # the robot homed: captures from before show the head elsewhere
         lab.write_auto_state()
       built.record_placements()
+      differs = built.differences_from(lab.planned) if lab.planned is not None and not from_plan else []
+      lab.clear_preview()  # used once: the device holds a deck now, and the plan's original is no longer the real one
+      try:  # the loaded deck for the dashboard's Deck setup card; drawing it must never stop the load
+        lab.record({"type": "deck", "event": "loaded", "name": saved_as, "map": deck_map(built),
+                    "text": built.describe(), "differs": differs or None})
+      except Exception:  # noqa: BLE001
+        pass
       try:
         identity = await asyncio.to_thread(lab.adapter.identity)
       except Exception as exc:  # noqa: BLE001 - who the device is must never stop the load
@@ -2565,6 +2933,8 @@ def create_server(workspace=None, backend: str | None = None, device: str | None
       if layout is not None and not hold:
         lab.ws.save_layout(saved_as, layout, lab.spec.model)
       out = {**built.summary(), "saved_as": saved_as, "path": str(lab.ws.layout_path(saved_as)), "gate": lab.gate.public()}
+      if differs:
+        out["differs_from_preview"] = differs
       if "matches" in match:
         out["matches_reference"] = match["matches"]
       elif "closest" in match:
@@ -2583,18 +2953,25 @@ def create_server(workspace=None, backend: str | None = None, device: str | None
       return out
 
     async def body():
-      chosen = layout if layout is not None else (lab.ws.read_layout(name) if name else None)
+      from_plan = layout is None and name is None and lab.planned_layout is not None
+      given, named = layout, name
+      if from_plan:  # the deck the person set up from: as if passed as layout (a saved layout, as if loaded by name)
+        chosen = copy.deepcopy(lab.planned_layout)
+        given, named = (None, lab.planned_name) if lab.planned_name else (chosen, None)
+      else:
+        chosen = layout if layout is not None else (lab.ws.read_layout(name) if name else None)
       fresh = lab._robot_lock is None
       try:
-        result = await lab.logged("load_layout", {"layout": chosen, "name": name}, lambda: load(chosen))
+        result = await lab.logged("load_layout", {"layout": chosen, "name": named}, lambda: load(chosen, given, named, from_plan))
       except Exception:
         if fresh and lab.live_run() is None:  # no run was started: the robot is not held for it
           lab.release_robot()
         raise
       root = lab.adapter.view_root()
       if lab.view is not None and root is not None:
-        lab.view.title = f"AHC · {lab.spec.title}"
-        result = {**result, "live_view_url": await lab.view.show(root)}
+        url = await lab.show_deck(root)
+        if url and lab.view.open_browser:  # --view: the person's own tab; otherwise the dashboard embeds it
+          result = {**result, "live_view_url": url}
       return result
     return await lab.act(body, "load_layout", {"layout": layout, "name": name}, plan_step, gated=False)
 
@@ -2633,6 +3010,25 @@ def create_server(workspace=None, backend: str | None = None, device: str | None
   async def drop_tips(device: Device, plan_step: PlanStep, mode: Literal["discard", "return"] = "discard") -> dict[str, Any]:
     return await lab.act(lambda: lab.lh.drop_tips(device, mode), "drop_tips", {"device": device, "mode": mode}, plan_step)
 
+  @server.tool(annotations=MOTION,
+               description="Tips left on the channels of a real instrument after an emergency stop, an unknown outcome or a restart, on a device where they cannot be pulled off by hand (a STARlet's CO-RE tips): put them back into the rack spots they came from, or into the tip waste. "
+                           "Never initializes anything and never saves a layout. It works only while the instrument still reports itself initialized (not after a power cycle), and only when tips may be on (otherwise no_recovery_needed: use drop_tips). "
+                           "Ask the person first, in chat: back into the rack they came from, or into the tip waste (the default, mode omitted, when the config names one: tip_waste). "
+                           "The person's approval of this call is their go-ahead for the move, so state in chat right before it exactly what will move: the channels and the 96 head go up, then the tips go down into the named spots (return) or to the waste (discard); hands and deck must be clear. "
+                           "tips names the spots the mounted tips were picked from, e.g. 'tips:col3': read them from the interrupted call in get_run. "
+                           "layout is the deck as it physically stands now: the racks where they are, the spots the mounted tips came from listed as tips_empty (and tips_returned for spots that hold a used tip); "
+                           "omitted, the saved layout name, else the task folder's last deck (after a stop that one leaves the tip racks out: pass the layout). It must match a deck this task folder saved or ran (layout_unknown otherwise); no deck check runs here. "
+                           "The result lists sensed_before and sensed_after per channel; if a tip is still sensed, tell the person plainly that they must look at the instrument, and do not retry. "
+                           "Afterwards the doubt stands: the person passes verify(check='tips_mounted', expect='none') (record_verdict), then load_layout with the returned spots as tips_returned, or after a discard the emptied spots as tips_empty.")
+  async def recover_tips(device: Device, plan_step: PlanStep,
+                         tips: Annotated[str, Field(description="The tip spots the mounted tips were picked from, e.g. 'tips:col3' or 'tips:A3:H3' (from the interrupted call in get_run)")],
+                         mode: Annotated[Literal["return", "discard"] | None, Field(description="return: back into those spots; discard: into the tip waste. Omitted = discard when the config names a tip waste, else refused (no_tip_waste)")] = None,
+                         layout: Annotated[dict[str, Any] | None, Field(description="The deck as it stands now (same format as load_layout), the spots the mounted tips came from as tips_empty; omitted = the saved layout name, else the last deck")] = None,
+                         name: Annotated[str | None, Field(description="A saved layout's name, when layout is omitted")] = None) -> dict[str, Any]:
+    args = {"device": device, "tips": tips, "mode": mode, "layout": layout, "name": name}
+    return await lab.act(lambda: lab.logged("recover_tips", args, lambda: lab.recover_tips(device, tips, mode, layout, name)),
+                         "recover_tips", args, plan_step, gated=False)
+
   @server.tool(annotations=MOTION, description="Run a model-only operation listed in describe_device (e.g. sense_tip_presence on starlet.pip).")
   async def invoke(device: Device, op: str, plan_step: PlanStep, params: dict[str, Any] | None = None) -> dict[str, Any]:
     async def body():
@@ -2647,6 +3043,8 @@ def create_server(workspace=None, backend: str | None = None, device: str | None
                            "omitted = all, one after another. The full-size files stay in .ahc/runs/<run id>/<step folder>/ (plan_step picks the folder; without it, the step you are "
                            "on, else 0_preset; final=true: <N+1>_results), and the paths can go to verify(images=[...]) as evidence. Not for simulation (the camera shows the real deck). "
                            "Not motion: it also works while the emergency stop is engaged. Images stay on this computer. "
+                           "A camera with source robot is the OT-2's built-in camera, asked of the robot (camera_disabled: the person turns it on in the Opentrons App; AHC never changes the robot's settings); "
+                           "no picture is taken while a call that moves the robot runs, so it waits for that call (robot_busy after 30 s: capture again later). "
                            "A camera with a slot map (map_camera) also gets, per image: map (ok, unclear when the frame is out of focus or covered, needs_new_map when it no longer aligns to its reference), "
                            "frame_sharpness, alignment and slots: one entry per mapped slot with its box in the preview's pixels (image_size), level (unclear, slot: labware presence, type and liquid colour can be judged, "
                            "well: single wells can be resolved; tip for a tips:<component> region), sharpness, px_per_well and a crop file (<camera>_<HHMMSS>_slot<N>.jpg next to the image). "
@@ -2666,7 +3064,13 @@ def create_server(workspace=None, backend: str | None = None, device: str | None
         return await lab.logged("capture", {"label": label, "plan_step": plan_step, "cameras": cameras, "final": final}, captured)
       finally:
         lab.step_context = None
-    result = await lab.run(body)
+    try:  # the robot's camera is not used while a call that moves the robot runs: wait for it, a while
+      result = await lab.run(body, wait=ROBOT_BUSY_WAIT_S if lab.wants_robot_camera(cameras) else None)
+    except LabError as exc:
+      if exc.code == "robot_busy":
+        lab.record({"op": "capture", "status": "refused", "error": exc.code, "message": str(exc),
+                    "basic": {"label": label, "plan_step": plan_step, "cameras": cameras, "final": final}})
+      raise
     content: list[Any] = [TextContent(type="text", text=json.dumps(result, indent=2))]
     for name, device, data in blobs:
       content.append(TextContent(type="text", text=f"{name} ({device}):"))
@@ -2679,7 +3083,7 @@ def create_server(workspace=None, backend: str | None = None, device: str | None
                            "Look at it and propose a box [x0, y0, x1, y1] for each slot you can see, in the pixels of the image you were given (image_size), hugging the labware's footprint (128 x 85 mm) by its guide lines and engraved number. "
                            "A box may reach past the frame (a plate cut off at the edge): give the whole footprint, AHC knows which part is visible. Leave out slots that are out of frame. A side view: view='side' (levels stop at slot). "
                            "A close-up region for tips: 'tips:<component>', e.g. 'tips:ot2.right'. With slots: they are written to the config (replacing the map's boxes) and drawn on the reference image, which comes back for you to check. "
-                           "The config goes pending and the person confirms it with confirm_config; the deck is then checked again. The person can also drag the boxes on the dashboard. "
+                           "The config goes pending and the person confirms it with confirm_config; the deck is then checked again. The person adjusts the boxes on the dashboard's calibration page (on real hardware every camera needs their calibration before load_layout). "
                            "Moves nothing; the reference is saved under .ahc/cameras/<camera>/. Not for simulation.")
   async def map_camera(camera: Annotated[str, Field(description="A camera name from config.cameras")],
                        slots: Annotated[dict[str, list[float]] | None, Field(description="Your proposal: {'2': [x0, y0, x1, y1], '5': [...]} for the image map_camera last gave you (else the camera's current reference); omitted = take a new reference image")] = None,
@@ -2700,14 +3104,15 @@ def create_server(workspace=None, backend: str | None = None, device: str | None
         if lab.adapter.simulated:
           raise LabError("camera_not_in_simulation", "this server runs a simulation, and a camera shows the real deck.",
                          "Map a camera on real hardware (a robot backend the person confirmed).")
-        cams.require_ffmpeg()
+        if not entry.is_robot:
+          cams.require_ffmpeg()
         lab.ws.require_task_folder()
         with tempfile.TemporaryDirectory(prefix="ahc-map-") as tmp:
-          why = await asyncio.to_thread(cams.capture_frame, entry.device, Path(tmp) / "frame.jpg")
-          if why is not None:
-            raise LabError("capture_failed", f"{camera}: {why}",
-                           "Check that the camera is plugged in, not used by another app, and allowed for this terminal.")
-          preview = await asyncio.to_thread(cams.downscaled, Path(tmp) / "frame.jpg")
+          failure = await lab.snapshot(entry, Path(tmp) / "frame.jpg", time.time())
+          if failure is not None:
+            raise LabError(failure.code if entry.is_robot else "capture_failed", f"{camera}: {failure.why}",
+                           failure.hint or "Check that the camera is plugged in, not used by another app, and allowed for this terminal.")
+          preview = (Path(tmp) / "frame.jpg").read_bytes() if entry.is_robot else await asyncio.to_thread(cams.downscaled, Path(tmp) / "frame.jpg")
         gray = vision.read_gray_bytes(preview)
         if gray is None:
           raise LabError("capture_failed", f"{camera} gave an image that cannot be read.", "Try once more, or ask the person.")
@@ -2768,7 +3173,8 @@ def create_server(workspace=None, backend: str | None = None, device: str | None
                            "Points (from the plan and the loaded layout): deck_matches_layout, every layout slot at level slot; liquid_present, the targets you declare with report_decision(vision_points=[...]) at level well; tips_mounted, 'tips:<pipette>' at level tip, which needs a camera region of that name or a tip sensor (the OT-2 has neither: it stays with the person). "
                            "It captures each mapped camera unless a capture newer than the last motion exists (recapture=true: always). Result: vision_context, instrument_context, points [{what, level, check, sources: [{source: 'vision:usb', level, fresh, covers}], status}], physical_world_confidence {by_check, by_source, all_confident}, suggestions, checked_at. "
                            "A point is covered when at least one source covers it at its level, unclear (blurred, covered or not captured: capture again; a camera that moved: map_camera again; its source entry says needs_new_map) or uncovered. No numeric score. by_check gives the same per check type with the sources and levels that cover; suggestions say what view or sensor would cover the rest. "
-                           "Moves nothing; it saves captures like capture does. Real hardware only. With auto_verify in the config, run it (or capture) after the last motion and before verify: auto is on only when every point of every listed check type is covered, and only captures newer than the last motion count.")
+                           "Single wells (level well) of a plate or rack are covered only once the person calibrated it (request_plate_calibration); plate_calibration says which plates are calibrated and which wait. A camera the person skipped covers nothing. "
+                           "Moves nothing; it saves captures like capture does. Real hardware only. With auto_verify in the config, run it after the last motion and before verify: auto is on only when every point of every listed check type is covered, only captures newer than the last motion count, and after any calibration action (the person's boxes, still right, skip, a plate) it must run again.")
   async def physical_world_context(recapture: Annotated[bool, Field(description="Capture again even if a capture newer than the last motion exists")] = False) -> dict[str, Any]:
     async def covered() -> dict[str, Any]:
       lab.poll_estop()
@@ -2791,6 +3197,7 @@ def create_server(workspace=None, backend: str | None = None, device: str | None
       if failures:
         result["vision_context"]["failures"] = failures
       lab.vision_result = {"result": result, "at": at}
+      lab.calibration.checked_again()
       lab.write_auto_state()
       try:
         lab.ws.state_dir.mkdir(parents=True, exist_ok=True)
@@ -2801,6 +3208,33 @@ def create_server(workspace=None, backend: str | None = None, device: str | None
 
     async def body():
       return await lab.logged("physical_world_context", {"recapture": recapture}, covered)
+    return await lab.run(body)
+
+  @server.tool(annotations=NOTE,
+               description="Ask the person to calibrate a plate by camera, real hardware, after load_layout: they click four of its wells (A1, A<last column>, <last row>1, <last row><last column>) in the camera's picture on the calibration page, "
+                           "and AHC computes every well's position from them (a perspective grid; a rotated or tilted plate is fine). Until then single wells of that plate stay uncovered in physical_world_context (a plate is covered at slot level only). "
+                           "labware: a plate or rack of the loaded layout that sits in a slot; camera: one whose slot map covers that slot and that the person calibrated this session (not skipped); why: one line for the person. "
+                           "Refused with a code when there is no layout (no_layout), the labware is not in it (unknown_labware), sits in no slot (labware_not_in_slot), has no grid of wells (not_a_plate), the camera does not cover the slot (not_covered_by_camera), is not calibrated yet (calibration_required) or was skipped (camera_skipped). "
+                           "Moves nothing and holds nothing: report waiting_for='person' and go on; physical_world_context says which plates are calibrated and which wait. The calibration belongs to the loaded layout: the next load_layout clears it (the page then offers the earlier corners with one click). "
+                           "Any calibration action turns auto-verify off until you run physical_world_context again.")
+  async def request_plate_calibration(labware: Annotated[str, Field(description="A plate or rack of the loaded layout, by its name in the layout")],
+                                      camera: Annotated[str, Field(description="A camera name from config.cameras whose slot boxes cover the labware's slot")],
+                                      why: Annotated[str, Field(description="One line for the person: why this plate needs calibrating")],
+                                      plan_step: PlanStep) -> dict[str, Any]:
+    async def requested() -> dict[str, Any]:
+      lab.poll_estop()
+      await lab.refresh(write=False)
+      lab.require_not_stopped()
+      lab.require_device()
+      lab.plan.check(plan_step)
+      return lab.calibration.request_plate(labware, camera, why, plan_step)
+
+    async def body():
+      lab.step_context = plan_step
+      try:
+        return await lab.logged("request_plate_calibration", {"labware": labware, "camera": camera, "why": why, "plan_step": plan_step}, requested)
+      finally:
+        lab.step_context = None
     return await lab.run(body)
 
   @server.tool(annotations=NOTE,
@@ -3066,8 +3500,9 @@ def create_server(workspace=None, backend: str | None = None, device: str | None
         else:  # tips the person found go on disk, and come off once a drop or a later check clears them
           lab.tips_checked()
         if every and verdict == "fail":
-          result["next"] = ("The person still sees tips on the pipettes (or could not check): they remove them by hand; "
-                            "then verify(check='tips_mounted', expect='none') again without device and record_verdict "
+          result["next"] = ("The person still sees tips on the pipettes (or could not check): they remove them by hand"
+                            + (";" + lab._recover_hint(lower=True) if lab.can_recover_tips() else "")
+                            + "; then verify(check='tips_mounted', expect='none') again without device and record_verdict "
                             "with its ask_person. load_layout stays refused until they pass it.")
       held = lab.verification.held_after(check_id)  # what their failed tips or liquid check holds back now
       if held:
@@ -3083,10 +3518,11 @@ def create_server(workspace=None, backend: str | None = None, device: str | None
     return await lab.run(body)
 
   @server.tool(annotations=NOTE,
-               description="Tell the person watching what you decided and why, in one line each. First, before load_layout or any action: your plan, as short concrete steps in `plan` "
+               description="Tell the person watching what you decided and why, in one line each. First, before load_layout or any action: your plan, as short concrete steps in `plan`, with the deck you will load in `layout` "
                            "(not in the decision text); every load_layout, verify and action call then names its step with plan_step, and the dashboard ticks a step once you move on. "
                            "Also report a changed plan, a refusal that changes what you do, and waiting for the person's approval (waiting_for='person', just before the confirm_config or record_verdict call they approve; with current_step if that is a step of its own). "
                            "When the last step is done, report the result with plan_done=true. With cameras that have slot maps, vision_points declares what they must see for your checks (liquid_present targets at level well); physical_world_context then says what they cover. "
+                           "layout: the deck you will load (a layout, or a saved one's name), with the plan or alone; the person sets the deck up by hand from the dashboard's Deck setup card before load_layout, and the next load_layout without a layout loads it, once (a reload needs the deck reported again). "
                            "Shown on the run dashboard and kept in this task's run log (so it writes .ahc/runs).")
   async def report_decision(decision: Annotated[str, Field(description="What you decided to do now, one line")],
                             why: Annotated[str | None, Field(description="Why, one line")] = None,
@@ -3094,7 +3530,8 @@ def create_server(workspace=None, backend: str | None = None, device: str | None
                             current_step: Annotated[int | None, Field(description="A step that starts without a call of its own (e.g. waiting for the person); calls name theirs with plan_step")] = None,
                             waiting_for: Annotated[Literal["person"] | None, Field(description="Set while you wait for the person's approval")] = None,
                             plan_done: Annotated[bool, Field(description="The plan is finished: this report gives the result")] = False,
-                            vision_points: Annotated[list[dict[str, str]] | None, Field(description="With the plan: what the cameras must see for your checks, e.g. [{'what': 'plate:B1:B8', 'level': 'well', 'check': 'liquid_present'}]. what: a target, 'slot:<n>' or 'tips:<component>'; level: slot, well or tip. They add to the points AHC derives from the loaded layout; a new plan starts the list again")] = None) -> dict[str, Any]:
+                            vision_points: Annotated[list[dict[str, str]] | None, Field(description="With the plan: what the cameras must see for your checks, e.g. [{'what': 'plate:B1:B8', 'level': 'well', 'check': 'liquid_present'}]. what: a target, 'slot:<n>' or 'tips:<component>'; level: slot, well or tip. They add to the points AHC derives from the loaded layout; a new plan starts the list again")] = None,
+                            layout: Annotated[dict[str, Any] | str | None, Field(description="The deck you will load, same format as load_layout's layout (see lab_overview.layout_format.example), or the name of a saved layout. With the plan (the usual case) or alone (a changed layout before loading). AHC draws it on the dashboard's Deck setup card for the person to set the deck up from, before load_layout; a layout that cannot be built is refused here and nothing is recorded. The next load_layout without a layout then loads it, once")] = None) -> dict[str, Any]:
     async def body():
       if not decision.strip():
         raise LabError("bad_decision", "decision is empty.", "Say in one line what you decided to do.")
@@ -3111,6 +3548,11 @@ def create_server(workspace=None, backend: str | None = None, device: str | None
         if lab.loaded_layout() is not None:
           vpoints.check_points(declared, lab.loaded_layout())
       await lab.refresh(write=False)
+      previewed = None
+      if layout is not None:  # before anything is recorded: a layout that cannot be built refuses the whole call
+        given, saved, built, scratch = await lab.build_preview(layout)
+        previewed = (given, saved, built, scratch)
+        lab.keep_preview(given, saved, built)
       entry: dict[str, Any] = {"type": "agent", "decision": decision.strip()[:500]}
       if why:
         entry["why"] = why.strip()[:500]
@@ -3136,6 +3578,21 @@ def create_server(workspace=None, backend: str | None = None, device: str | None
         result["next"] = (f"Plan recorded ({len(plan)} steps). Pass plan_step (the step a call belongs to) on every "
                           "load_layout, verify and action call; a step is ticked once you move on to a later one. When "
                           "the last step is done, report the result with report_decision(plan_done=true).")
+      if previewed is not None:
+        _, _, built, scratch = previewed
+        result["layout_shown"] = ("Drawn on the run dashboard's 'Deck setup' card: the person sets the deck up from it "
+                                  "before load_layout (nothing was sent to the device).")
+        result["deck"] = built.describe()
+        result["next"] = " ".join(filter(None, [
+          result.get("next"),
+          "Say the deck in chat too (result.deck). load_layout(plan_step) with no layout loads this one, once (a reload needs the deck reported again); "
+          "then verify(check='deck_matches_layout')."
+          + ("" if lab.dashboard or lab.view_dashboard else " No dashboard is open: call open_dashboard so the person "
+                                                              "sees the Deck setup card.")]))
+        if lab.view is not None and lab.adapter.view_root() is None:  # no device deck is shown yet: the scratch one
+          url = await lab.show_deck(lab.adapter.preview_root(scratch))
+          if url and lab.view.open_browser:  # --view: the person's own tab; otherwise the dashboard embeds it
+            result["live_view_url"] = url
       return result
     return await lab.run(body)
 

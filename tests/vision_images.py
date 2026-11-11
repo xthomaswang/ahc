@@ -69,3 +69,23 @@ def other_scene(seed: int = 7) -> np.ndarray:
     color = tuple(int(c) for c in rng.integers(0, 255, 3))
     cv2.rectangle(image, (x, y), (x + int(rng.integers(5, 60)), y + int(rng.integers(5, 40))), color, -1)
   return image
+
+
+def plate_corners(slot: int | list[float], labware: str = "Cor_96_wellplate_360ul_Fb") -> list[list[float]]:
+  """Where the four corner wells (A1, A<last column>, <last row>1, <last row><last column>) of a plate that fills slot
+  `slot` (or the box) are in the reference picture: what the person would click."""
+  from ahc import vision
+
+  box = slot_box(slot) if isinstance(slot, int) else slot
+  geometry = vision.labware_geometry(labware)
+  x0, y0, x1, y1 = box
+  return [[x0 + geometry["wells"][w][0] * (x1 - x0), y0 + geometry["wells"][w][1] * (y1 - y0)]
+          for w in vision.corner_wells(geometry["rows"], geometry["cols"])]
+
+
+def plate(slot: int, labware: str = "Cor_96_wellplate_360ul_Fb") -> dict:
+  """A calibrated plate as ahc.vision.analyze takes it (plates={slot: ...})."""
+  from ahc import vision
+
+  geometry = vision.labware_geometry(labware)
+  return {"corners": plate_corners(slot, labware), "rows": geometry["rows"], "cols": geometry["cols"], "type": labware}

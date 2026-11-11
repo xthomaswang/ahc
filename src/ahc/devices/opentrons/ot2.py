@@ -39,6 +39,20 @@ def _close_transport(device) -> None:
 class OT2Adapter(OpentronsAdapter):
   """An OT-2 driven step by step through PyLabRobot 1.0 over the robot-server HTTP API."""
 
+  @staticmethod
+  def _where(options: dict[str, Any]) -> str:
+    """" at host:port" for an entry that names a host (the robot-server's port when it names none), else ""."""
+    return f" at {options['host']}:{options.get('port') or 31950}" if options.get("host") else ""
+
+  @classmethod
+  def describe_entry(cls, options: dict[str, Any]) -> str:
+    name = cls.pinned(options)
+    return (f", robot {name!r}" if name else ", robot (no name)") + cls._where(options)
+
+  @classmethod
+  def named(cls, entry_id: str, model: str, options: dict[str, Any]) -> str:
+    return super().named(entry_id, model, options) + cls._where(options)
+
   async def start(self) -> None:
     await super().start()
     self.device = None
@@ -187,7 +201,7 @@ class OT2Adapter(OpentronsAdapter):
     except Exception:  # noqa: BLE001 - the robot cannot say: not confirmed
       return False
 
-  async def halt(self) -> bool:
+  async def halt(self, stop: dict[str, Any] | None = None) -> bool:
     """The emergency stop: stop the robot's run at once, also a run load_layout is still setting up.
 
     Not device.stop(): that waits for the command in flight to give up PyLabRobot's operation lock,
@@ -237,8 +251,7 @@ class OT2Adapter(OpentronsAdapter):
     mounts = (await asyncio.to_thread(self.identity))["mounts"]
     if not mounts["ok"]:
       raise LabError("mount_mismatch", "; ".join(mounts["problems"]) + "; nothing was moved.", self._mount_hint())
-    types = {item.get("type") for item in (layout.get("slots") or {}).values() if isinstance(item, dict)}
-    await asyncio.to_thread(ensure_tip_rack_definitions, types)  # never a download on the event loop
+    await asyncio.to_thread(ensure_tip_rack_definitions, self.labware_types(layout))  # never a download on the event loop
     deck = OTDeck()
     new_layout = self._build_deck(deck, layout)
     await self.stop()

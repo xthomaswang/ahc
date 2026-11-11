@@ -188,6 +188,27 @@ async def test_component_and_layout_refusals(starlet):
   assert await starlet.refused("load_layout", layout=bad) == "overfill"
 
 
+async def test_the_lab_deck_carries_water_from_one_plate_to_the_next(starlet):
+  # The first real STARlet test's deck: a deep-well carrier on track 1 holding an empty target plate at
+  # site 0 (front) and the water plate behind it, and a tip carrier on track 13.
+  deck = {"carriers": [
+    {"type": "PLT_CAR_L5_DWP", "track": 1, "name": "plates",
+     "sites": {"0": {"type": "Cor_96_wellplate_360ul_Fb", "name": "target"},
+               "1": {"type": "Cor_96_wellplate_360ul_Fb", "name": "water"}}},
+    {"type": "TIP_CAR_480_A00", "track": 13, "name": "tipcar",
+     "sites": {"0": {"type": "hamilton_96_tiprack_300uL_filter", "name": "tips"}}}],
+    "liquids": {"water:A1:H1": 300}}
+  await load_verified(starlet, layout=deck)
+  picked = await starlet.call("pick_up_tips", device=DEV)
+  assert picked["effective"]["where"] == "tips: column 1 (A1-H1)"  # the next fresh column of the rack
+  await starlet.call("aspirate", device=DEV, targets=["water:A1:H1"], volumes=100)
+  await starlet.call("dispense", device=DEV, targets=["target:A1:H1"], volumes=100)
+  liquids = (await starlet.call("get_state", device=DEV))["liquids_ul"]
+  assert set(liquids["target"]) == {f"{r}1" for r in "ABCDEFGH"}
+  assert all(v == pytest.approx(100.0) for v in liquids["target"].values())
+  assert all(liquids["water"][f"{r}1"] == pytest.approx(200.0) for r in "ABCDEFGH")
+
+
 async def test_refusals_are_logged(starlet):
   await loaded(starlet, with_tips=True)
   await starlet.refused("aspirate", device=DEV, targets=["diluent"], volumes=2000)
@@ -249,6 +270,8 @@ async def test_one_aspiration_split_over_dispenses_is_explained(starlet):
   await starlet.call("dispense", device=DEV, targets=["plate:A3:H3"], volumes=33.3, flow_rate=100)
   text = await starlet.call_text("dispense", device=DEV, targets=["plate:A4:H4"], volumes=33.3, flow_rate=100)
   assert "[piston_travel]" in text and "aspirate about" in text
+  assert "leave that surplus in the tip (it goes with the tip), or aspirate once per dispense" in text
+  assert "to waste" not in text
 
 
 async def test_mix_is_one_command_that_cannot_stop_half_way(starlet):
@@ -312,16 +335,21 @@ async def test_a_failed_setup_leaves_no_half_built_device(starlet, monkeypatch):
   await loaded(starlet, with_tips=True)  # the retry works once the device answers
 
 
-async def test_the_starlet_runs_only_simulated():
+async def test_the_starlet_usb_backend_needs_its_bridge_and_unknown_backends_are_refused():
   from dataclasses import replace
 
   from ahc.core.errors import LabError
   from ahc.devices.hamilton.starlet import STARletAdapter
   from ahc.devices.spec import load_device
 
-  spec = replace(load_device("hamilton.starlet"), backends={"sim": "simulated", "usb": "a real STARlet"})
+  spec = replace(load_device("hamilton.starlet"), backends={"sim": "simulated", "usb": "a real STARlet",
+                                                            "serial": "not a backend"})
   with pytest.raises(LabError) as refused:
-    await STARletAdapter(spec, "usb", {}).start()  # never the simulator under real-hardware rules
+    STARletAdapter.check_options("usb", {})  # no longer "not implemented": it needs the USB host's name
+  assert refused.value.code == "bridge_required"
+  await STARletAdapter(spec, "usb", {"bridge": "usb-host"}).start()  # opens nothing
+  with pytest.raises(LabError) as refused:
+    await STARletAdapter(spec, "serial", {}).start()  # never the simulator under real-hardware rules
   assert refused.value.code == "backend_not_implemented"
 
 

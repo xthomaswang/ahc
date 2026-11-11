@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 import os
@@ -14,11 +15,13 @@ from typing import Any
 import pylabrobot.resources as plr
 from pylabrobot.resources import OTDeck
 
+from ahc.cameras import CameraFailure, ROBOT_TIMEOUT_S
 from ahc.core.errors import LabError
 from ahc.core.layout import Layout, deck_position, make_labware
 from ahc.devices.base import Adapter
 
 MOUNTS = ("left", "right")
+MAX_PICTURE_BYTES = 8_000_000  # a robot's picture is 30-40 kB; anything this large is not one
 _HOST = re.compile(r"[A-Za-z0-9.-]+")  # a hostname or an IPv4 address: no scheme, port or path
 
 # PyLabRobot builds Opentrons tip racks from Opentrons' own labware definitions: it reads a copy in the
@@ -97,6 +100,14 @@ def _request(host: str, port: int, path: str, timeout: float, body: dict[str, An
                                    method="GET" if body is None else "POST")
   with urllib.request.urlopen(request, timeout=timeout) as response:
     return json.load(response) if body is None else {}
+
+
+def _request_bytes(host: str, port: int, path: str, timeout: float, post: bool = False) -> bytes:
+  """One blocking robot-server request whose reply is the body itself (a picture)."""
+  request = urllib.request.Request(f"http://{host}:{port}{path}", data=b"" if post else None,
+                                   headers={"Opentrons-Version": "*"}, method="POST" if post else "GET")
+  with urllib.request.urlopen(request, timeout=timeout) as response:
+    return response.read(MAX_PICTURE_BYTES + 1)
 
 
 def read_identity(host: str, port: int, timeout: float) -> dict[str, Any]:
@@ -202,6 +213,36 @@ class OpentronsAdapter(Adapter):
   def _post(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
     return _request(self.host, self.port, path, timeout=10, body=body)
 
+  def camera_picture(self, timeout: float = ROBOT_TIMEOUT_S) -> bytes:
+    """One JPEG from the robot's built-in camera, asked of the robot's server (GET /camera, then POST /camera/picture).
+    Blocking (async callers use a thread). Any failure is a CameraFailure: a picture is never a device command, so
+    nothing here changes what AHC knows about the robot. AHC never writes the robot's settings."""
+    try:
+      status = _request(self.host, self.port, "/camera", timeout)
+    except urllib.error.HTTPError as exc:
+      raise CameraFailure("camera_unavailable", f"the robot's server has no camera service (GET /camera answered {exc.code}).",
+                          "This robot's software may be too old for a camera picture; use a USB camera plugged into the Mac.") from exc
+    except (OSError, ValueError) as exc:
+      raise CameraFailure("camera_unreachable", f"the robot's server did not answer ({type(exc).__name__}: {exc}).",
+                          "Do not retry in a loop; tell the person.") from exc
+    if not isinstance(status, dict) or not status.get("cameraEnabled"):
+      raise CameraFailure("camera_disabled", "the robot's camera is turned off.",
+                          "Tell the person: they turn the camera on in the Opentrons App (the robot's settings). AHC never changes the robot's settings.")
+    try:
+      data = _request_bytes(self.host, self.port, "/camera/picture", timeout, post=True)
+    except urllib.error.HTTPError as exc:
+      if exc.code == 422:  # the robot's own answer for a camera that is turned off
+        raise CameraFailure("camera_disabled", "the robot's camera is turned off (the robot refused the picture).",
+                            "Tell the person: they turn the camera on in the Opentrons App (the robot's settings). AHC never changes the robot's settings.") from exc
+      raise CameraFailure("camera_failed", f"the robot could not take a picture (it answered {exc.code}).",
+                          "Do not retry in a loop; tell the person.") from exc
+    except (OSError, ValueError) as exc:
+      raise CameraFailure("camera_unreachable", f"the robot did not give a picture ({type(exc).__name__}: {exc}).",
+                          "Do not retry in a loop; tell the person.") from exc
+    if not data.startswith(b"\xff\xd8") or len(data) > MAX_PICTURE_BYTES:
+      raise CameraFailure("camera_failed", "the robot's answer was not a JPEG picture.", "Do not retry in a loop; tell the person.")
+    return data
+
   def check_reachable(self) -> dict[str, Any]:
     """Blocking (async callers use a thread)."""
     check = self.options.get("check_endpoint")  # simulated: is this the task's own simulator?
@@ -227,6 +268,27 @@ class OpentronsAdapter(Adapter):
     out["mounts"] = self.check_mounts(out["pipettes"], self.spec.mounted)
     return out
 
+  @staticmethod
+  def labware_types(layout: dict[str, Any]) -> set[Any]:
+    """The labware types a layout's slots name."""
+    return {item.get("type") for item in (layout.get("slots") or {}).values() if isinstance(item, dict)}
+
+  async def preview_layout(self, layout: dict[str, Any]) -> tuple[Layout, Any]:
+    # No check_reachable, identity or OT2(...): the robot is never contacted. The tip rack definitions are read
+    # from this computer's cache (see ensure_tip_rack_definitions), never from the robot.
+    try:
+      await asyncio.to_thread(ensure_tip_rack_definitions, self.labware_types(layout))  # never a download on the event loop
+      deck = OTDeck()  # a scratch deck: no robot, no run
+      built = self._build_deck(deck, layout)
+    except LabError:
+      raise
+    except Exception as exc:  # noqa: BLE001 - a malformed layout (a missing key, a wrong type) is the agent's to fix
+      raise LabError("bad_layout", f"the layout could not be built: {type(exc).__name__}: {exc}",
+                     "An Opentrons layout has slots (slot -> name, type), and optionally liquids, aliases, "
+                     "tips_empty and tips_returned.") from exc
+    built.record_placements()
+    return built, deck
+
   def _build_deck(self, deck: OTDeck, layout: dict[str, Any]) -> Layout:
     rules = self.spec.layout
     extra = set(layout) - {"slots", "liquids", "aliases", "tips_empty", "tips_returned"}
@@ -235,6 +297,7 @@ class OpentronsAdapter(Adapter):
                      "An Opentrons layout has slots, liquids, aliases, and optionally tips_empty and tips_returned.")
     out = Layout(self.spec, kind="slots")
     out.declared = copy.deepcopy(layout)
+    out.deck = deck
     lo, hi = rules["slots"]["min"], rules["slots"]["max"]
     for slot, item in (layout.get("slots") or {}).items():
       if not str(slot).isdigit() or not lo <= int(slot) <= hi:

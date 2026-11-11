@@ -8,7 +8,9 @@ It models what AHC and PyLabRobot use, following the robot-server's own behaviou
 - a run that is no longer current answers 409 to commands and actions;
 - failures can be injected: `fail_commands`, `stop_status`, `poll_status`, `instruments_status`,
   `count_get_fail_at`, `count_get_delay`, `reboot()`; `pipettes` sets what each mount carries;
-- another client (the Opentrons App) can start a run of its own: `other_client_run()`.
+- another client (the Opentrons App) can start a run of its own: `other_client_run()`;
+- the built-in camera: GET /camera (`camera_enabled`), POST /camera/picture (a small generated JPEG after
+  `picture_seconds`; 422 while the camera is disabled, or `picture_status` when set).
 Every request is logged in `log` with a monotonic timestamp; `dump()` prints it.
 """
 
@@ -22,6 +24,23 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+
+
+def make_jpeg(width: int = 640, height: int = 480, label: str = "") -> bytes:
+  """A small deck-like test picture: a grey deck with a 3 x 4 grid of slots, as a JPEG."""
+  import cv2
+  import numpy as np
+
+  image = np.full((height, width, 3), 70, np.uint8)
+  for row in range(3):
+    for col in range(4):
+      x0, y0 = 30 + col * (width - 60) // 4, 30 + row * (height - 60) // 3
+      cv2.rectangle(image, (x0, y0), (x0 + (width - 60) // 4 - 12, y0 + (height - 60) // 3 - 12), (200, 200, 200), 2)
+      cv2.putText(image, str(row * 4 + col + 1), (x0 + 8, y0 + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+  if label:
+    cv2.putText(image, label, (10, height - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+  ok, data = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 80])
+  return data.tobytes()
 
 
 class FakeRobot:
@@ -38,6 +57,12 @@ class FakeRobot:
     self.count_get_delay_once_at: int | None = None  # only the n-th such GET (1-based)
     self.count_get_fail_at: int | None = None  # the n-th such GET answers 500
     self._count_gets = 0
+    self.camera_enabled = True  # GET /camera says so; a disabled camera answers 422 to a picture
+    self.picture_seconds = 0.0  # how long a picture takes (a real one takes 2.5 s)
+    self.picture_status: int | None = None  # force this HTTP status on POST /camera/picture
+    self.picture = make_jpeg()  # what a picture is
+    self.pictures_taken = 0
+    self.pictures_in_flight = self.max_pictures_in_flight = 0  # requests being served at once: the client sends one at a time
     self.fail_commands: dict[str, str] = {}  # commandType -> error detail (command fails)
     self.stop_status: int | None = None  # force this HTTP status on POST actions
     self.poll_status: int | None = None  # force this HTTP status on GET /runs/{id}/commands/{cid}
@@ -171,6 +196,9 @@ class FakeRobot:
           time.sleep(bot.health_seconds)
           return self._send(200, {"name": bot.name, "robot_model": "OT-2 Standard", "api_version": bot.api_version,
                                   "fw_version": "v1.0", "robot_serial": "OT2FAKE", "system_version": "1.0"})
+        if path == "/camera":
+          return self._send(200, {"cameraEnabled": bot.camera_enabled, "liveStreamEnabled": False,
+                                  "errorRecoveryCameraEnabled": False})
         if path == "/pipettes":
           empty = {"name": None, "model": None, "id": None}
           return self._send(200, {m: dict(p) if p else empty for m, p in bot.pipettes.items()})
@@ -221,6 +249,25 @@ class FakeRobot:
         if path == "/runs":
           run = bot._new_run()
           return self._send(201, {"data": {"id": run["id"], "status": "idle"}})
+        if path == "/camera/picture":
+          with bot._lock:
+            bot.pictures_in_flight += 1
+            bot.max_pictures_in_flight = max(bot.max_pictures_in_flight, bot.pictures_in_flight)
+          try:
+            time.sleep(bot.picture_seconds)
+          finally:
+            with bot._lock:
+              bot.pictures_in_flight -= 1
+          if bot.picture_status is not None:
+            return self._send(bot.picture_status, {"errors": [{"detail": "injected"}]})
+          if not bot.camera_enabled:
+            return self._send(422, {"message": "Cannot take photo, camera is disabled."})
+          bot.pictures_taken += 1
+          self.send_response(200)
+          self.send_header("Content-Type", "image/jpg")
+          self.send_header("Content-Length", str(len(bot.picture)))
+          self.end_headers()
+          return self.wfile.write(bot.picture)
         if path == "/robot/home":
           time.sleep(bot.home_seconds)
           bot.log.append((bot.t(), "EVENT", "home finished", None))

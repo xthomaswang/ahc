@@ -170,7 +170,7 @@ async def test_the_home_folder_is_no_task(tmp_path, monkeypatch, open_lab):
 
 async def test_a_real_backend_needs_a_description_file_backend(tmp_path, open_lab):
   async with open_lab(tmp_path, backend=None) as lab:
-    bad = [{"id": "starlet", "model": "hamilton.starlet", "backend": "usb"}]
+    bad = [{"id": "starlet", "model": "hamilton.starlet", "backend": "serial"}]  # a backend its description lacks
     assert await lab.refused("configure_devices", devices=bad) == "config_invalid"
     assert await lab.refused("configure_devices", devices=STARLET_SIM * 2) == "config_invalid"
 

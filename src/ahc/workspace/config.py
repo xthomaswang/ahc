@@ -10,6 +10,8 @@
     confirmation: {by: human | simulation, at: ..., digest: sha256:...}   # written by the server
     cameras:                  # optional; the task's cameras, by their exact AVFoundation device name
       - {name: top, device: "USB Camera"}
+      # the OT-2's own built-in camera, through the robot's server (a USB camera must be plugged into the Mac, not the robot)
+      - {name: robot, source: robot, device: ot2}   # device: the id of a configured OT-2 on real hardware
       # a camera may carry a slot map (written by map_camera or the dashboard, never by hand): a reference image
       # under .ahc and one box per deck slot it sees, in the reference's pixels
       #   slot_map: {reference: cameras/top/reference.jpg, size: [1280, 720], sha256: ..., view: top,
@@ -42,7 +44,8 @@ from ahc.devices.spec import known_models, load_device
 
 KEYS = {"devices", "limits", "cameras", "auto_verify", "confirmation", "sim"}
 DEVICE_KEYS = {"id", "model", "backend", "options"}
-CAMERA_KEYS = {"name", "device", "slot_map"}
+CAMERA_KEYS = {"name", "device", "slot_map", "source"}
+CAMERA_SOURCES = ("mac", "robot")  # mac: a camera on this Mac (AVFoundation, by name); robot: the OT-2's built-in camera
 SLOT_MAP_KEYS = {"reference", "size", "slots", "sha256", "view"}
 SLOT_KEY = re.compile(r"(?:[1-9]|1[0-2])|tips:[a-z][a-z0-9_]*\.[a-z0-9_]+")
 VIEWS = ("top", "side")
@@ -80,15 +83,27 @@ class DeviceEntry:
 @dataclass(frozen=True)
 class CameraEntry:
   name: str  # what capture calls it: lowercase, like a device id
-  device: str  # the camera's exact AVFoundation device name
+  device: str  # mac: the camera's exact AVFoundation device name; robot: the id of the OT-2 whose built-in camera it is
   slot_map: dict[str, Any] | None = None  # reference image, size and one box per slot: see parse_slot_map
+  source: str = "mac"  # where the picture comes from: see CAMERA_SOURCES
+
+  @property
+  def is_robot(self) -> bool:
+    return self.source == "robot"
 
   def data(self) -> dict[str, Any]:
-    """The entry as the file and the digest hold it: a slot map only when there is one."""
+    """The entry as the file and the digest hold it: a slot map only when there is one, the source only when it is
+    not the default (so a Mac camera keeps the digest it was confirmed with)."""
     out: dict[str, Any] = {"name": self.name, "device": self.device}
+    if self.is_robot:
+      out["source"] = self.source
     if self.slot_map:
       out["slot_map"] = self.slot_map
     return out
+
+  def what(self) -> str:
+    """What the person is shown for it: the Mac camera's name, or the robot's built-in camera."""
+    return f"{self.device!r} (the built-in camera of the robot {self.device})" if self.is_robot else repr(self.device)
 
   def sees(self) -> str | None:
     """"slots 1-9" (and regions), from the slot map; None without one."""
@@ -274,26 +289,47 @@ def parse_cameras(raw: Any) -> list[CameraEntry]:
   if raw is None:
     return []
   if not isinstance(raw, list):
-    raise invalid("cameras must be a list.", "Each entry: {name: top, device: \"USB Camera\"}.")
+    raise invalid("cameras must be a list.", "Each entry: {name: top, device: \"USB Camera\"}, or {name: robot, source: robot, device: ot2}.")
   out: list[CameraEntry] = []
   for i, item in enumerate(raw):
     if not isinstance(item, dict):
       raise invalid(f"cameras[{i}] must be a mapping with name and device.", "Each entry: {name: top, device: \"USB Camera\"}.")
     extra = set(item) - CAMERA_KEYS
     if extra:
-      raise invalid(f"cameras[{i}] has unknown keys {sorted(extra)}.", "Keys: name, device, slot_map.")
-    name, device = item.get("name"), item.get("device")
+      raise invalid(f"cameras[{i}] has unknown keys {sorted(extra)}.", "Keys: name, device, source, slot_map.")
+    name, device, source = item.get("name"), item.get("device"), item.get("source", "mac")
+    if source not in CAMERA_SOURCES:
+      raise invalid(f"cameras[{i}]: source {source!r} must be one of {', '.join(CAMERA_SOURCES)}.",
+                    "mac (the default): a camera on this Mac, by its AVFoundation name. robot: the OT-2's built-in camera, device = the OT-2's id.")
     if not isinstance(name, str) or not ID.fullmatch(name):
       raise invalid(f"cameras[{i}]: name {name!r} must be lowercase letters, digits or '_', starting with a letter.")
+    if source == "robot" and not (isinstance(device, str) and ID.fullmatch(device)):
+      raise invalid(f"cameras[{i}]: a robot camera's device must be the id of the OT-2 it belongs to (e.g. ot2).",
+                    "Use the id of the OT-2 entry in devices; a USB camera plugged into the robot cannot be used: plug it into the Mac.")
     if not isinstance(device, str) or not device.strip():
       raise invalid(f"cameras[{i}]: device must be the camera's exact AVFoundation device name.",
                     "Ask the person for the name, or list the devices with `ffmpeg -f avfoundation -list_devices true -i \"\"`.")
     slot_map = parse_slot_map(item["slot_map"], name) if item.get("slot_map") is not None else None
-    out.append(CameraEntry(name, device, slot_map))
+    out.append(CameraEntry(name, device, slot_map, source))
   names = [c.name for c in out]
   if len(set(names)) != len(names):
     raise invalid(f"camera names must be unique, got {names}.")
   return out
+
+
+def check_robot_cameras(devices: list[DeviceEntry], cameras: list[CameraEntry]) -> None:
+  """A robot camera belongs to a configured OT-2 on real hardware: the picture comes from that robot's server."""
+  for camera in cameras:
+    if not camera.is_robot:
+      continue
+    entry = next((d for d in devices if d.id == camera.device), None)
+    if entry is None or entry.model != "opentrons.ot2":
+      raise invalid(f"camera {camera.name!r}: source robot needs device to be a configured OT-2, and {camera.device!r} is not "
+                    f"({', '.join(f'{d.id} = {d.model}' for d in devices) or 'no device configured'}).",
+                    "Set the camera's device to the id of the OT-2 in devices; only the OT-2's own built-in camera can be used this way.")
+    if entry.backend == "sim":
+      raise invalid(f"camera {camera.name!r}: the robot's camera needs the real robot, and {entry.id!r} is a simulation.",
+                    "A robot camera works on real hardware (backend robot); in simulation there is no camera picture.")
 
 
 def parse_auto_verify(raw: Any) -> AutoVerify | None:
@@ -344,8 +380,10 @@ def parse_config(text: str) -> Config:
   sim = data.get("sim") or {}
   if not isinstance(sim, dict):
     raise invalid("sim must be a mapping.")
+  cameras = parse_cameras(data.get("cameras"))
+  check_robot_cameras(devices, cameras)
   return Config(devices=devices, limits=limits, confirmation=confirmation, sim=sim,
-                cameras=parse_cameras(data.get("cameras")), auto_verify=parse_auto_verify(data.get("auto_verify")))
+                cameras=cameras, auto_verify=parse_auto_verify(data.get("auto_verify")))
 
 
 def template_text() -> str:

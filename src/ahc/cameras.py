@@ -10,6 +10,10 @@ the server hands the images to the agent. Full-resolution files stay on disk:
 The step folder is `0_preset` before any plan step, `<k>_<slug of step k>` for plan step k, and
 `<N+1>_results` for the final capture of an N-step plan. AVFoundation indices swap between runs, so a
 camera is always selected by its name. Nothing is masked and nothing leaves this machine.
+
+A camera's `source` is `mac` (a camera plugged into this Mac, through AVFoundation) or `robot` (the OT-2's own
+built-in camera, a picture asked of the robot's server: see OpentronsAdapter.camera_picture). A failure of
+either is a capture failure, never a device error.
 """
 
 from __future__ import annotations
@@ -30,8 +34,18 @@ TIMEOUT_S = 20  # per capture; the process is killed after it
 SKIP_S = 1.5  # the first frames are dark while the camera's exposure settles
 MAX_WIDTH = 1280  # what the agent sees; the file on disk keeps the camera's resolution
 SLUG_LIMIT = 40
+ROBOT_TIMEOUT_S = 15  # one picture from the robot's server (it takes about 3 s)
 INSTALL_HINT = "brew install ffmpeg"
 DEVICE_LINE = re.compile(r"\[(\d+)\]\s+(.+?)\s*$")
+
+
+class CameraFailure(Exception):
+  """A picture that could not be taken: `code` names the kind (camera_disabled, robot_busy, ...), `why` says what
+  happened, `hint` what to do. Never a device error: nothing here may mark a robot outcome unknown."""
+
+  def __init__(self, code: str, why: str, hint: str | None = None):
+    super().__init__(why)
+    self.code, self.why, self.hint = code, why, hint
 
 
 def ffmpeg() -> str | None:

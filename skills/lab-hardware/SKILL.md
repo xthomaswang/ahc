@@ -1,6 +1,6 @@
 ---
 name: lab-hardware
-description: Run liquid-handling protocols on lab robots through the AHC (Agentic Hardware Control) MCP server: any work a device can do with tips, aspirate, dispense and mix (reagent addition, plate-to-plate transfers, normalization, dilution series, assay setup), on the Hamilton STARlet (simulated) and the Opentrons OT-2 (simulated, or a real robot with a person on site). Use when planning or executing lab work in a task folder, choosing its device or layout, or when an AHC tool reports that a simulator is missing.
+description: Run liquid-handling protocols on lab robots through the AHC (Agentic Hardware Control) MCP server: any work a device can do with tips, aspirate, dispense and mix (reagent addition, plate-to-plate transfers, normalization, dilution series, assay setup), on the Hamilton STARlet (simulated, or a real instrument through a USB host with a person on site) and the Opentrons OT-2 (simulated, or a real robot with a person on site). Use when planning or executing lab work in a task folder, choosing its device or layout, or when an AHC tool reports that a simulator is missing.
 ---
 
 # Lab hardware (AHC)
@@ -19,7 +19,8 @@ read `patterns.md` in this skill's folder.
    the next step. Read what you need (`find_layout_references`, `describe_device`, `get_params`).
    Call `open_dashboard` at the start of a task: it serves the run page from this server and opens
    it in the person's browser, so they can watch the run and use its stop button. The person types
-   nothing; `lab_overview.dashboard` has the URL. For an audience, `open_dashboard(view_only=true)`
+   nothing; `lab_overview.dashboard` has the URL. Its Deck setup card has a 3D live tab (the digital twin,
+   not a camera image). For an audience, `open_dashboard(view_only=true)`
    opens a second page with no stop or release button; the person keeps their own.
 2. Report your plan with `report_decision(plan=[...])` before `load_layout` or any action (refused
    otherwise: `plan_required`): short concrete steps, e.g. "Load the layout", "The person checks the
@@ -30,6 +31,15 @@ read `patterns.md` in this skill's folder.
      `current_step` and `waiting_for="person"`, just before the call they approve.
    - A changed plan, or a refusal that changes your course: `report_decision` again. Not for every
      call.
+   - Report the deck with the plan: `report_decision(plan=[...], layout=...)` (a layout, or a saved
+     layout's name; alone for a changed layout before loading). AHC draws it on the dashboard's Deck setup
+     card, and the person sets the deck up by hand from it before `load_layout`: say the deck in chat too
+     (`result.deck`) and call `open_dashboard` if none is open. A layout that cannot be built is refused
+     there (nothing recorded) with the build's error. The next `load_layout(plan_step)` with no layout loads
+     it, once: for a reload report the deck again (e.g. `last_deck.layout` to continue from the last run's
+     deck), or `load_layout` is refused (`layout_required`). A different layout loads too and the result
+     lists `differs_from_preview`. Site 0 of a STARlet
+     carrier is its front-most site (VENUS position 1 is the back-most; the card shows both).
 3. The device config and this session's go-ahead:
    - When the server forces simulation (`lab_overview.forced_simulation`, e.g. a headless run with
      `AHC_BACKEND=sim`), a STARlet simulation config is created on first use. `configure_devices`
@@ -152,6 +162,35 @@ decide: you prepare it, show it and wait.
   the summary listing the mounts, before they confirm. `mount_mismatch` (the pipettes changed after
   confirmation): write the config again with `configure_devices` and have them confirm it.
   `no_usable_pipette`, `wrong_robot` (another robot answers at that address): stop and tell the person.
+- A real STARlet is the `usb` backend: ask the person for its USB host's ssh name (never guess one), write
+  `[{"id": "starlet", "model": "hamilton.starlet", "backend": "usb", "options": {"bridge": "<ssh name>"}}]`
+  (`tip_waste: true` only when the person says a tip waste is fitted; `channel_spacing_mm` only when the person states the spacing their channels can take) and show them the identity
+  `configure_devices` read (serial, firmware, channels, fitted parts, tips sensed, the host); they confirm that
+  serial. Its first `load_layout` of a session, and the first after a stop, an error or a disconnect,
+  initializes the instrument (channels, 96-head, iSWAP and autoload all move): say so with the line above.
+  Return tips (`drop_tips` with `mode='return'`): `no_tip_waste` means discarding is not allowed. Stop and tell
+  the person on `tips_on_channels`, `initialization_failed`, `instrument_read_only`,
+  `link_lost`, `completion_unknown` and `halt_unconfirmed`: they check the instrument and its channels for tips;
+  retrying is theirs to allow. The backend has had only its first runs on an instrument: the person stands at the
+  power switch.
+  On a real STARlet AHC's stop keeps AHC from sending anything more, but a command the instrument is already running
+  finishes; the instrument's power switch is the only thing that stops motion at once, so before `load_layout` tell
+  the person that approving also means they are within reach of it. After the power switch the link is lost and the
+  outcome is unknown: the person sees to it that no tips are on the channels (after a power-off `recover_tips`
+  cannot run, so they come off outside AHC) and confirms it with the tips check, and only then does a new
+  `load_layout` run (it refuses to initialize while the tip sensor reports tips).
+  A STARlet's CO-RE tips did not come off by hand on the lab's instrument, and the stop does not cancel the pick-up
+  command already in flight, so tips may sit on the channels. After the person has released the stop,
+  `recover_tips` puts them back or discards them (never an initialization). Ask the person first, in chat: back into the rack spots they came from
+  (`mode='return'`), or into the tip waste (the default, only when the config says `tip_waste: true`). Their approval
+  of the call is their go-ahead for the move: say right before it what moves (the channels and the 96 head go up, the
+  tips go down into the spots or the waste) and that hands and deck must be clear. `tips` is the column the
+  interrupted pick-up took (`get_run`); `layout` is the deck as it stands, the racks where they physically are with
+  those spots as `tips_empty` (it must match a deck this task folder ran: `layout_unknown`). It works only while the
+  instrument still reports itself initialized (`recovery_needs_initialized` after a power cycle: tell the person, do
+  not retry). Afterwards the person passes the tips check as usual and `load_layout` declares the returned spots as
+  `tips_returned` (after a discard, the emptied ones as `tips_empty`); a tip still sensed in the result means the
+  person must look at the instrument.
 - Tell the person how to stop this server: `lab_overview.emergency_stop.how` (the dashboard's stop
   button, or `uv run --project <repo> ahc-estop` in a terminal).
 - To let go of the robot while the session and the dashboard stay up, call `disconnect` (no emergency
@@ -203,7 +242,11 @@ decide: you prepare it, show it and wait.
   elsewhere (e.g. after dropping tips in the trash), and say so when an image shows the head instead.
 - Photos of a check go in `verify(images=[paths from capture])`. They are evidence only: on real
   hardware the person still gives the verdict. Cameras are the person's to declare (`configure_devices`
-  `cameras`, confirmed by them); never invent a device name, ask which camera is which.
+  `cameras`, confirmed by them); never invent a device name, ask which camera is which. The OT-2's own
+  built-in camera is `{name, source: "robot", device: <the OT-2's id>}`; a USB camera must be plugged into the
+  Mac, not the robot. If the robot's camera is off (`camera_disabled`) the person turns it on in the Opentrons
+  App; you cannot. A picture is not taken while a call that moves the robot runs (`robot_busy`: capture again
+  after it). The person also has a live camera tab on the dashboard; it is not evidence, only capture files are.
 
 ### Slot maps, verification points and shadow judgments (cameras with a slot map)
 
@@ -215,7 +258,24 @@ decide: you prepare it, show it and wait.
   off at the frame's edge gets its whole footprint (the box reaches past the edge); AHC knows which wells are
   visible. Leave out slots the camera does not see. A side camera: `view="side"`. A close-up of a pipette's
   tips: `tips:<component>`. The drawn boxes come back for you to check; the config is then pending: the person
-  confirms it (`confirm_config`, the deck is checked again) and can drag boxes on the dashboard.
+  confirms it (`confirm_config`, the deck is checked again) and can adjust the boxes on the calibration page.
+- Calibration is the person's, on the dashboard's `/calibration` page (open_dashboard opens it while a camera waits).
+  On a real robot with cameras `load_layout` is refused with `calibration_required` until the person has, in this
+  server session, saved each camera's boxes, said they are still right (a fresh frame is compared with the camera's
+  reference: "has not moved" / "moved about N px" / "could not compare"), or skipped it. Tell them where to go
+  (`lab_overview.calibration` has the page and the next step per camera); a camera with no slot map needs your
+  `map_camera` first. A skipped camera still takes photos but covers nothing in `physical_world_context`. Every
+  calibration action turns auto-verify off (the reason is in `lab_overview` and capture results) until you run
+  `physical_world_context` again; your track record is kept.
+- Single wells of a plate need the person's plate calibration: after `load_layout`, ask with
+  `request_plate_calibration(labware, camera, why, plan_step)` for a plate that sits in a slot a calibrated camera
+  covers, report `waiting_for='person'` and go on (motion is not held). They click four wells (A1, A12, H1, H12 on a
+  96-well plate) and a perspective grid gives every well's position. Until then well-level points of that plate stay
+  uncovered; `physical_world_context.plate_calibration` says which plates are calibrated and which wait. The
+  calibration belongs to the loaded layout: the next `load_layout` clears it (the page offers the earlier corners
+  with one click, so ask again after a reload). Refusal codes: `no_layout`, `unknown_labware`,
+  `labware_not_in_slot`, `not_a_plate`, `not_covered_by_camera`, `no_slot_map`, `calibration_required`,
+  `camera_skipped`. It is not allowed during an emergency stop.
 - A capture of a mapped camera says per slot the `level` AHC measured: `unclear` (too blurry, covered, too
   small or mostly out of frame: judge nothing), `slot` (labware present, its type and liquid colour) or `well`
   (single wells). Judge only at that level, and look at the crops (`slots[].crop`). `map` is `unclear` when
@@ -236,15 +296,15 @@ decide: you prepare it, show it and wait.
   capture again; `state: needs_new_map` on a source: the camera moved, `map_camera` again) or `uncovered`.
   `physical_world_confidence.by_check` gives the same per check type with the sources and levels that cover
   it, `by_source` what each source observes and covers, `all_confident` whether every point is covered. There is no
-  numeric score. A point at level `well` also needs those wells inside the frame (a plate cut off at the top shows
-  rows D-H only). Use it to know what can be verified before you rely on an image; it gives no verdict.
+  numeric score. A point at level `well` on a plate also needs the plate calibrated (above) and those wells inside
+  the frame (a plate cut off at the top shows rows D-H only). Use it to know what can be verified before you rely on an image; it gives no verdict.
 - The digital twin (tracked volumes and tips) is not a source: it is the expectation that observations are
   compared with, and it never adds confidence.
 - Shadow mode, on real hardware: while a check waits for the person, look at the crops and call
   `propose_verdict(check_id, verdict="pass"|"fail"|"unclear", images=[...], per_point=[...])` before
   `record_verdict`. Images are required. It passes nothing: the person's verdict decides. AHC records whether
-  you agreed with them (per check type; a disagreement or `unclear` resets the streak, a changed slot map
-  resets all), which later decides how much the cameras may judge on their own. Say `unclear` when the
+  you agreed with them (per check type; a disagreement or `unclear` resets the streak, a new slot map from you
+  (`map_camera`) resets all; the person's own calibration keeps them), which later decides how much the cameras may judge on their own. Say `unclear` when the
   images cannot tell; never guess. The recovery checks after a stop, an unknown outcome or a restart stay
   with the person (`recovery_check`).
 
@@ -297,7 +357,8 @@ type, AUTO or why not.
   configured, `capture` the deck first. Tell the person what was running and report
   `waiting_for="person"`. AHC sends
   nothing more (on an OT-2 it also stops its run), but the robot may first finish the command it is
-  executing (a move, an aspirate, a pick-up): the robot's power switch is the immediate stop. When
+  executing (a move, an aspirate, a pick-up): the robot's power switch is the immediate stop. On a real STARlet
+  AHC's stop lets the command the instrument is running finish, and only its power switch stops motion at once. When
   `next` or `get_state.unknown` says the robot has not confirmed that its run stopped, it may still be
   moving: tell the person so. A call the stop cut short on real hardware has an unknown outcome, as
   above.

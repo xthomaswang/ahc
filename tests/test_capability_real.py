@@ -460,7 +460,8 @@ OPTION_REFUSALS = [
   (OT2Adapter, "sim", {"mounts": ["p300_single_gen2"]}, "bad_option"),
   (OT2Adapter, "sim", {"mounts": {"middle": "p300_single_gen2"}}, "bad_option"),
   (OT2Adapter, "robot", {"host": "10.0.0.5", "mounts": {"left": 300}}, "bad_option"),
-  (STARletAdapter, "usb", {}, "backend_not_implemented"),
+  (STARletAdapter, "usb", {}, "bridge_required"),
+  (STARletAdapter, "serial", {}, "backend_not_implemented"),
   (STARletAdapter, "sim", {"host": "10.0.0.5"}, "sim_options_refused"),
 ]
 
@@ -478,6 +479,7 @@ def test_entries_the_adapters_can_run():
   OT2Adapter.check_options("robot", {"host": "ot2-lab.local", "port": 31950, "robot_name": "lab-ot2"})
   OT2Adapter.check_options("sim", {})
   STARletAdapter.check_options("sim", {})
+  STARletAdapter.check_options("usb", {"bridge": "usb-host", "serial": "T0001"})
 
 
 # -- the event loop and the tip-rack definition ---------------------------------------------------

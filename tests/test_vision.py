@@ -12,7 +12,7 @@ from ahc.core.errors import LabError
 from ahc.vision import analyze, labware_geometry
 from ahc.workspace import CameraEntry, Config, DeviceEntry, parse_cameras, parse_config, parse_slot_map, slots_text
 from ahc.workspace.store import Workspace
-from vision_images import H, W, deck, jpeg, other_scene, slot_box
+from vision_images import H, W, deck, jpeg, other_scene, plate, plate_corners, slot_box
 
 PLATE = "Cor_96_wellplate_360ul_Fb"
 TROUGH = "nest_1_troughplate_195000uL_Vb"
@@ -195,9 +195,10 @@ class Layout:
   _items = staticmethod(__import__("ahc.core.layout", fromlist=["Layout"]).Layout._items)
 
 
-def analysis(tmp_path, reference, image=None, slots=None):
+def analysis(tmp_path, reference, image=None, slots=None, plates=("3", "8")):
+  """A capture analysed; `plates`: the slots whose plates the person calibrated (four clicked wells each)."""
   return analyze(capture(tmp_path, image if image is not None else deck()), smap(slots), reference,
-                 {"2": PLATE, "3": PLATE, "8": PLATE})
+                 {"2": PLATE, "3": PLATE, "8": PLATE}, plates={n: plate(int(n)) for n in plates})
 
 
 def test_points_are_derived_from_the_layout_and_the_agent_adds(tmp_path, reference):
@@ -275,10 +276,12 @@ def test_coverage_of_a_real_looking_deck(tmp_path, reference):
 def test_a_level_below_the_need_is_uncovered_and_everything_covered_says_so(tmp_path, reference):
   layout = Layout()
   small = {"2": [141.0, 371.0, 141 + 150.0, 371 + 101.0]}  # level slot only
-  cams = {"usb": {"map": smap(small), "analysis": analysis(tmp_path, reference, slots=small)}}
+  grid = {"2": {**plate(2), "corners": plate_corners(small["2"])}}  # the person clicked the wells of the small plate
+  seen = analyze(capture(tmp_path, deck()), smap(small), reference, {"2": PLATE}, plates=grid)
+  cams = {"usb": {"map": smap(small), "analysis": seen}}
   need_well = [{"what": "reagents:A1", "level": "well", "check": "liquid_present", "declared_by": "agent"}]
   [row] = covered(need_well, cams, layout)["points"]
-  assert row["status"] == "uncovered" and row["sources"][0]["level"] == "slot" and "the point needs well" in row["why"]
+  assert row["status"] == "uncovered" and row["sources"][0]["level"] == "slot" and "px apart" in row["why"]
   ok = covered([{"what": "slot:2", "level": "slot", "check": "deck_matches_layout", "declared_by": "derived"}], cams, layout)
   assert ok["physical_world_confidence"]["all_confident"] and by_check(ok) == {"deck_matches_layout": "covered"} and ok["suggestions"] == []
 

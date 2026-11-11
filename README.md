@@ -10,15 +10,16 @@ real hardware the agent must have no other way to the robot (see
 The repository is also a Claude Code plugin: install it, open Claude Code in a folder for a task,
 and ask for the lab work, any liquid handling the device can do.
 
-**Status: simulation only.** Two devices are supported, both simulated:
+**Status: simulation, plus first runs on real instruments.** Two devices are supported:
 
-- a Hamilton STARlet, through PyLabRobot's firmware-level simulator (a real one is planned over USB
-  from the Mac, as the optional extra `ahc[usb]`, after the OT-2);
-- an Opentrons OT-2, through Opentrons' own robot-server with a virtual motor controller.
+- a Hamilton STARlet, through PyLabRobot's firmware-level simulator, or a real one through a USB host
+  (backend `usb`, see [A real STARlet](#a-real-starlet-through-a-usb-host));
+- an Opentrons OT-2, through Opentrons' own robot-server with a virtual motor controller, or a real
+  robot (see [A real OT-2](#a-real-ot-2-bring-up)).
 
-Nothing here has run on a physical instrument yet. The path to a real OT-2 is in place and rehearsed
-against the simulator (see [A real OT-2](#a-real-ot-2-bring-up)); it is the first to be tried on
-hardware.
+Both real backends have had their first runs on an instrument, with a person on site: a dye dilution on
+an OT-2, and tips, transfers, the stop and the tip recovery on a STARlet. [Known limits](#known-limits)
+lists what has run on an instrument and what has not; everything else is checked in simulation only.
 
 ## How it works
 
@@ -45,7 +46,8 @@ hardware.
   - The emergency stop (dashboard button or `ahc-estop`) makes the server send nothing more and
     refuse every action until a person releases it. On an OT-2 it also stops AHC's run, but the
     robot first finishes the run command it is executing: the robot's power switch is the
-    immediate stop (see [Emergency stop](#emergency-stop)).
+    immediate stop. On a real STARlet the stop likewise lets a command already running finish, and the
+    instrument's power switch is the immediate stop (see [Emergency stop](#emergency-stop)).
 
 ## Install (Claude Code)
 
@@ -80,9 +82,22 @@ budgets:
    instead of the agent writing that state by hand. You confirm it at the deck check as any layout
    (`ask_person` lists the volumes and the empty and returned tip spots); with a top camera
    configured, `capture` can show you the plate there.
-4. The agent reports its plan as concrete steps. The server refuses `load_layout` and every action
-   until then; after that, every call names its plan step and the dashboard ticks each step as the
-   agent moves on.
+4. The agent reports its plan as concrete steps, with the deck it will load: `report_decision(plan=[...],
+   layout=...)`. The server refuses `load_layout` and every action until then; after that, every call
+   names its plan step and the dashboard ticks each step as the agent moves on. The layout is built on
+   a scratch deck with no device (a layout that cannot be built is refused, nothing recorded), so it
+   works before `load_layout`, on a real robot too, and it never contacts the robot. You set the deck
+   up by hand from the dashboard's **Deck setup** card: a top view as you stand in front of the robot
+   (front at the bottom, left on the left) with the slots, or the tracks, carriers and sites, each
+   labware's name, type, liquids and tip states, and well A1 marked. On the STARlet site 0 is a
+   carrier's front-most site, and each site also shows its VENUS position (VENUS counts from the
+   back). The card has two tabs, **Top view (2D)** and **3D live**: the 3D tab embeds PyLabRobot's viewer of
+   the same deck and follows the run. It is the digital twin (AHC's simulated state of the deck, not a camera
+   image), and says so on a real robot. The card is pinned and highlighted at the top until the deck check
+   passes, then stays in place; the 2D tab is the default until then, the 3D tab after, and your tab choice is
+   kept. The next `load_layout` with no layout loads it, once: a reload (after a stop or a
+   finished run) needs the deck reported again, e.g. `last_deck.layout` to continue from the last run's deck. A
+   different layout loads too, and the result lists `differs_from_preview`.
 5. `load_layout`, then `verify(check="deck_matches_layout")`: the motion gate. On a real robot you
    check every deck. In simulation the simulator checks it, but you confirm a layout whose deck
    placement (the labware type at each position, carriers included) matches none of the folder's
@@ -222,6 +237,15 @@ On a real robot:
   when and why; the person removes them by hand (or sees there are none), and the agent asks for
   their verdict on one check for both pipettes, `verify(check="tips_mounted", expect="none")`
   without a device. Their pass clears the note.
+- A STARlet's CO-RE tips did not come off by hand on the lab's instrument, and its emergency stop does
+  not cancel the command in flight, so a stop during a pick-up leaves tips on the channels.
+  `recover_tips` (a real STARlet only) puts them back into the rack spots they came from, or into the
+  tip waste when the config says `tip_waste: true`; the agent asks the person which first, and the
+  person's approval of the call is their go-ahead for the move. It opens a link of its own, never
+  initializes the instrument (that would eject the tips at the waste position) and works only while the
+  instrument still reports itself initialized. It clears no doubt: the person's tip check and
+  `load_layout` follow, with the returned spots as `tips_returned`. Its layout must be a deck this task
+  folder saved or ran (`layout_unknown` otherwise), because no deck check runs first.
 - `disconnect` lets go of the robot without an emergency stop, so the session, the dashboard and
   the run log stay up: it ends the run (`run_ended_confirmed` is the robot's own answer, not an
   assumption), closes the connection, notes tips still on a pipette as a restart does and logs it.
@@ -323,6 +347,68 @@ Run the `ahc-smoke` stages first, so the robot, the deck and your checks are kno
 agent chooses the calls. Other MCP clients reach the robot the same way: `ahc-mcp` without
 `--backend sim`, or with `--backend config`.
 
+## A real STARlet (through a USB host)
+
+macOS cannot enumerate a STARlet, so the instrument's USB cable goes to a USB host (a small Linux machine, e.g. a
+Raspberry Pi) and this computer reaches it over ssh with key login. AHC starts the bridge there for each session; it
+never opens the instrument from this computer.
+
+On the host, once:
+
+- Python 3.9 or newer with PyLabRobot at the commit pinned in this repository's `pyproject.toml`, installed with its
+  `usb` extra (for example in `~/ahc/.venv`);
+- a udev rule that lets the user the bridge runs as open the instrument (vendor `08af`, product `8000`);
+- `src/ahc/devices/hamilton/star_bridge.py` copied to `~/ahc/star_bridge.py`: one file, standard library only until USB
+  is opened. Other places go in the entry as `bridge_python` and `bridge_script`.
+
+The task folder's config entry (the agent writes it with `configure_devices` and you confirm it):
+
+```yaml
+devices:
+  - id: starlet
+    model: hamilton.starlet
+    backend: usb
+    options:
+      bridge: usb-host        # the host's ssh name (ssh config entry, or user@host); you give it, never the agent
+      # serial: T0001         # read from the instrument by configure_devices; you confirm it
+      # tip_waste: true       # only if a tip waste is fitted: otherwise tips go back to their rack
+      # channel_spacing_mm: 9 # only if you state that the channels can sit that close (see below)
+```
+
+`configure_devices` reads the serial and the instrument's state with reads only (the bridge is never armed), and the
+summary you confirm names the serial and the host. The first `load_layout` of a session (and the first after a stop,
+an error or a disconnect) initializes the instrument: its channels, 96-head, iSWAP and autoload all move, so hands and
+deck must be clear when you approve it; a tip sensed on a channel refuses the load first. After a stop, a lost link or a
+failed command you check the channels for tips before the next load. Tips go back to their rack unless the confirmed
+config says `tip_waste: true`.
+
+Two things found on the instrument:
+
+- **Channel spacing.** AHC plans with the width each channel reports. The lab's channels report about 18 mm, so a
+  column of 8 went one channel at a time (274 s for a pick-up, a 50 uL transfer and the return), although the
+  channels do take a column at a plate's 9 mm. With `channel_spacing_mm: 9`, stated by the person on site and
+  confirmed with the config, the same column runs with all 8 channels at once (40 s). AHC refuses a value below the
+  minimum pitch the instrument's master reports.
+- **The 96 head at initialization.** The initialization ejects tips from the 96 head at its waste position. With
+  PyLabRobot's default position the head, lowered there, touched the edge of the waste box at the left of the deck
+  (lightly: no error, nothing bent). AHC now sends the head to its waste position at its travel height and does not
+  lower it. That change has not run on the instrument yet: watch the head at the first initialization after a
+  power-on, with a hand on the power switch.
+
+There are two ways to stop a real STARlet. AHC's stop (the dashboard button or `ahc-estop`) keeps AHC from sending
+anything more and tells the bridge to disarm; a command the instrument is already running finishes, because no firmware
+command aborts one in flight. The instrument's power switch is the only thing that stops motion at once. After the
+power switch the link is lost and the outcome is unknown: you check the channels for tips and confirm they are off, and
+only then does a new `load_layout` run (it refuses to initialize while the tip sensor reports tips).
+
+Tips left on the channels did not come off by hand on the lab's instrument. While the instrument still reports itself
+initialized (after AHC's stop, not after the power switch), `recover_tips` puts them back into their rack or into the
+tip waste (its rules are in the list under [A real OT-2](#a-real-ot-2-bring-up)). After a power-off AHC has no way to
+take them off: they come off outside AHC, for example with the vendor's software.
+
+`~/ahc/.venv/bin/python ~/ahc/star_bridge.py status` shows whether a bridge is serving. Runs on an instrument need a
+person at the power switch.
+
 ## Cameras (opt-in)
 
 A task can declare cameras in `.ahc/config.yaml`; with none declared nothing of this is active. They are
@@ -332,7 +418,20 @@ part of the config the person confirms (a change sends it back to pending):
 cameras:
   - {name: top, device: "USB Camera"}       # name: lowercase id; device: the exact macOS camera name
   - {name: side, device: "Intel(R) RealSense(TM) Depth Camera 435 with RGB Module RGB"}
+  - {name: deck, source: robot, device: ot2}   # the OT-2's own built-in camera (see below)
 ```
+
+A camera's `source` is `mac` (the default, left out of the file: a camera plugged into this Mac, `device` is
+its macOS name) or `robot`: the OT-2's built-in camera, with `device` the id of a configured OT-2 on real
+hardware (`config_invalid` otherwise). A picture from it is asked of the robot's own server (`GET /camera`,
+then `POST /camera/picture`, 640 x 480, about 3 s, the same address and version header as the commands, a 15 s
+timeout). The camera must be turned on in the Opentrons App: a camera that is off is a capture error
+`camera_disabled` (AHC never writes the robot's settings). No picture is taken while a call that moves the robot
+runs: `capture` waits for it to end (30 s, then `robot_busy`), and a picture taken across the start of a motion is
+thrown away. Any failure of it is a capture error, never a device error. The source is part of the confirm summary
+and the digest. A USB camera cannot be read through the robot: plug it into the Mac. `map_camera`, slot maps,
+the vision analysis, shadow judgments and auto-verify work on it as on any camera (a 640 px picture often limits
+the points to slot level).
 
 The agent writes them with `configure_devices(cameras=[...])` (omitted: the config's cameras stay; `[]`
 removes them) after the person says which camera is which. Each name is checked against the AVFoundation
@@ -360,7 +459,26 @@ records the verdict. Notes:
   (`hooks/estop-guard.sh`) lets it through, with the other calls that only look or report (see
   [Emergency stop](#emergency-stop)), and denies every other call, which ends the agent's turn.
 - Images stay on this computer, unmasked and never uploaded by AHC; the client shows them to its model.
-- macOS asks once whether the terminal (or Claude Code) may use the camera.
+- macOS asks once whether the terminal (or Claude Code) may use the camera: the process running the server, so
+  the terminal app that started Claude Code.
+
+### Live camera view
+
+The dashboard that the AHC server serves (`open_dashboard`, the control and the view-only page) has a
+**Cameras** tab in the Deck setup card (Top view (2D) | 3D live | Cameras) when the config has cameras: one
+panel per camera with its latest frame, its age ("3 s ago"), its status (live, paused while the robot moves, or the
+error) and a "slot boxes" toggle that draws the camera's slot map over the frame. Frames are produced only
+while a page asks for them (the tab is visible and the browser tab is in front): about one a second from a Mac
+camera (at most 1280 px wide), one every 5 s from the robot's camera (never while a motion call runs); the
+server stops a camera about 30 s after the last ask. A Mac camera's live view is one persistent ffmpeg per device;
+`capture` and `map_camera` take the next frame newer than the request, and than the last motion, from it instead of
+opening the device a second time, and with no live view they open it as before, so a live view never makes a
+capture fail with "device busy". The robot's camera has one request in flight at a time, shared by the view and
+capture. Live frames are for the person only: kept in memory, never written under `.ahc/runs`, never evidence
+(`verify`, `propose_verdict` and `agent_verdict` take capture files), served on 127.0.0.1 to the page only
+(Host and Origin checked, like the reference images) and also during an emergency stop. Like capture, it needs
+real hardware: in simulation the tab says so. The standalone `ahc-dashboard` has no live frames and says that
+they come from the server's own dashboard.
 
 ### Slot maps and the physical world context
 
@@ -374,9 +492,8 @@ Nobody writes it by hand:
   which is written to the config (pending until the person confirms it) and drawn on the reference to check.
   A box may reach past the frame (a plate cut off at the edge); `view="side"` marks a side camera (levels stop
   at `slot`); a close-up region for tips is `tips:<component>`.
-- The dashboard's control page shows each reference with its boxes: the person drags corners (resize) or the
-  body (move) and saves, which writes the config and sends it back to pending. The view-only page shows the
-  overlay without handles. Saving needs the page's own token, like a release.
+- The person calibrates the boxes on the calibration page (below), not on the run page. Deck setup > Cameras on
+  the run page shows each camera live, and the physical world context under it.
 
 Every capture of a mapped camera is aligned to the reference (ORB features, RANSAC homography) and each
 slot's crop is measured, by AHC and never self-reported. A capture's `images[].slots` has per slot: the
@@ -386,6 +503,51 @@ can be judged, `well`: single wells can be resolved, `tip` for a tips region), `
 captures; see `src/ahc/vision.py`): frame sharpness at least 12, slot crop sharpness at least 6, at least
 half the box inside the frame, 0.8 px/mm for a slot, 20 px per well for `well`, 40 aligned features; a frame
 out of focus or covered is `unclear`, a camera that no longer aligns `needs_new_map`.
+
+### Calibration (the person's page, `/calibration`)
+
+With cameras configured on a real robot, `load_layout` is refused (`calibration_required`) until the person has
+dealt with every camera in this server session: boxes saved (calibrated), "Still right" (confirmed), or skipped.
+Nothing changes without cameras or in simulation. The page belongs to the dashboard the AHC server process serves
+(`open_dashboard`), behind the same Host/Origin checks and token as the stop and release buttons, and carries the
+EMERGENCY STOP bar. While a camera waits for the person, `/` of the control dashboard redirects to `/calibration`
+(`/?page=run` is the run page), `open_dashboard` opens that page and says so, and `lab_overview.calibration` gives
+per camera its state, the page and the next step. The view-only dashboard is never redirected and says only that
+calibration is in progress; the standalone `ahc-dashboard` has no calibration page.
+
+- A camera with no slot map first needs the agent's `map_camera`; the person can also skip it.
+- The page takes a fresh frame of the camera (`Lab.snapshot`, not a capture and not evidence) and compares it with
+  the camera's reference image with the same ORB alignment the captures use: "camera has not moved", "camera
+  moved about N px" (the saved boxes are drawn where the deck is now) or "could not compare" (a warning, never a
+  block). "Still right" is one click; otherwise the person drags the boxes (corners resize, the body moves) and
+  saves. A save makes the fresh frame the camera's reference image and writes the config, which is pending until
+  `confirm_config`; the agent's track record in `vision_record.json` moves to the new maps digest and is kept.
+- "Still right" and "Skip" are per session and not config: they keep the config digest (no dialog). A skipped
+  camera still takes photos with `capture` but gets no analysis and contributes no coverage to
+  `physical_world_context`, and auto-verify depends only on the cameras that are calibrated. A new slot map from the
+  agent (`map_camera`) makes the camera pending again.
+- Every calibration action drops the last `physical_world_context` and the camera's analysis of its latest
+  capture: auto-verify is off, with the reason on the dashboard's auto state, in `lab_overview` and in capture
+  results, until the agent runs `physical_world_context` again and everything is covered.
+
+Plate calibration: after `load_layout` the agent can ask the person to calibrate a plate or rack that sits in a slot
+a calibrated camera's boxes cover, with `request_plate_calibration(labware, camera, why, plan_step)` (refused with
+`no_layout`, `unknown_labware`, `labware_not_in_slot`, `not_a_plate`, `not_covered_by_camera`, `no_slot_map`,
+`calibration_required`, `camera_skipped`; not allowed during an emergency stop; motion is not held). The page shows
+the request with the agent's reason. The person clicks four wells in order, A1, A12, H1, H12 on a 96-well plate
+(generally A1, the last column of row A, the first column of the last row, the last well; the next one is named in
+the hint), a perspective transform (`cv2.getPerspectiveTransform`) gives every well's centre and a radius, and the
+grid is drawn over the picture; the four points can be dragged and the grid follows. The click order fixes A1, so a
+rotated plate works; a mirrored order is refused. The corners are kept in the camera's reference pixels. A
+calibrated plate's well-level points (`liquid_present`, `plate:B1:B8` at level `well`) use the grid's positions and
+well radius and the 20 px per well gate (on the grid's pitch); until then they stay uncovered, and
+`physical_world_context.plate_calibration` says which plates are calibrated and which wait for the person. A plate
+calibration belongs to the loaded layout: it is stored with it (run log entries `type: calibration`,
+`.ahc/state/plate_calibration.json`) and cleared by the next successful `load_layout`; after a reload the page
+offers the earlier corners over a fresh frame with one-click "Still right" (it counts as done). It is not config.
+
+State: `.ahc/state/calibration.json` (this server's cameras and plates, with its pid, for the dashboard) and
+`.ahc/state/plate_calibration.json`. Per-session calibration never enters the config digest.
 
 `physical_world_context()` is the umbrella for what AHC can observe of the real deck. It is built from independent
 context sources, each reporting per verification point whether it can observe the point, at what level and how
@@ -402,7 +564,7 @@ compared with, and they never add confidence.
 
 Once a plan is reported and a layout is loaded the run has verification points: every layout slot at level `slot`
 for `deck_matches_layout`, the targets the agent declares with `report_decision(vision_points=[...])` at level
-`well` for `liquid_present`, and `tips:<pipette>` at level `tip` for `tips_mounted` (uncovered until a camera maps
+`well` for `liquid_present` (on a plate or rack only once the person calibrated it), and `tips:<pipette>` at level `tip` for `tips_mounted` (uncovered until a camera maps
 such a region or the instrument senses tips). The tool returns:
 
 ```json
@@ -428,7 +590,8 @@ context" section show the per-source breakdown and the confidence per check type
 On real hardware, while a check waits for the person, the agent may call `propose_verdict(check_id, verdict,
 images, per_point)` (shadow mode: it passes nothing). When the person's verdict arrives AHC records, per check
 type, in `.ahc/state/vision_record.json` whether the two agreed (`agree_streak`, `total`, `disagreements`);
-a disagreement or an unclear judgment resets the streak, and any change of a slot map resets every streak.
+a disagreement or an unclear judgment resets the streak, and any change of a slot map by the agent (`map_camera`)
+resets every streak (the person's own calibration on the dashboard keeps them).
 
 ### Auto-verify (opt-in, per check type)
 
@@ -498,8 +661,11 @@ your control page, and each kind is reused only by its own kind. Captures are no
 dashboard, so there is nothing to hide there.
 
 Concentrations are the digital twin's estimate (complete mixing; liquid behind a `stock` alias
-= 1), not measurements. `AHC_VIEW=1 claude` also opens a live 3D view of the device when the agent
-loads a layout.
+= 1), not measurements. The dashboard's Deck setup card embeds a live 3D view of the deck (its **3D live** tab) in simulation and on
+real hardware: `open_dashboard` starts it on free local ports, with no extra browser tab, and the standalone
+`ahc-dashboard` finds it through `.ahc/state/view.json` (the link, the server's pid; removed when the server
+stops, ignored once the pid is gone). If the viewer cannot start the tab says why and the rest works.
+`--view` (or `AHC_VIEW=1 claude`) also opens the viewer in its own browser tab when the agent loads a layout.
 
 In Claude Code the agent panel updates live. The plugin's hooks add what the agent was asked, what
 it says, which tool it is calling and its final answer, from its first AHC call on. They copy that
@@ -552,7 +718,9 @@ device with its robot name or none, whether a run was active, and `halt`: `stopp
   (`other_run_active`).
 - A call the stop cut short on real hardware has an unknown outcome: the person checks the tips and
   the wells.
-- On the simulated STARlet the stop ends the call in the simulator.
+- On the simulated STARlet the stop ends the call in the simulator. On a real STARlet nothing more is sent and the
+  command in flight finishes: the instrument's power switch is the only thing that stops motion at once (see
+  [A real STARlet](#a-real-starlet-through-a-usb-host)). The dashboard's stop bar shows that line under the button.
 
 Releasing is the person's: the dashboard's Release, after a confirmation, or
 `uv run --project <repo> ahc-estop --release`
@@ -608,9 +776,18 @@ OT-2 simulator; when nothing answers there, the run fails instead of skipping th
 
 ## Known limits
 
-- **Not yet run on a physical instrument.** The OT-2's real path is rehearsed against the simulator
-  only. The STARlet is simulated only: its real backend, USB from the Mac as the optional extra
-  `ahc[usb]`, comes after the OT-2's bring-up and is not implemented yet.
+- **First runs only on real instruments.** Each of these ran once or a few times, on one instrument, with a person on
+  site; none is a validation.
+  - OT-2 (2026-10-29): a dye dilution with tips, aspirate, dispense, mix and both ways of dropping tips, the person's
+    deck, tip and liquid checks, camera captures, and the stop from the dashboard.
+  - STARlet (2026-11-11; 8 channels, 300 uL tips, water): the read-only connect, the initialization, the person's
+    deck, tip and liquid checks, a pick-up, a 50 uL transfer and the return of the tips one channel at a time and
+    then with 8 channels at once (`channel_spacing_mm: 9`), the stop during a column's pick-up (the command in flight
+    finished and the tips stayed on), `recover_tips` back into the rack, and the load after it.
+  - Not yet on a STARlet: a dilution series, `mix`, an initialization with the 96 head's new waste position (see
+    [A real STARlet](#a-real-starlet-through-a-usb-host)), a tip waste (`tip_waste: true`, `drop_tips` and
+    `recover_tips` with `mode='discard'`), a stop with liquid in the tips, and the power switch during a command.
+  - Volumes are what was sent, not measured, on both.
 - **The OT-2 stop does not interrupt a run command in flight** (see above); the power switch does.
 - **`load_layout` homes the OT-2 before the person checks the deck.**
 - **Plans and checks live in the server's memory.** A new server session (a new Claude Code session,

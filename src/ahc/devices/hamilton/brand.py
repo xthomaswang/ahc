@@ -52,6 +52,19 @@ class HamiltonAdapter(Adapter):
     for name in ("send_command", "send_raw_command"):
       setattr(driver, name, _counting(getattr(driver, name), count))
 
+  async def preview_layout(self, layout: dict[str, Any]) -> tuple[Layout, Any]:
+    deck = plr.STARLetDeck()  # a scratch deck: no STAR, no driver
+    try:
+      built = self._build_deck(deck, layout)
+    except LabError:
+      raise
+    except Exception as exc:  # noqa: BLE001 - a malformed layout (a missing key, a wrong type) is the agent's to fix
+      raise LabError("bad_layout", f"the layout could not be built: {type(exc).__name__}: {exc}",
+                     "A Hamilton layout has carriers (type, track, name, sites) and optionally liquids, aliases, "
+                     "tips_empty and tips_returned.") from exc
+    built.record_placements()
+    return built, deck
+
   def _build_deck(self, deck: Any, layout: dict[str, Any]) -> Layout:
     rules = self.spec.layout
     keys = {"carriers", "liquids", "aliases", "tips_empty", "tips_returned"}
@@ -61,6 +74,7 @@ class HamiltonAdapter(Adapter):
                      "tips_empty and tips_returned.")
     out = Layout(self.spec, kind="tracks")
     out.declared = copy.deepcopy(layout)
+    out.deck = deck
     lo, hi = rules["tracks"]["min"], rules["tracks"]["max"]
     for carrier in layout.get("carriers", []):
       kind, track, name = carrier.get("type"), carrier.get("track"), carrier.get("name")

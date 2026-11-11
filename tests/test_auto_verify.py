@@ -14,7 +14,7 @@ from ahc.viz.dashboard import replay, serve
 from ahc.workspace import AutoVerify, CameraEntry, Config, DeviceEntry, estop, parse_auto_verify, parse_config
 from ahc.workspace.config import HEADER
 from ahc.workspace.store import Workspace
-from conftest import confirm_as_person, load_verified, robot_entry
+from conftest import calibrate_plate, confirm_as_person, load_verified, robot_entry
 from test_dashboard import _http
 from test_vision_tools import BOXES, TOP, USB, FakeCameras, camera, home, mapped_lab  # noqa: F401 - fixtures
 from vision_images import deck, jpeg, other_scene
@@ -36,9 +36,12 @@ async def authorise(lab, bot, auto=BOTH):
   await confirm_as_person(lab)
 
 
-async def ready(lab):
+async def ready(lab, plate=True):
   await lab.call("report_decision", decision="Plan", plan=PLAN, vision_points=POINTS)
   await load_verified(lab, layout=OT2_LAYOUT, plan_step=1)
+  if plate:
+    await calibrate_plate(lab, "reagents")  # single wells (liquid_present) need the person's four clicks on the plate
+  await lab.call("physical_world_context")  # a calibration turns auto off until the agent checks what the cameras cover again
 
 
 async def liquid(lab, step=2):

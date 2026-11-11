@@ -106,6 +106,7 @@ class Layout:
     self.returned: set[str] = set()  # spots holding a returned tip: never "next fresh" again
     self.tip_states: dict[str, dict[str, list[str]]] = {}  # rack -> {"empty": [spot ids], "returned": [...]} as loaded
     self.declared: dict[str, Any] | None = None  # the layout as load_layout was given it
+    self.deck: Any = None  # the PyLabRobot deck the labware sits on (a scratch one for a preview)
 
   def add(self, name: str, resource: Any, type_name: str) -> None:
     if name in self.labware:
@@ -332,15 +333,19 @@ class Layout:
         out[name] = {"kind": "container", "max_ul": res.max_volume}
     return out
 
+  def position(self, name: str) -> str:
+    """Where a labware sits, as a sentence part: 'slot 3', or 'plates site 0' (carrier name, site index)."""
+    parent = (getattr(self, "placements", {}).get(name) or {}).get("parent") or ""
+    slot = re.search(r"slot_(\d+)$", parent)
+    site = re.fullmatch(r"(.+)-(\d+)", parent)
+    return f"slot {slot.group(1)}" if slot else f"{site.group(1)} site {site.group(2)}" if site else parent
+
   def describe(self) -> str:
     """The loaded deck as one sentence for the person: where each labware sits, its type and name, the starting
     liquids in its wells (volumes per well, wells in runs like A1-H1) and the tip spots that are not fresh."""
     parts = []
     for name, type_name in self.types.items():
-      parent = (getattr(self, "placements", {}).get(name) or {}).get("parent") or ""
-      slot = re.search(r"slot_(\d+)$", parent)
-      site = re.fullmatch(r"(.+)-(\d+)", parent)
-      where = f"slot {slot.group(1)}" if slot else f"{site.group(1)} site {site.group(2)}" if site else parent
+      where = self.position(name)
       text = f"{name} ({type_name})"
       held = self._liquids_of(name)
       states = self.tip_states.get(name) or {}
@@ -354,18 +359,50 @@ class Layout:
     """Wells or spots as ranges: ['B1', 'C1', 'A2'] -> ['B1-C1', 'A2'] (see well_runs)."""
     return [run[0] if len(run) == 1 else f"{run[0]}-{run[-1]}" for run in well_runs(wells)]
 
-  def _liquids_of(self, labware: str) -> str:
-    """'A1-H1 1800 uL, A2-H2 500 uL': the starting liquids of one labware, wells grouped by volume and column."""
+  def liquid_groups(self, labware: str) -> list[tuple[list[str], float]]:
+    """The starting liquids of one labware as (wells, volume per well) groups, wells in column order; a single
+    container (a trough) has no wells: ([], volume)."""
     by_volume: dict[float, list[str]] = {}
     for container, volume in self.liquids.items():
       well = container.removeprefix(f"{labware}_well_") if container.startswith(f"{labware}_well_") else None
       if well is not None or container == labware:
         by_volume.setdefault(volume, []).append(well or "")
+    return [([w for w in wells if w], volume) for volume, wells in by_volume.items()]
+
+  def _liquids_of(self, labware: str) -> str:
+    """'A1-H1 1800 uL, A2-H2 500 uL': the starting liquids of one labware, wells grouped by volume and column."""
     out = []
-    for volume, wells in by_volume.items():
-      names = self._runs([w for w in wells if w])
+    for wells, volume in self.liquid_groups(labware):
+      names = self._runs(wells)
       out.append((", ".join(names) + " " if names else "") + f"{volume:g} uL")
     return ", ".join(out)
+
+  def differences_from(self, planned: Layout) -> list[str]:
+    """How this (loaded) layout differs from a planned one, labware by labware: what sits where, the starting
+    liquids, the tip spots that are not fresh and the aliases. Empty when the two describe the same deck."""
+    out = []
+    for name in sorted(set(planned.types) | set(self.types)):
+      if name not in self.types:
+        out.append(f"{name}: planned at {planned.position(name)} ({planned.types[name]}), not in the loaded layout")
+        continue
+      if name not in planned.types:
+        out.append(f"{name}: not in the plan, loaded at {self.position(name)} ({self.types[name]})")
+        continue
+      for what, mine, theirs in (("placed", f"{self.position(name)} ({self.types[name]})",
+                                  f"{planned.position(name)} ({planned.types[name]})"),
+                                 ("liquids", self._liquids_of(name) or "none", planned._liquids_of(name) or "none"),
+                                 ("tips", self._tips_of(name), planned._tips_of(name))):
+        if mine != theirs:
+          out.append(f"{name} ({what}): planned {theirs}, loaded {mine}")
+    if self.aliases != planned.aliases:
+      out.append("aliases differ from the plan's")
+    return out
+
+  def _tips_of(self, labware: str) -> str:
+    """'empty B1-H1; returned A2' (tip spots that are not fresh), or 'all fresh'."""
+    states = self.tip_states.get(labware) or {}
+    return "; ".join(f"{state} {', '.join(self._runs(states[state]))}" for state in ("empty", "returned")
+                     if states.get(state)) or "all fresh"
 
   def summary(self) -> dict[str, Any]:
     return {

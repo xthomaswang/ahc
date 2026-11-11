@@ -14,7 +14,7 @@ import pytest
 from ahc import cameras as cams
 from ahc.examples import OT2_LAYOUT
 from ahc.workspace import estop
-from conftest import confirm_as_person, load_verified, robot_entry
+from conftest import calibrate_plate, confirm_as_person, load_verified, robot_entry
 from vision_images import H, W, deck, jpeg, other_scene, slot_box
 
 pytestmark = pytest.mark.anyio
@@ -241,10 +241,17 @@ async def test_coverage_needs_a_plan_and_a_layout_then_lists_the_points(tmp_path
     assert empty["points"] == [] and "load_layout" in empty["note"] and len(camera.captures()) == taken  # nothing to check yet
     assert empty["instrument_context"]["note"] == "OT-2: no tip or liquid sensors" and not empty["physical_world_confidence"]["all_confident"]
     await ready(lab)
+    before = await lab.call("physical_world_context")
+    assert len(camera.captures()) == taken + 1
+    unclicked = {(p["what"], p["check"]): p for p in before["points"]}[("plate:B1:B8", "liquid_present")]
+    assert unclicked["status"] == "uncovered" and "calibrates the plate" in unclicked["why"]  # single wells need the person's four clicks
+    await calibrate_plate(lab, "plate")
     first = await lab.call("physical_world_context")
-    assert set(first) == {"vision_context", "instrument_context", "points", "physical_world_confidence", "suggestions", "checked_at"}
+    assert set(first) == {"vision_context", "instrument_context", "points", "physical_world_confidence", "suggestions", "checked_at",
+                          "plate_calibration"}
+    assert first["plate_calibration"] == {"plate": {"state": "calibrated", "camera": "usb", "slot": "3"}}
     rows = {(p["what"], p["check"]): p for p in first["points"]}
-    assert len(camera.captures()) == taken + 1 and first["vision_context"]["cameras"]["usb"]["status"] == "ok"
+    assert len(camera.captures()) == taken + 3 and first["vision_context"]["cameras"]["usb"]["status"] == "ok"
     assert first["vision_context"]["cameras"]["usb"]["fresh"] is True
     # OT2_LAYOUT: slots 1 and 4 tip racks, 2 reagents, 3 plate; the map sees slots 1-4
     for slot in ("slot:1", "slot:2", "slot:3", "slot:4"):

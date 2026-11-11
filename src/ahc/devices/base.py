@@ -18,12 +18,48 @@ from ahc.core.errors import LabError
 from ahc.core.layout import Layout
 
 
+def unknown_text(unknown: dict[str, Any]) -> str:
+  """What an unknown-outcome record says: the call whose outcome on the device is unknown, or the record's own
+  sentence ("says") when it is not about one call (a link that was lost)."""
+  return unknown.get("says") or f"the outcome of {unknown['op']} on the device is unknown ({unknown['error']})"
+
+
 class Adapter(ABC):
   # The options a device entry may set, per backend; anything else is refused before the person confirms it.
   OPTIONS: dict[str, frozenset[str]] = {}
   # uL/s a mix runs at when the call gives no flow rate, if the adapter chooses it (then it is recorded);
   # None: the device's own default.
   MIX_FLOW_RATE: float | None = None
+  # The option that pins which real device an entry means, and the field of probe_identity()'s answer it is read from:
+  # configure_devices fills the option from the device itself, the person confirms it, and a device that answers with
+  # another value is refused (wrong_robot). A robot is pinned by its name, a Hamilton instrument by its serial.
+  IDENTITY_OPTION = "robot_name"
+  IDENTITY_FIELD = "name"
+  # What load_layout does to a real device before anything else, as the person is told when they approve it ("load_layout
+  # <this> next").
+  LOAD_MOVES = "homes the robot"
+  # What the person's approval before load_layout also means ("approving also means <this>").
+  LOAD_NEEDS = "hands and deck are clear"
+  # What a stop did once halt() returned True, for the stop's acknowledgement and the run log.
+  HALTED = "the robot accepted the stop and its run reports stopped; the command in flight may have finished first"
+  # What the person is told about a real device, in the device's own words. Each default is the robot's wording.
+  IDENTITY_SAYS = "name, serial, software, the pipette on each mount"  # what configure_devices read, for them to confirm
+  PROBE_NEEDS = ("configure_devices reads the robot's name and pipettes before it writes the config, so the robot must "
+                 "be on and reachable; ask the person.")  # appended to a probe that found nothing to read
+  STOPPED = "The emergency stop stopped the robot's run"  # the stop reached the device and it is stopped
+  STOP_UNCONFIRMED = ("The emergency stop was sent to the robot, which has not confirmed that its run stopped: it may "
+                      "still be executing its last command, and the power switch is the immediate stop")
+  # Whether the device forgets which tips are on once its run stops (a robot's run does; an instrument's channels hold
+  # what they hold), which decides how a stop is explained to the person.
+  FORGETS_TIPS = True
+  # How disconnect answers when no run was open on a real device, or None for the server's own sentences.
+  LET_GO: str | None = None
+  # Whether the device takes one connection at a time: a second one (configure_devices reading its identity) is refused
+  # while this server holds a link, so the server asks the bound adapter instead.
+  EXCLUSIVE_LINK = False
+  # What the overview adds about the emergency stop on a real device.
+  STOP_NOTE = ("On a real OT-2 it ends AHC's run, but the robot first finishes the command it is executing (a move, an "
+               "aspirate, a pick-up); the power switch is the immediate stop.")
 
   def __init__(self, spec: DeviceSpec, backend: str, options: dict[str, Any]):
     if backend not in spec.backends:
@@ -76,6 +112,40 @@ class Adapter(ABC):
     Blocking (async callers use a thread); {} when there is nothing to probe."""
     return {}
 
+  @classmethod
+  def check_identity(cls, identity: dict[str, Any], options: dict[str, Any]) -> None:
+    """Refuse (wrong_robot) an identity that is not the device the entry is pinned to. The default checks nothing: the
+    server compares a robot's name itself."""
+
+  @classmethod
+  def pinned(cls, options: dict[str, Any]) -> str | None:
+    """The device a real entry is pinned to (the robot's name, the instrument's serial); None while it names none."""
+    value = options.get(cls.IDENTITY_OPTION) if isinstance(options, dict) else None
+    return str(value) if value else None
+
+  @classmethod
+  def describe_entry(cls, options: dict[str, Any]) -> str:
+    """How the confirm summary names a real entry's device, after "<id> = <model>, backend <backend>": which device,
+    where it is reached, and anything else about it the person confirms. Starts with ", ". Never raises."""
+    name = cls.pinned(options)
+    return f", device {name!r}" if name else ", device (not identified)"
+
+  @classmethod
+  def named(cls, entry_id: str, model: str, options: dict[str, Any]) -> str:
+    """A real entry's device as a sentence names it: the one it is pinned to, else the entry's id and model."""
+    pinned = cls.pinned(options)
+    return repr(pinned) if pinned else f"{entry_id} ({model})"
+
+  @classmethod
+  def go_ahead_why(cls, named: str) -> str:
+    """Why the person's go-ahead is needed before a real device is driven; `named` is what named() returned."""
+    return f"the real robot {named} homes on load_layout"
+
+  def reaches(self, options: dict[str, Any]) -> bool:
+    """Whether an entry's options reach the same place as this adapter's (the same USB host, the same address), for a
+    device that takes one connection at a time (EXCLUSIVE_LINK)."""
+    return False
+
   def identity(self) -> dict[str, Any]:
     """What the device says it is (name, serial, software), for the run log; {} if it cannot say."""
     return {}
@@ -90,8 +160,14 @@ class Adapter(ABC):
     read back after a call whose outcome is unknown; None when the device keeps none. Blocking."""
     return None
 
-  async def halt(self) -> bool:
-    """The emergency stop: stop the device itself, if it has a stop this adapter can reach. False if not."""
+  @property
+  def has_stop(self) -> bool:
+    """Whether halt() can reach a stop on this device. False: the emergency stop only keeps AHC from sending more."""
+    return type(self).halt is not Adapter.halt
+
+  async def halt(self, stop: dict[str, Any] | None = None) -> bool:
+    """The emergency stop: stop the device itself, if it has a stop this adapter can reach. False if not.
+    stop: the stop's record (its id among others), for a device that keeps the stop under that id."""
     return False
 
   async def run_ended(self, run_id: str | None) -> bool | None:
@@ -119,8 +195,7 @@ class Adapter(ABC):
     if self.outcome_unknown:
       unknown = self.outcome_unknown
       raise LabError("completion_unknown",
-                     f"the outcome of {unknown['op']} on the device is unknown ({unknown['error']}); nothing moves "
-                     "until the layout is loaded again.",
+                     f"{unknown_text(unknown)}; nothing moves until the layout is loaded again.",
                      "Stop and tell the person: they check the tips and wells; then load_layout again with the "
                      "volumes they report.")
 
@@ -153,6 +228,12 @@ class Adapter(ABC):
 
   @abstractmethod
   async def load_layout(self, layout: dict[str, Any]) -> Layout: ...
+
+  async def preview_layout(self, layout: dict[str, Any]) -> tuple[Layout, Any]:
+    """The deck a layout describes, built on a scratch PyLabRobot deck, for the person to set up by hand before
+    load_layout: (the Layout, its deck). Touches no device: no backend, no run, no request to a robot, and it
+    changes nothing this adapter holds (self.layout stays). Refused with the same LabError load_layout gives."""
+    raise LabError("not_supported", f"{self.spec.model} cannot preview a layout.")
 
   # -- state ----------------------------------------------------------------------------------
 
@@ -188,6 +269,22 @@ class Adapter(ABC):
   @abstractmethod
   async def drop_tips(self, comp: Component, mode: str) -> str | None: ...
 
+  # -- recovery -------------------------------------------------------------------------------
+
+  def recovers_tips(self) -> bool:
+    """Whether recover_tips() can put tips left on the channels (after a stop, say) back or into the waste, with no
+    person pulling them off by hand. False: the person removes them."""
+    return False
+
+  async def recover_tips(self, comp: Component, layout: dict[str, Any], mode: str,
+                         target: str | None) -> dict[str, Any]:
+    """Return ('return': back into the spots `target` names, which they were picked up from) or discard ('discard': into
+    the tip waste) the tips on the channels, on a fresh link and a scratch deck built from `layout`, and let go of the
+    link. Returns what was sensed and moved. Refuses with a LabError when it cannot do so safely."""
+    raise LabError("recovery_not_supported", f"{self.spec.model} has no tip recovery.",
+                   "The person removes the tips by hand, then verify(check='tips_mounted', expect='none') and "
+                   "record_verdict.")
+
   # -- model-only operations and sensors ------------------------------------------------------
 
   async def invoke(self, comp: Component, op: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -196,6 +293,11 @@ class Adapter(ABC):
   def view_root(self):
     """The resource a live 3D view should draw, or None before a layout is loaded."""
     return None
+
+  def preview_root(self, deck):
+    """The resource a live 3D view should draw for a previewed (scratch) deck: sized as view_root() sizes the
+    device's, so swapping the device in at load_layout fits the same view."""
+    return deck
 
   async def sense(self, comp: Component, check: str) -> dict[str, Any] | None:
     """Readings from the instrument's own sensors for a check, or None when it has none."""

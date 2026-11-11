@@ -32,7 +32,7 @@ class Refused(Exception):
 
 
 # The tools that name their plan step (the server refuses them before a plan is reported).
-PLAN_TOOLS = {"load_layout", "verify", "pick_up_tips", "aspirate", "dispense", "mix", "drop_tips", "invoke"}
+PLAN_TOOLS = {"load_layout", "verify", "pick_up_tips", "aspirate", "dispense", "mix", "drop_tips", "invoke", "recover_tips"}
 
 
 class LabClient:
@@ -138,9 +138,40 @@ def give_reference(lab, layout: dict | None = None, model: str = "hamilton.starl
   lab.server.lab.ws.save_layout("reference", layout or STARLET_LAYOUT, model)
 
 
+def calibrated(lab) -> None:
+  """The person has calibrated the cameras on the calibration page (the test plays them): every camera with a slot map
+  is confirmed still right, one with none is skipped. Cameras already done stay as they are."""
+  cal = lab.server.lab.calibration
+  for camera in cal.cameras():
+    if cal.state(camera) not in ("calibrated", "confirmed", "skipped"):
+      cal._mark(camera, "confirmed" if camera.slot_map else "skipped")
+
+
+async def calibrate_plate(lab, labware: str, camera: str = "usb", plan_step: int = 1) -> dict:
+  """The person clicks the four corner wells of `labware` on the calibration page (the test plays them, on the camera's
+  fresh frame): request_plate_calibration through the controller, then the clicks. Needs a loaded layout and a camera
+  the person has calibrated (see calibrated())."""
+  from ahc import vision
+  from vision_images import plate_corners
+
+  inner = lab.server.lab
+  calibrated(lab)
+  cal = inner.calibration
+  asked = cal.request_plate(labware, camera, "test", plan_step)
+  frame = await cal.look(camera)
+  plate = cal.plates[labware]
+  geometry = vision.labware_geometry(plate["type"])
+  # the corner wells inside the slot's box in the frame (the camera has not moved)
+  box = frame["boxes"][plate["slot"]]
+  await cal.save_plate(labware, plate_corners(box, plate["type"]))
+  assert geometry["rows"] == plate["rows"]
+  return asked
+
+
 async def load_verified(lab, **args):
   """load_layout, then the deck check that opens the motion gate. The simulator judges it, except where
   the person does (real hardware, or a layout no reference in the folder matches): the test plays them."""
+  calibrated(lab)  # where cameras are configured on real hardware, load_layout waits for the person's calibration
   loaded = await lab.call("load_layout", **args)
   step = {"plan_step": args["plan_step"]} if "plan_step" in args else {}
   verdict = await lab.call("verify", check="deck_matches_layout", **step)
@@ -165,6 +196,16 @@ def no_robot_search(monkeypatch):
   """A robot that does not answer is looked for by its name with find_robots (mDNS on the real network): never in a
   test, unless the test names what the search finds."""
   monkeypatch.setattr("ahc.server.search_robots", lambda timeout_s: [])
+
+
+@pytest.fixture(autouse=True)
+def no_ssh(monkeypatch):
+  """The place AHC starts ssh (the bridge link to a STAR's USB host) refuses in every test, so no test can ever reach a
+  real host. A test that needs one replaces it with a stand-in."""
+  def refuse(*args, **kwargs):
+    raise AssertionError("a test tried to reach a real host")
+
+  monkeypatch.setattr("ahc.devices.hamilton.link.spawn", refuse)
 
 
 @pytest.fixture(autouse=True)

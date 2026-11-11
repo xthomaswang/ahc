@@ -52,7 +52,7 @@ AUTO_JUDGE = "agent (auto, cameras)"
 HOLDING = ("tips_mounted", "liquid_present")  # the person's checks that hold motion while they wait, or once failed
 # On real hardware the person checks the deck against this, every time.
 DECK_ON_SITE = (f"The person on site checks the deck against the layout: every slot's labware as listed, {ON_A_REAL_DECK}. "
-                "The layout is also on the run dashboard. ")
+                "The deck is drawn on the run dashboard's 'Deck setup' card. ")
 
 
 class Verification:
@@ -145,10 +145,11 @@ class Verification:
   def _ask(self, check_id, check, device, targets, expect, min_volume_ul, person, differs=None) -> str:
     """What the person is asked, check by check: the call that asks them is the next one."""
     homes = check == "tips_mounted" and device is None and not self.adapter.simulated  # the dialog before load_layout
-    now = f" {pass_now(check_id, homes=homes)} {DENIED}"
+    asked = pass_now(check_id, homes=homes, moves=self.adapter.LOAD_MOVES, needs=self.adapter.LOAD_NEEDS)
+    now = f" {asked} {DENIED}"
     if person and self.adapter.simulated:
       return ((differs or "This layout matches no reference in this task folder.") + " So the person confirms it: "
-              "ask_person lists the labware, positions and liquids (also on the run dashboard)." + now)
+              "ask_person lists the labware, positions and liquids (also drawn on the run dashboard's 'Deck setup' card)." + now)
     if check == "deck_matches_layout":
       return DECK_ON_SITE + (f"{differs} " if differs else "") + now.lstrip()
     return f"The person on site checks {self._question(check, device, targets, expect, min_volume_ul)}.{now}"
@@ -280,7 +281,7 @@ class Verification:
 
   def require_unheld(self, op: str) -> None:
     """Refuse motion a person's check holds back: anything while one waits for their verdict (check_pending);
-    after a failed tips check all but drop_tips, after a failed liquid check all but drop_tips and load_layout
+    after a failed tips check all but drop_tips and recover_tips, after a failed liquid check all but drop_tips and load_layout
     (check_failed)."""
     waiting = {cid: h for cid, h in self.holds.items() if h["state"] == "pending"}
     if waiting:
@@ -294,7 +295,7 @@ class Verification:
                      "A new verify of the same check replaces the one waiting.")
     failed = {cid: h for cid, h in self.holds.items() if h["state"] == "failed"}
     for cid, hold in failed.items():
-      if hold["check"] == "tips_mounted" and op != "drop_tips":
+      if hold["check"] == "tips_mounted" and op not in ("drop_tips", "recover_tips"):
         every = hold["subject"] is None
         doubt = (self.tips_note() or "") if every else ""
         raise LabError("check_failed",

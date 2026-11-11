@@ -184,7 +184,7 @@ async def test_the_stop_reaches_the_device_even_when_the_run_log_cannot_be_writt
     server = await ready(lab)
     halted = []
 
-    async def halt():
+    async def halt(stop=None):
       halted.append(time.monotonic())
       return False
 
@@ -231,7 +231,7 @@ async def test_the_stop_reaches_a_run_the_load_is_still_setting_up(tmp_path, ope
         adapter._setting_up = None
       raise AssertionError("the emergency stop ends this load")
 
-    async def halt():  # contract C4: its first step finds the run being set up
+    async def halt(stop=None):  # contract C4: its first step finds the run being set up
       seen.append(adapter._setting_up)
       homing.set()  # the robot stops
       return seen[-1] is not None

@@ -8,6 +8,9 @@ in the reference's pixels. Per capture:
                    an implausible homography means the camera needs a new map
   3. slot crops    each box is warped into the capture and cropped; per crop: edge sharpness (size-normalized),
                    pixels per well (from the labware's well pitch) and how much of the box is in the frame
+  4. plate grids   a plate the person calibrated (four clicked wells, ahc.calibration) carries a grid of well centres
+                   warped into the capture the same way; its pitch in pixels, not the box's estimate, then decides
+                   whether single wells resolve
 
 and each crop gets a level: `unclear` (below the thresholds), `slot` (presence, type and liquid colour can be
 judged) or `well` (single wells can be resolved). A `tips:<component>` region gets `tip` instead. The numbers
@@ -37,6 +40,9 @@ from ahc.physical_world import LEVELS, RANK  # noqa: F401 - the levels are share
 
 FRAME_SHARP_MIN = 12.0  # whole frame, p99 of |Laplacian| at 960 px wide
 SLOT_SHARP_MIN = 6.0  # a slot crop, p99 of |Laplacian| at 384 px wide
+MOVED_PX = 8.0  # a camera that has moved less than this (a frame corner, in the picture's pixels) "has not moved"
+DEFAULT_WELL_FRACTION = 0.7  # a well's diameter over the well pitch, when the labware does not say
+MIN_GRID_SPAN = 0.02  # the four clicked points enclose at least this part of the frame (else they are one spot)
 MIN_VISIBLE = 0.5  # the part of a slot's box inside the frame (slot 8 shows about 0.65 on the real deck)
 SLOT_MIN_PX_PER_MM = 0.8  # below it labware type and liquid colour cannot be judged
 WELL_MIN_PX = 20.0  # pixels across one well pitch, to resolve single wells
@@ -174,7 +180,7 @@ def labware_geometry(type_name: str) -> dict[str, Any] | None:
       size_x, size_y = resource.get_size_x(), resource.get_size_y()
       rows, cols = getattr(resource, "num_items_y", 0), getattr(resource, "num_items_x", 0)
       if rows * cols <= 1:
-        return {"size": (size_x, size_y), "rows": 1, "cols": 1, "pitch_mm": None, "wells": {}}
+        return {"size": (size_x, size_y), "rows": 1, "cols": 1, "pitch_mm": None, "wells": {}, "well_mm": None}
       wells = {}
       for r in range(rows):
         for c in range(cols):
@@ -183,9 +189,10 @@ def labware_geometry(type_name: str) -> dict[str, Any] | None:
           wells[well_id] = ((item.location.x + item.get_size_x() / 2) / size_x,
                             1 - (item.location.y + item.get_size_y() / 2) / size_y)
       pitch = round(resource.get_item("A2").location.x - resource.get_item("A1").location.x, 2) if cols > 1 else None
+      well_mm = resource.get_item("A1").get_size_x()
   except Exception:  # noqa: BLE001 - a labware PyLabRobot builds differently is just unknown here
     return None
-  return {"size": (size_x, size_y), "rows": rows, "cols": cols, "pitch_mm": pitch, "wells": wells}
+  return {"size": (size_x, size_y), "rows": rows, "cols": cols, "pitch_mm": pitch, "wells": wells, "well_mm": well_mm}
 
 
 # -- analysing a capture ----------------------------------------------------------------------------
@@ -250,11 +257,21 @@ def _level(key: str, view: str, visible: float, sharpness: float, px_per_mm: flo
   return "slot", None
 
 
+def preview_matrix(matrix: np.ndarray, ref_w: float) -> np.ndarray:
+  """The alignment (made at ALIGN_WIDTH) in the pixels of a map that is `ref_w` wide: a reference narrower than
+  ALIGN_WIDTH (the OT-2's own 640 px camera) is aligned scaled up, and boxes live in its own pixels."""
+  s = ALIGN_WIDTH / ref_w
+  up, down = np.diag([s, s, 1.0]), np.diag([1 / s, 1 / s, 1.0])
+  return down @ matrix @ up
+
+
 def analyze(image: Path, slot_map: dict[str, Any], reference: Path, labware: dict[str, str] | None = None,
-            save_crops: bool = True) -> dict[str, Any]:
+            save_crops: bool = True, plates: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
   """One capture against its camera's map: {status ok|unclear|needs_new_map, why, image_size (the preview's),
   frame_sharpness, alignment, slots: [per-slot entries, boxes in preview pixels]}. `labware`: slot -> labware type of
-  the loaded layout. Crops are written next to the image when `save_crops`. Never raises for a bad image."""
+  the loaded layout. `plates`: slot -> a calibrated plate {corners (in the reference's pixels, A1, A<cols>, <last row>1,
+  <last row><cols>), rows, cols, type}; its entry then carries `grid` (the corners in the preview's pixels, pitch_px and
+  radius_px in the capture's own pixels). Crops are written next to the image when `save_crops`. Never raises for a bad image."""
   gray = read_gray(image)
   if gray is None:
     return {"status": "unclear", "why": "the image file cannot be read", "slots": []}
@@ -273,8 +290,13 @@ def analyze(image: Path, slot_map: dict[str, Any], reference: Path, labware: dic
     return {**out, "status": "needs_new_map",
             "why": f"{result.reason}: map the camera again (map_camera) if it moved or the scene changed"}
   view = slot_map.get("view", "top")
-  entries = [_entry(key, box, result.matrix, gray, scale, preview, view, (labware or {}).get(key), image if save_crops else None)
+  matrix = preview_matrix(result.matrix, ref_w)
+  entries = [_entry(key, box, matrix, gray, scale, preview, view, (labware or {}).get(key), image if save_crops else None)
              for key, box in slot_map["slots"].items()]
+  for entry in entries:
+    plate = (plates or {}).get(entry["slot"])
+    if plate is not None:
+      entry["grid"] = warped_grid(plate, matrix, scale)
   color = None
   for entry in entries:
     crop = entry.pop("_crop", None)
@@ -305,6 +327,111 @@ def wells_outside(entry: dict[str, Any], labware: str, wells: list[str], frame: 
   half = (geometry["pitch_mm"] or 0) / 2 * ((x1 - x0) / FOOTPRINT_MM[0])
   return [w for w, x, y in well_positions(entry, labware, wells)
           if x - half < 0 or y - half < 0 or x + half > frame[0] or y + half > frame[1]]
+
+
+# -- a calibrated plate: four clicked wells, a perspective grid ------------------------------------------
+
+def well_ids(rows: int, cols: int) -> list[str]:
+  return [f"{'ABCDEFGHIJKLMNOP'[r]}{c + 1}" for r in range(rows) for c in range(cols)]
+
+
+def corner_wells(rows: int, cols: int) -> list[str]:
+  """The four wells the person clicks, in order: A1, the last column of row A, the first column of the last row, and
+  the last well (A1, A12, H1, H12 on a 96-well plate)."""
+  last = "ABCDEFGHIJKLMNOP"[rows - 1]
+  return ["A1", f"A{cols}", f"{last}1", f"{last}{cols}"]
+
+
+def check_corners(corners: Any, size: tuple[float, float] | None = None) -> list[list[float]]:
+  """Four clicked points [[x, y], ...] as floats; ValueError saying what is wrong. They must be the corners of a
+  convex four-sided shape in the order A1, A<cols>, <last row>1, <last row><cols>, as a plate looks from above: a plate that
+  is turned or seen at an angle is fine; a mirrored order (A12 and H1 swapped, say), a crossed shape or a collapsed one is not."""
+  try:
+    pts = [[float(x), float(y)] for x, y in corners]
+  except (TypeError, ValueError) as exc:
+    raise ValueError("give four points [x, y]") from exc
+  if len(pts) != 4 or any(not np.isfinite(v) for p in pts for v in p):
+    raise ValueError("give four points [x, y]")
+  ring = [pts[0], pts[1], pts[3], pts[2]]  # around the plate: A1, A<cols>, <last row><cols>, <last row>1
+  signed = sum(a[0] * b[1] - b[0] * a[1] for a, b in zip(ring, ring[1:] + ring[:1])) / 2  # > 0: clockwise on the screen
+  if not cv2.isContourConvex(np.float32(ring).reshape(-1, 1, 2)) or abs(signed) < 100:
+    raise ValueError("the four points do not make a plate's corners: click A1, the last column of row A, the first column "
+                     "of the last row, then the last well, in that order")
+  if signed < 0:
+    raise ValueError("the points are in a mirrored order (a plate seen from above runs A1 to the last column of row A "
+                     "clockwise to the last well): click A1, the last column of row A, the first column of the last row, "
+                     "then the last well")
+  if size is not None and signed < MIN_GRID_SPAN * size[0] * size[1] * 0.05:
+    raise ValueError("the four points are too close together to be a plate")
+  return pts
+
+
+def plate_grid(corners: list[list[float]], rows: int, cols: int, well_fraction: float | None = None) -> dict[str, Any]:
+  """Every well's centre from the four corner wells, through a perspective transform (cv2.getPerspectiveTransform): the
+  OT-2's own camera looks at the deck at an angle, so the grid is not a plain rectangle. -> {rows, cols, centres
+  ([[x, y] per well, row by row]), pitch_px (the smallest distance between neighbouring wells), radius_px}."""
+  src = np.float32([[0, 0], [cols - 1, 0], [0, rows - 1], [cols - 1, rows - 1]])
+  transform = cv2.getPerspectiveTransform(src, np.float32(corners))
+  grid = np.float32([[c, r] for r in range(rows) for c in range(cols)]).reshape(-1, 1, 2)
+  centres = cv2.perspectiveTransform(grid, transform).reshape(rows, cols, 2)
+  gaps = [float(np.linalg.norm(centres[r, c] - centres[r, c + 1])) for r in range(rows) for c in range(cols - 1)]
+  gaps += [float(np.linalg.norm(centres[r, c] - centres[r + 1, c])) for r in range(rows - 1) for c in range(cols)]
+  pitch = min(gaps)
+  fraction = well_fraction or DEFAULT_WELL_FRACTION
+  return {"rows": rows, "cols": cols, "centres": [[round(float(x), 2), round(float(y), 2)] for x, y in centres.reshape(-1, 2)],
+          "pitch_px": round(pitch, 2), "radius_px": round(pitch * fraction / 2, 2)}
+
+
+def well_fraction(type_name: str | None) -> float | None:
+  """A well's diameter over the well pitch for this labware (None: unknown)."""
+  geometry = labware_geometry(type_name) if type_name else None
+  if geometry and geometry.get("well_mm") and geometry.get("pitch_mm"):
+    return min(0.95, geometry["well_mm"] / geometry["pitch_mm"])
+  return None
+
+
+def warped_grid(plate: dict[str, Any], matrix: np.ndarray, scale: float) -> dict[str, Any]:
+  """A calibrated plate's grid in a capture: its corners (the reference's pixels) through the capture's alignment
+  `matrix`, then the grid of well centres in the preview's pixels. pitch_px and radius_px are in the capture's own
+  pixels (preview pixels times `scale`), the unit of the other per-well measures (WELL_MIN_PX)."""
+  pts = cv2.perspectiveTransform(np.float32(plate["corners"]).reshape(-1, 1, 2), matrix).reshape(4, 2)
+  grid = plate_grid(pts.tolist(), plate["rows"], plate["cols"], well_fraction(plate.get("type")))
+  return {"rows": grid["rows"], "cols": grid["cols"], "centres": grid["centres"],
+          "pitch_px": round(grid["pitch_px"] * scale, 2), "radius_px": round(grid["radius_px"] * scale, 2), "scale": scale,
+          "corners": [[round(float(x), 1), round(float(y), 1)] for x, y in pts]}
+
+
+def grid_wells_outside(grid: dict[str, Any], wells: list[str], frame: list[int]) -> list[str]:
+  """The wells of a calibrated plate whose centre, or half a pitch around it, is not inside the frame."""
+  half = grid["pitch_px"] / grid.get("scale", 1.0) / 2
+  index = {w: i for i, w in enumerate(well_ids(grid["rows"], grid["cols"]))}
+  out = []
+  for w in wells:
+    if w not in index:
+      continue
+    x, y = grid["centres"][index[w]]
+    if x - half < 0 or y - half < 0 or x + half > frame[0] or y + half > frame[1]:
+      out.append(w)
+  return out
+
+
+def compare_to_reference(reference: Path, gray: np.ndarray, ref_size: tuple[int, int]) -> dict[str, Any]:
+  """Has the camera moved since its reference image was taken? ORB alignment of a fresh frame against it:
+  {result: unmoved | moved | could_not_compare, shift_px (the largest move of a frame corner, in the frame's pixels),
+  inliers, text, matrix (reference -> fresh frame, at ALIGN_WIDTH; None unless aligned)}."""
+  if gray is None:
+    return {"result": "could_not_compare", "shift_px": None, "inliers": 0, "matrix": None,
+            "text": "could not compare: the picture cannot be read"}
+  result = align(reference, gray)
+  if not result.ok:
+    return {"result": "could_not_compare", "shift_px": None, "inliers": result.inliers, "matrix": None,
+            "text": f"could not compare: {result.reason}"}
+  shift = float(result.shift_px or 0.0) * ref_size[0] / ALIGN_WIDTH  # in the frame's own pixels
+  if shift < MOVED_PX:
+    return {"result": "unmoved", "shift_px": round(shift, 1), "inliers": result.inliers, "matrix": result.matrix,
+            "text": "camera has not moved"}
+  return {"result": "moved", "shift_px": round(shift, 1), "inliers": result.inliers, "matrix": result.matrix,
+          "text": f"camera moved about {shift:.0f} px"}
 
 
 def overlay(reference_jpeg: bytes, slots: dict[str, list[float]]) -> bytes:

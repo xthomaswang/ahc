@@ -194,7 +194,9 @@ layout is loaded again.
 ## Sensors usable for verification
 
 None: OT-2 GEN2 pipettes report no tip presence. On real hardware the person checks tips and wells
-(cameras later), and nothing moves while their check waits.
+(cameras later), and nothing moves while their check waits. The OT-2 has a built-in camera (an angled side
+view of the deck, 640 x 480): a task can use it as a capture source with `source: robot` in its cameras (the
+person turns it on in the Opentrons App); it is not a sensor of the device, only a picture.
 
 ## Cannot
 

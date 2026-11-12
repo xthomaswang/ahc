@@ -83,13 +83,15 @@ Mac reaches the host over ssh with key login and never opens the instrument itse
   initialization refuse the load (`tips_on_channels`): they come off with `recover_tips` (below) while the
   instrument still reports itself initialized, otherwise outside AHC (they did not come off by hand on the lab's
   instrument).
-- Channel spacing: AHC plans with the width each channel reports. On an instrument whose channels report more than
-  the 9 mm between a plate's rows, a column of tips, aspirations or dispenses goes one channel at a time.
-  `channel_spacing_mm` (a number, at least 9) is set only when the person on site states that the channels can sit
-  that close; the person confirms it with the config ("channels planned N mm apart as the person states"). AHC
-  refuses a value below the minimum pitch the instrument's master reports, or when it reports none
-  (`channel_spacing_refused`, before anything moves), and after initialization plans every channel with the stated
-  value; `identity.channel_spacing_mm` then shows the widths the channels reported and the spacing planned.
+- Channel spacing: AHC plans the channels at the minimum pitch the instrument's master reports (never closer than
+  the 9 mm between a plate's rows), not at the width each channel reports: on the lab's instrument the channels
+  report about 18 mm, which made a column go one channel at a time, while the master reports 9 mm and the channels
+  do take a column at once. `channel_spacing_mm` (a number, at least 9) is an optional override: the spacing the
+  person on site states, confirmed with the config ("channels planned N mm apart as the person states"). AHC
+  refuses a stated value below the master's minimum pitch, or when the master reports none
+  (`channel_spacing_refused`, before anything moves). After initialization `identity.channel_spacing_mm` shows the
+  widths the channels reported, the spacing planned and its source (`instrument` or `config`). With no stated value
+  and no pitch from the master, AHC plans with the widths the channels report.
 - Tips go back to their rack (`drop_tips` with `mode='return'`). `mode='discard'` is refused (`no_tip_waste`) unless
   the confirmed config says `tip_waste: true`.
 - The emergency stop (the task folder's, from the dashboard or `ahc-estop`): nothing more is sent to the
@@ -131,8 +133,8 @@ Mac reaches the host over ssh with key login and never opens the instrument itse
   task folder ran), `layout_incomplete` and `layout_required` (pass the deck as it stands).
 - Status: the `usb` backend has had its first runs on one instrument (2026-11-11, with a person on site): the
   read-only connect, the initialization, a pick-up, a 50 uL transfer and the return of the tips one channel at a
-  time and with 8 channels at once (`channel_spacing_mm: 9`), the stop during a column's pick-up, `recover_tips`
-  with `mode='return'` and the load after it. Not yet on an instrument: an initialization with the 96 head's waste
+  time and with 8 channels at once (then stated as `channel_spacing_mm: 9`), the stop during a column's pick-up,
+  `recover_tips` with `mode='return'` and the load after it. Not yet on an instrument: an initialization with the 96 head's waste
   position as AHC now sets it (with PyLabRobot's default the head touched the edge of the waste box at the first
   initialization, so the person watches the head at the next one after a power-on), `mix`, a tip waste
   (`mode='discard'` in `drop_tips` and `recover_tips`), a stop with liquid in the tips, and the power switch during
@@ -159,7 +161,7 @@ plate carriers', is the case among the listed types.
 `RGT_CAR_5R60_A00` is AHC's own definition, with the five sites of Hamilton's definition of the carrier
 (PyLabRobot's `Trough_CAR_5R60_A00` has four, one of them 7.5 mm off, and is not listed). The 60 mL trough has a
 wall across its middle: 8 channels go in four on each side of it, which needs channels 9 mm apart
-(`channel_spacing_mm` on an instrument that reports them wider).
+(what AHC plans when the instrument's master reports that pitch).
 Site 0 is a carrier's front-most site, nearest the person. VENUS numbers positions the other way, from
 the back: on a 5-site carrier, VENUS position 5 is site 0 and position 1 is site 4.
 

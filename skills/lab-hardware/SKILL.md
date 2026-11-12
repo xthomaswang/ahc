@@ -164,7 +164,7 @@ decide: you prepare it, show it and wait.
   `no_usable_pipette`, `wrong_robot` (another robot answers at that address): stop and tell the person.
 - A real STARlet is the `usb` backend: ask the person for its USB host's ssh name (never guess one), write
   `[{"id": "starlet", "model": "hamilton.starlet", "backend": "usb", "options": {"bridge": "<ssh name>"}}]`
-  (`tip_waste: true` only when the person says a tip waste is fitted; `channel_spacing_mm` only when the person states the spacing their channels can take) and show them the identity
+  (`tip_waste: true` only when the person says a tip waste is fitted; `channel_spacing_mm` only when the person states a spacing other than the instrument's minimum pitch, which AHC plans by itself) and show them the identity
   `configure_devices` read (serial, firmware, channels, fitted parts, tips sensed, the host); they confirm that
   serial. Its first `load_layout` of a session, and the first after a stop, an error or a disconnect,
   initializes the instrument (channels, 96-head, iSWAP and autoload all move): say so with the line above.

@@ -243,7 +243,9 @@ async def test_the_first_load_connects_then_initializes(make):
   assert adapter.layout is layout and adapter.device is shadow.device and adapter.view_root() is shadow.device
   assert adapter.identity() == {"serial": "T0001", "firmware": "7.6S 25 2021_11_05 (GRU C0)", "channels": 8,
                                 "fitted": {"head96": True, "iswap": True, "autoload": True}, "usb_host": "usb-host",
-                                "firmware_date": "2021-11-05"}
+                                "firmware_date": "2021-11-05",
+                                # the master's minimum pitch, planned in place of the width the channels report
+                                "channel_spacing_mm": {"reported": [8.98], "planned": 9.0, "source": "instrument"}}
   assert adapter.command_count() == shadow.state.moved == len(shadow.moved())  # reads do not count
   assert adapter.robot_record(2) == [{"command": c, "status": "answered"} for c in shadow.moved()[-2:]]
   assert layout.labware["tips"] is not None and shadow.driver.deck is not None
@@ -959,8 +961,8 @@ async def _column(rig: Rig) -> None:
   await rig.lh.drop_tips(DEV, "return")
 
 
-async def test_channels_reporting_17_97_mm_take_a_column_one_channel_at_a_time(make):
-  rig = await started(make("shadow", channel_width=LAB_CHANNEL_WIDTH))
+async def test_with_no_pitch_from_the_master_channels_reporting_17_97_mm_take_a_column_one_at_a_time(make):
+  rig = await started(make("shadow", channel_width=LAB_CHANNEL_WIDTH, no_raster_pitch=True))
   await rig.load()
   assert {c.width for c in rig.instrument.driver.arms[0].pipettes.configuration.channels} == {17.97}
   await _column(rig)
@@ -971,8 +973,9 @@ async def test_channels_reporting_17_97_mm_take_a_column_one_channel_at_a_time(m
   assert "channel_spacing_mm" not in rig.adapter.identity()
 
 
-async def test_a_stated_spacing_takes_a_full_column_in_one_command_of_each_kind(make):
-  rig = await started(make("shadow", options=SPACING_OPTIONS, channel_width=LAB_CHANNEL_WIDTH))
+@pytest.mark.parametrize("options", [SPACING_OPTIONS, {}], ids=["stated in the config", "the master's pitch"])
+async def test_channels_planned_9_mm_apart_take_a_full_column_in_one_command_of_each_kind(make, options):
+  rig = await started(make("shadow", options=options, channel_width=LAB_CHANNEL_WIDTH))
   await rig.load()
   await _column(rig)
   shadow = rig.instrument
@@ -1024,12 +1027,27 @@ async def test_the_stated_spacing_replaces_every_width_after_setup_and_is_on_the
   await rig.load()
   channels = rig.instrument.driver.arms[0].pipettes.configuration.channels
   assert len(channels) == 8 and {c.width for c in channels} == {9.0}
-  assert rig.adapter.identity()["channel_spacing_mm"] == {"reported": [17.97], "planned": 9.0}
+  assert rig.adapter.identity()["channel_spacing_mm"] == {"reported": [17.97], "planned": 9.0, "source": "config"}
   assert rig.adapter.identity()["serial"] == "T0001"  # the rest of the identity is as it was
 
 
-async def test_without_the_option_the_widths_and_the_identity_are_as_reported(make):
+async def test_without_the_option_the_masters_pitch_replaces_every_width_and_is_on_the_identity(make):
   rig = await started(make("shadow", channel_width=LAB_CHANNEL_WIDTH))
+  await rig.load()
+  assert {c.width for c in rig.instrument.driver.arms[0].pipettes.configuration.channels} == {9.0}
+  assert rig.adapter.identity()["channel_spacing_mm"] == {"reported": [17.97], "planned": 9.0, "source": "instrument"}
+
+
+@pytest.mark.parametrize("pitch,planned", [(18.0, 18.0), (12.5, 12.5), (8.0, 9.0)])
+async def test_the_masters_pitch_is_planned_as_reported_but_never_closer_than_a_plates_rows(make, pitch, planned):
+  rig = await started(make("shadow", channel_width=LAB_CHANNEL_WIDTH, raster_pitch=pitch))
+  await rig.load()
+  assert {c.width for c in rig.instrument.driver.arms[0].pipettes.configuration.channels} == {planned}
+  assert rig.adapter.identity()["channel_spacing_mm"]["planned"] == planned
+
+
+async def test_with_no_option_and_no_pitch_the_widths_and_the_identity_are_as_reported(make):
+  rig = await started(make("shadow", channel_width=LAB_CHANNEL_WIDTH, no_raster_pitch=True))
   await rig.load()
   assert {c.width for c in rig.instrument.driver.arms[0].pipettes.configuration.channels} == {17.97}
   assert "channel_spacing_mm" not in rig.adapter.identity()
@@ -1125,8 +1143,9 @@ async def test_recovery_returns_the_tips_without_initializing_and_lets_go_of_the
   assert abs(_field(text, "xp")[0] - xs.pop()) <= 5  # the named column's x (tenths of a mm)
 
 
-async def test_recovery_without_the_spacing_option_returns_one_channel_at_a_time(make):
-  rig = await started(make("shadow", tips_mounted=ALL_TIPS, initialized=True, channel_width=LAB_CHANNEL_WIDTH))
+async def test_recovery_with_no_spacing_and_no_pitch_from_the_master_returns_one_channel_at_a_time(make):
+  rig = await started(make("shadow", tips_mounted=ALL_TIPS, initialized=True, channel_width=LAB_CHANNEL_WIDTH,
+                           no_raster_pitch=True))
   shadow = rig.instrument
   result = await recover(rig)
   assert shadow.moved() == ["C0ZA", "C0EV"] + ["C0TR"] * 8

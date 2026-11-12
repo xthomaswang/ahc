@@ -38,7 +38,7 @@ HEAD96_EJECT_Y = 120.3
 # the 96 head retracted); never the initialization of the channels, which ejects what they hold.
 RECOVERY_SETUP = {"skip_device_initialization": True, "skip_pipettes": True, "skip_iswap": True, "skip_head96": True,
                   "skip_head384": True, "skip_autoload": True}
-MIN_CHANNEL_SPACING_MM = 9.0  # the pitch of a plate's rows: no channel spacing the person states is below it
+MIN_CHANNEL_SPACING_MM = 9.0  # the pitch of a plate's rows: AHC plans the channels no closer, whoever states the spacing
 
 # PyLabRobot's STAR model refuses a dispense its piston cannot make; said as what to change instead.
 _PISTON = re.compile(r"piston holds ([\d.]+) uL of travel for the ([\d.]+) uL")
@@ -559,16 +559,25 @@ class STARletAdapter(HamiltonAdapter):
                    "allows, or without that option (then AHC plans with the width each channel reports).")
 
   def _plan_channel_spacing(self, link: _Link) -> None:
-    """After setup (which reads every channel's width again): plan with the person's spacing, and record both."""
+    """After setup (which reads every channel's width again): plan every channel with the spacing the person states,
+    else with the minimum pitch the instrument's master reports (never closer than a plate's rows), and record what
+    the channels reported, what is planned and where it comes from. The width a channel reports is not the smallest
+    gap to its neighbour on every channel generation: planned with it, a column can go one channel at a time. With
+    no stated spacing and no pitch from the master, the reported widths stay."""
     asked = self.options.get("channel_spacing_mm")
-    if asked is None:
+    pitch = link.driver.configuration.min_raster_pitch_pip_channels
+    if asked is not None:
+      planned, source = float(asked), "config"
+    elif pitch is not None:
+      planned, source = max(float(pitch), MIN_CHANNEL_SPACING_MM), "instrument"
+    else:
       return
     channels = [channel for arm in link.driver.arms if arm.pipettes is not None
                 for channel in arm.pipettes.configuration.channels]
     reported = sorted({round(channel.width, 2) for channel in channels if channel.width is not None})
     for channel in channels:
-      channel.width = float(asked)
-    link.identity["channel_spacing_mm"] = {"reported": reported, "planned": float(asked)}
+      channel.width = planned
+    link.identity["channel_spacing_mm"] = {"reported": reported, "planned": planned, "source": source}
 
   @staticmethod
   def _place_head96_eject(driver) -> None:

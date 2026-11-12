@@ -372,7 +372,7 @@ devices:
       bridge: usb-host        # the host's ssh name (ssh config entry, or user@host); you give it, never the agent
       # serial: T0001         # read from the instrument by configure_devices; you confirm it
       # tip_waste: true       # only if a tip waste is fitted: otherwise tips go back to their rack
-      # channel_spacing_mm: 9 # only if you state that the channels can sit that close (see below)
+      # channel_spacing_mm: 9 # optional: the spacing you state; left out, the instrument's minimum pitch (see below)
 ```
 
 `configure_devices` reads the serial and the instrument's state with reads only (the bridge is never armed), and the
@@ -384,11 +384,13 @@ config says `tip_waste: true`.
 
 Two things found on the instrument:
 
-- **Channel spacing.** AHC plans with the width each channel reports. The lab's channels report about 18 mm, so a
-  column of 8 went one channel at a time (274 s for a pick-up, a 50 uL transfer and the return), although the
-  channels do take a column at a plate's 9 mm. With `channel_spacing_mm: 9`, stated by the person on site and
-  confirmed with the config, the same column runs with all 8 channels at once (40 s). AHC refuses a value below the
-  minimum pitch the instrument's master reports.
+- **Channel spacing.** The lab's channels report a width of about 18 mm, and planned with it a column of 8 went one
+  channel at a time (274 s for a pick-up, a 50 uL transfer and the return), although the channels do take a column
+  at a plate's 9 mm (40 s with all 8 at once). AHC now plans the channels at the minimum pitch the instrument's
+  master reports (9 mm there, never closer than 9 mm), so a column runs with all channels at once without any
+  option. `channel_spacing_mm` states another spacing; AHC refuses one below the master's minimum pitch. The run
+  with 8 channels at once on the instrument had the 9 mm stated in the config; the automatic choice has not run on
+  the instrument yet.
 - **The 96 head at initialization.** The initialization ejects tips from the 96 head at its waste position. With
   PyLabRobot's default position the head, lowered there, touched the edge of the waste box at the left of the deck
   (lightly: no error, nothing bent). AHC now sends the head to its waste position at its travel height and does not

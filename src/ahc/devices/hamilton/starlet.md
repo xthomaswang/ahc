@@ -152,6 +152,10 @@ a `RGT_CAR_5R60_A00`. The tip and plate carriers take 6 tracks each, the 200 mL 
 reagent carrier 1 (5 sites). Tip racks are the framed 96-tip racks of 300 uL and 1000 uL tips, with or without
 filter; declare the rack that is on the deck, because the tip's length and volume come from it.
 
+A layout whose labware would stand above the height the channels travel at (245 mm) is refused
+(`labware_too_high`): a deep-well plate on a `PLT_CAR_L5MD_A00`, whose sites are 25 mm higher than the other
+plate carriers', is the case among the listed types.
+
 `RGT_CAR_5R60_A00` is AHC's own definition, with the five sites of Hamilton's definition of the carrier
 (PyLabRobot's `Trough_CAR_5R60_A00` has four, one of them 7.5 mm off, and is not listed). The 60 mL trough has a
 wall across its middle: 8 channels go in four on each side of it, which needs channels 9 mm apart

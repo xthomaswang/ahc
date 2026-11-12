@@ -66,6 +66,20 @@ class HamiltonAdapter(Adapter):
     built.record_placements()
     return built, deck
 
+  @staticmethod
+  def _check_heights(deck: Any, carrier: dict[str, Any]) -> None:
+    """Refuse labware that would stand above the height the channels travel at (PyLabRobot only warns): a deep
+    plate on a carrier with high sites, for example."""
+    limit = float(deck.safe_deck_height)
+    for item in (carrier.get("sites") or {}).values():
+      top = deck.get_resource(item["name"]).get_location_wrt(deck, z="top").z
+      if top > limit:
+        raise LabError("labware_too_high",
+                       f"{item['name']!r} ({item['type']}) on a {carrier.get('type')} would stand {top:.1f} mm high, "
+                       f"above the {limit:.0f} mm the channels travel at.",
+                       "Put it on a carrier with lower sites: a PLT_CAR_L5_DWP or a PLT_CAR_L5AC_A00 takes a deep "
+                       "plate.")
+
   def _build_deck(self, deck: Any, layout: dict[str, Any]) -> Layout:
     rules = self.spec.layout
     keys = {"carriers", "liquids", "aliases", "tips_empty", "tips_returned"}
@@ -96,6 +110,7 @@ class HamiltonAdapter(Adapter):
         deck.assign_child_resource(holder, track=track)
       except Exception as exc:  # noqa: BLE001 - PLR refuses overlapping carriers
         raise LabError("bad_track", f"carrier {name!r} on track {track}: {exc}") from exc
+      self._check_heights(deck, carrier)
     out.set_aliases(layout.get("aliases") or {})
     out.set_liquids(layout.get("liquids") or {})
     out.set_tip_states(layout.get("tips_empty"), layout.get("tips_returned"))

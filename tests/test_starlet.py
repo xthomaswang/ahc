@@ -233,6 +233,20 @@ async def test_every_listed_tip_rack_runs_a_column_on_the_md_plate_carrier(starl
   assert len(liquids["target"]) == 8 and all(v == pytest.approx(100.0) for v in liquids["target"].values())
 
 
+@pytest.mark.parametrize("carrier,refused", [("PLT_CAR_L5MD_A00", True), ("PLT_CAR_L5AC_A00", False),
+                                             ("PLT_CAR_L5_DWP", False)])
+async def test_labware_above_the_travel_height_is_refused(starlet, carrier, refused):
+  # A deep plate on the MD carrier's high sites would stand at 254 mm; the channels travel at 245 mm.
+  deck = {"carriers": [
+    {"type": carrier, "track": 1, "name": "plates", "sites": {"0": {"type": "cor_96_wellplate_2mL_Vb", "name": "deep"}}},
+    {"type": "TIP_CAR_480_A00", "track": 13, "name": "tipcar",
+     "sites": {"0": {"type": "hamilton_96_tiprack_300uL_filter", "name": "tips"}}}]}
+  if refused:
+    assert await starlet.refused("load_layout", layout=deck) == "labware_too_high"
+  else:
+    await load_verified(starlet, layout=deck)
+
+
 def test_the_60_ml_reagent_carrier_has_hamiltons_five_sites():
   # PyLabRobot's Trough_CAR_5R60_A00 has four sites, the fourth 7.5 mm off Hamilton's: AHC builds its own.
   from ahc.devices.hamilton.labware import RGT_CAR_5R60_A00

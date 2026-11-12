@@ -787,6 +787,8 @@ OT-2 simulator; when nothing answers there, the run fails instead of skipping th
   - Not yet on a STARlet: a dilution series, `mix`, an initialization with the 96 head's new waste position (see
     [A real STARlet](#a-real-starlet-through-a-usb-host)), a tip waste (`tip_waste: true`, `drop_tips` and
     `recover_tips` with `mode='discard'`), a stop with liquid in the tips, and the power switch during a command.
+    Of the labware the description file lists, only a `PLT_CAR_L5_DWP`, a `TIP_CAR_480_A00`, 300 uL filter tips
+    and the `Cor_96_wellplate_360ul_Fb` model have been on the instrument.
   - Volumes are what was sent, not measured, on both.
 - **The OT-2 stop does not interrupt a run command in flight** (see above); the power switch does.
 - **`load_layout` homes the OT-2 before the person checks the deck.**

@@ -10,6 +10,7 @@ import pylabrobot.resources as plr
 from ahc.core.errors import LabError
 from ahc.core.layout import Layout, deck_position, make_labware
 from ahc.devices.base import Adapter
+from ahc.devices.hamilton.labware import CARRIERS
 
 
 def _counting(send: Callable, count: Callable[[], None]) -> Callable:
@@ -83,7 +84,7 @@ class HamiltonAdapter(Adapter):
                        f"Allowed carriers: {', '.join(rules['carriers'])}.")
       if not isinstance(track, int) or not lo <= track <= hi:
         raise LabError("bad_track", f"carrier {name!r}: track {track!r} is outside {lo}..{hi}.")
-      holder = getattr(plr, kind)(name=name)
+      holder = (CARRIERS.get(kind) or getattr(plr, kind))(name=name)
       for site, item in (carrier.get("sites") or {}).items():
         resource = make_labware(self.spec, "", item["type"], item["name"])
         try:

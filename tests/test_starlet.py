@@ -209,6 +209,74 @@ async def test_the_lab_deck_carries_water_from_one_plate_to_the_next(starlet):
   assert all(liquids["water"][f"{r}1"] == pytest.approx(200.0) for r in "ABCDEFGH")
 
 
+# The plate carrier and the tip racks listed after a comparison with a lab's labware library: each rack runs a
+# column in simulation with every water liquid class (surface or jet, with or without blow-out).
+MORE_TIPS = ["hamilton_96_tiprack_300uL", "hamilton_96_tiprack_1000uL", "hamilton_96_tiprack_1000uL_filter"]
+WATER_CLASSES = [{}, {"blow_out": True}, {"jet": True}, {"jet": True, "blow_out": True}]
+
+
+@pytest.mark.parametrize("rack", MORE_TIPS)
+@pytest.mark.parametrize("specialized", WATER_CLASSES, ids=["surface", "blow_out", "jet", "jet_blow_out"])
+async def test_every_listed_tip_rack_runs_a_column_on_the_md_plate_carrier(starlet, rack, specialized):
+  deck = {"carriers": [
+    {"type": "PLT_CAR_L5MD_A00", "track": 1, "name": "plates",
+     "sites": {"0": {"type": "Cor_96_wellplate_360ul_Fb", "name": "target"},
+               "1": {"type": "Cor_96_wellplate_360ul_Fb", "name": "water"}}},
+    {"type": "TIP_CAR_480_A00", "track": 13, "name": "tipcar", "sites": {"0": {"type": rack, "name": "tips"}}}],
+    "liquids": {"water:A1:H1": 200}}
+  await load_verified(starlet, layout=deck)
+  await starlet.call("pick_up_tips", device=DEV)
+  await starlet.call("aspirate", device=DEV, targets=["water:A1:H1"], volumes=100, specialized=specialized)
+  await starlet.call("dispense", device=DEV, targets=["target:A1:H1"], volumes=100, specialized=specialized)
+  await starlet.call("drop_tips", device=DEV)
+  liquids = (await starlet.call("get_state", device=DEV))["liquids_ul"]
+  assert len(liquids["target"]) == 8 and all(v == pytest.approx(100.0) for v in liquids["target"].values())
+
+
+def test_the_60_ml_reagent_carrier_has_hamiltons_five_sites():
+  # PyLabRobot's Trough_CAR_5R60_A00 has four sites, the fourth 7.5 mm off Hamilton's: AHC builds its own.
+  from ahc.devices.hamilton.labware import RGT_CAR_5R60_A00
+  carrier = RGT_CAR_5R60_A00(name="rgt")
+  sites = list(carrier.sites.values())
+  assert [round(s.location.y - sites[0].location.y, 2) for s in sites] == [0, 96, 192, 288, 384]
+  # A 19 x 90 mm trough sits on the centre of the carrier (22.5 mm wide) and of Hamilton's site (89.9 mm from Y 6.5).
+  assert sites[0].location.x + 19.0 / 2 == pytest.approx(22.5 / 2)
+  assert sites[0].location.y + 90.0 / 2 == pytest.approx(6.5 + 89.9 / 2)
+
+
+@pytest.mark.parametrize("site", ["0", "4"])
+async def test_eight_channels_draw_from_a_60_ml_trough_on_either_side_of_its_divider(starlet, site):
+  deck = {"carriers": [
+    {"type": "PLT_CAR_L5_DWP", "track": 1, "name": "plates",
+     "sites": {"0": {"type": "Cor_96_wellplate_360ul_Fb", "name": "target"}}},
+    {"type": "TIP_CAR_480_A00", "track": 13, "name": "tipcar",
+     "sites": {"0": {"type": "hamilton_96_tiprack_300uL_filter", "name": "tips"}}},
+    {"type": "RGT_CAR_5R60_A00", "track": 20, "name": "reagents",
+     "sites": {site: {"type": "hamilton_1_trough_60mL_Vb", "name": "diluent"}}}],
+    "liquids": {"diluent": 40000}}
+  await load_verified(starlet, layout=deck)
+  sent: list[dict] = []
+  driver = starlet.server.lab.adapter.device.driver
+  send = driver.send_command
+
+  async def spy(*args, **kwargs):
+    sent.append(kwargs)
+    return await send(*args, **kwargs)
+
+  driver.send_command = spy
+  await starlet.call("pick_up_tips", device=DEV)
+  await starlet.call("aspirate", device=DEV, targets=["diluent"], volumes=100)
+  await starlet.call("dispense", device=DEV, targets=["target:A1:H1"], volumes=100)
+  # Where the channels went in the trough, in mm from its front edge (the carrier's Y 63, the site, 96 mm a site).
+  front = 63.0 + 6.45 + 96.0 * int(site)
+  ys = [int(y) / 10 - front for y in next(k["yp"] for k in sent if k.get("command") == "AS")]
+  assert len(ys) == 8 and all(8 < y < 82 for y in ys)  # inside the 90 mm trough, clear of its end walls
+  assert all(abs(y - 45.0) > 7 for y in ys)  # four on each side of the centre divider (44.4 to 45.6 mm)
+  assert sorted(y > 45 for y in ys) == [False] * 4 + [True] * 4
+  state = await starlet.call("get_state", device=DEV)
+  assert all(v == pytest.approx(100.0) for v in state["liquids_ul"]["target"].values())
+
+
 async def test_refusals_are_logged(starlet):
   await loaded(starlet, with_tips=True)
   await starlet.refused("aspirate", device=DEV, targets=["diluent"], volumes=2000)

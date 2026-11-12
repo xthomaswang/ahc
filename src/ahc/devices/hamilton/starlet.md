@@ -10,11 +10,11 @@ emergency_stop:
 layout:
   kind: tracks
   tracks: {min: 1, max: 30}
-  carriers: [TIP_CAR_480_A00, PLT_CAR_L5AC_A00, PLT_CAR_L5_DWP, Trough_CAR_4R200_A00]
+  carriers: [TIP_CAR_480_A00, PLT_CAR_L5AC_A00, PLT_CAR_L5MD_A00, PLT_CAR_L5_DWP, Trough_CAR_4R200_A00, RGT_CAR_5R60_A00]
   labware:
-    tip_racks: [hamilton_96_tiprack_300uL_filter, hamilton_96_tiprack_1000uL_filter]
+    tip_racks: [hamilton_96_tiprack_300uL_filter, hamilton_96_tiprack_300uL, hamilton_96_tiprack_1000uL_filter, hamilton_96_tiprack_1000uL]
     plates: [Cor_96_wellplate_360ul_Fb, cor_96_wellplate_2mL_Vb]
-    troughs: [Hamilton_1_trough_200ml_Vb]
+    troughs: [Hamilton_1_trough_200ml_Vb, hamilton_1_trough_60mL_Vb]
 components:
   pip:
     title: 8 independent pipetting channels
@@ -136,15 +136,26 @@ Mac reaches the host over ssh with key login and never opens the instrument itse
   position as AHC now sets it (with PyLabRobot's default the head touched the edge of the waste box at the first
   initialization, so the person watches the head at the next one after a power-on), `mix`, a tip waste
   (`mode='discard'` in `drop_tips` and `recover_tips`), a stop with liquid in the tips, and the power switch during
-  a command. Everything else is checked against PyLabRobot's simulator and a stand-in USB host. Runs on an
+  a command. Of the labware listed, a `PLT_CAR_L5_DWP`, a `TIP_CAR_480_A00`, 300 uL filter tips and the
+  `Cor_96_wellplate_360ul_Fb` model have been on the instrument; the other carriers, racks, plates and the troughs
+  have not: at their first use the person watches the first pick-up and the first descent into a well or trough.
+  Everything else is checked against PyLabRobot's simulator and a stand-in USB host. Runs on an
   instrument need a person at the power switch.
 
 ## Layout
 
 Carriers sit on tracks 1–30. A layout lists carriers with their track and the labware on each carrier
 site, for example a `PLT_CAR_L5_DWP` on track 1 and a `TIP_CAR_480_A00` on track 13 holding a tip rack
-at site 0. Plates go on a `PLT_CAR_L5AC_A00` or a `PLT_CAR_L5_DWP` (deep-well plates, Hamilton 93522-01),
-troughs on a `Trough_CAR_4R200_A00`. The tip and plate carriers take 6 tracks each, the trough carrier 2.
+at site 0. Plates go on a `PLT_CAR_L5AC_A00`, a `PLT_CAR_L5MD_A00` or a `PLT_CAR_L5_DWP` (deep-well plates,
+Hamilton 93522-01), 200 mL troughs on a `Trough_CAR_4R200_A00`, 60 mL troughs (`hamilton_1_trough_60mL_Vb`) on
+a `RGT_CAR_5R60_A00`. The tip and plate carriers take 6 tracks each, the 200 mL trough carrier 2, the 60 mL
+reagent carrier 1 (5 sites). Tip racks are the framed 96-tip racks of 300 uL and 1000 uL tips, with or without
+filter; declare the rack that is on the deck, because the tip's length and volume come from it.
+
+`RGT_CAR_5R60_A00` is AHC's own definition, with the five sites of Hamilton's definition of the carrier
+(PyLabRobot's `Trough_CAR_5R60_A00` has four, one of them 7.5 mm off, and is not listed). The 60 mL trough has a
+wall across its middle: 8 channels go in four on each side of it, which needs channels 9 mm apart
+(`channel_spacing_mm` on an instrument that reports them wider).
 Site 0 is a carrier's front-most site, nearest the person. VENUS numbers positions the other way, from
 the back: on a 5-site carrier, VENUS position 5 is site 0 and position 1 is site 4.
 

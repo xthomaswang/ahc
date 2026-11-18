@@ -274,6 +274,14 @@ On a real robot:
   `load_layout` move until a later check of those wells passes or a new layout is loaded
   (`check_failed`). `volumes_match` is the exception: it compares the expected volumes with the
   digital twin, which holds what was sent, not what was measured.
+- Steps the device cannot do are the person's: `request_manual_step` asks you to do one by hand
+  (centrifuge a plate, incubate or shake it off deck, vortex, move labware), with one instruction,
+  the labware and its place on the deck, and about how long it takes. It reaches you as a
+  `record_verdict` dialog, in simulation too, and nothing moves until you approve it once the step
+  is done; the dashboard lists it as waiting for you. Deny it if you could not do it: the agent asks
+  what happened, and only `drop_tips` moves until a later manual step passes. The digital twin
+  follows only liquid the step declares it removes (`empties`, e.g. a spin column's discarded
+  flow-through), once you approve it.
 - An omitted liquid height is the description file's default, 1 mm above the cavity bottom on the
   OT-2, and every result records the height used. An aspirate or mix that would leave the tips above
   the liquid is refused.

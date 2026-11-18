@@ -3491,6 +3491,8 @@ def create_server(workspace=None, backend: str | None = None, device: str | None
         if verdict == "fail":
           result["next"] = ("Ask the person what differs, then load the corrected layout (or they fix the deck and you "
                             "verify again); the new deck check goes to them again.")
+      elif verdict == "fail" and result["check"] == "manual_step":
+        result["next"] = ("The person could not do the manual step: stop, ask what happened and go on only as they say.")
       elif verdict == "fail":
         result["next"] = (f"The person found {result['check']} not as expected: stop and go on only as they say.")
       every = result["check"] == "tips_mounted" and "pipettes" in (result["evidence"]["digital_twin"] or {})
@@ -3514,6 +3516,40 @@ def create_server(workspace=None, backend: str | None = None, device: str | None
         return await recorded()
       except LabError as exc:
         lab.record_refusal("record_verdict", {"check_id": check_id, "verdict": verdict}, exc)
+        raise
+    return await lab.run(body)
+
+  @server.tool(annotations=NOTE,
+               description="Ask the person to do by hand a step the device cannot do (centrifuge, incubate or shake off deck, vortex, move labware, add a reagent by hand), in one instruction. "
+                           "It works the same in simulation and on real hardware: the step is always the person's. It waits for their verdict and holds motion until then (check_pending), like their tips and liquid checks: "
+                           "call record_verdict right away with its check_id, verdict='pass' and note=ask_person; the person approves that call in the client's dialog once they have done it. "
+                           "Denied: they could not do it; stop, ask what happened and record verdict='fail' with their words, after which only drop_tips moves until a later manual step passes. "
+                           "The digital twin follows only what empties declares (liquid the step removes, set to 0 uL once the person passes it); other liquid the person adds or removes is not in its volumes (load_layout again with the volumes they report if the run depends on them). "
+                           "Kept in the run log and shown on the dashboard as waiting for the person.")
+  async def request_manual_step(instruction: Annotated[str, Field(description="What the person does, as one instruction, e.g. 'Centrifuge plate at 6000 x g for 1 min, then put it back in its slot'")],
+                                plan_step: PlanStep,
+                                why: Annotated[str | None, Field(description="Why it is done by hand, one line, e.g. 'no centrifuge on the deck'")] = None,
+                                labware: Annotated[list[str] | None, Field(description="Labware of the loaded layout the person handles, by its name in the layout")] = None,
+                                duration_min: Annotated[float | None, Field(description="About how long it takes, minutes")] = None,
+                                empties: Annotated[list[str] | None, Field(description="Targets whose liquid the step removes, e.g. ['columns:A1:H1'] for a spin column's flow-through that is discarded: once the person passes the step, the digital twin holds 0 uL there")] = None) -> dict[str, Any]:
+    async def asked():
+      lab.require_not_stopped()
+      await lab.refresh(write=False)
+      lab.require_device()
+      lab.plan.check(plan_step)
+      last = lab.last_step_starts(plan_step)
+      lab.step_context = plan_step
+      try:
+        result = lab.verification.manual_step(instruction, why, labware, duration_min, empties)
+      finally:
+        lab.step_context = None
+      return lab.plan_note(result, last)
+
+    async def body():
+      try:
+        return await asked()
+      except LabError as exc:
+        lab.record_refusal("request_manual_step", {"instruction": instruction, "labware": labware, "empties": empties}, exc)
         raise
     return await lab.run(body)
 

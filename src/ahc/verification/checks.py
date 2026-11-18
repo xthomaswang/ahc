@@ -15,6 +15,11 @@ deck check's gate):
            passes a later tips_mounted check of it. liquid_present: no pick-up and no liquid moves (drop_tips
            and load_layout do), until the person passes a later check of those containers or a new layout
            is loaded (check_failed).
+
+A manual step (manual_step) is work the device cannot do that the person does by hand: centrifuge a plate, incubate
+it off deck, vortex, move labware. The agent asks for it (request_manual_step) with the instruction; it is always
+the person's, in simulation too, and holds motion the same way: nothing moves while it waits, and once they report
+they could not do it (fail) only drop_tips moves, until a later manual step passes.
 """
 
 from __future__ import annotations
@@ -28,7 +33,7 @@ from ahc.devices.base import Adapter
 from ahc.devices.spec import DeviceSpec
 from ahc.core.errors import LabError
 from ahc.records import RunLog
-from ahc.verification.ask import DENIED, agent_now, pass_now
+from ahc.verification.ask import DENIED, NO_DIALOG, agent_now, pass_now
 
 # What the person checks on a real deck besides each labware and its position: in the check itself, in what
 # verify asks them, and where find_layout_references sends them to the deck.
@@ -50,6 +55,8 @@ CAMERA_NOTE = ("no camera verifier: no image is judged automatically. Photos fro
 TWIN_JUDGE = "digital twin (what was sent, not measured)"
 AUTO_JUDGE = "agent (auto, cameras)"
 HOLDING = ("tips_mounted", "liquid_present")  # the person's checks that hold motion while they wait, or once failed
+MANUAL = "manual_step"  # work the person does by hand (request_manual_step); never a verify check
+MANUAL_JUDGE = "the person (manual step)"
 # On real hardware the person checks the deck against this, every time.
 DECK_ON_SITE = (f"The person on site checks the deck against the layout: every slot's labware as listed, {ON_A_REAL_DECK}. "
                 "The deck is drawn on the run dashboard's 'Deck setup' card. ")
@@ -123,6 +130,69 @@ class Verification:
                         "evidence": result["evidence"], **({"supersedes": replaced[-1]} if replaced else {}),
                         **({"auto": True} if result.get("auto") else {})})
     return result
+
+  def manual_step(self, instruction: str, why: str | None = None, labware: list[str] | None = None,
+                  duration_min: float | None = None, empties: list[str] | None = None) -> dict[str, Any]:
+    """Ask the person to do `instruction` by hand. It waits for their verdict (record_verdict: pass once done, fail
+    when they could not) and holds motion until then, in simulation as on real hardware: the simulator cannot do it
+    for them. `labware`: what they handle, by its layout name (shown to them); `duration_min`: how long it takes;
+    `empties`: targets whose liquid the step removes (a spin column's flow-through discarded): once the person
+    passes it, the digital twin holds 0 uL there."""
+    instruction = (instruction or "").strip()
+    if not instruction:
+      raise LabError("bad_instruction", "instruction is empty.",
+                     "Say what the person does, as one instruction: e.g. 'Centrifuge plate at 6000 x g for 1 min, then put it back in its slot'.")
+    if duration_min is not None and (isinstance(duration_min, bool) or not isinstance(duration_min, (int, float))
+                                     or not math.isfinite(duration_min) or duration_min < 0):
+      raise LabError("bad_duration", f"duration_min must be minutes >= 0, got {duration_min!r}.")
+    where: list[str] = []
+    if labware:  # names the person can find on the deck: the loaded layout's own, with where each sits
+      layout = self.adapter.require_layout()
+      known = {**{n: n for n in layout.labware}, **layout.aliases}
+      unknown = [n for n in labware if n not in known]
+      if unknown:
+        raise LabError("unknown_labware", f"{', '.join(unknown)} {'is' if len(unknown) == 1 else 'are'} not in the loaded layout.",
+                       f"Name labware as the layout does: {', '.join(known)}.")
+      for n in labware:
+        spot = layout.position(known[n]) if known[n] in layout.labware else ""
+        where.append(f"{n} ({spot})" if spot else n)
+    emptied: list[str] = []
+    if empties:  # checked now, against the loaded layout, so a pass never fails to apply
+      layout = self.adapter.require_layout()
+      emptied = [c.name for c in layout.resolve_targets(list(empties))]
+    check_id = uuid.uuid4().hex[:8]
+    detail = {"instruction": instruction[:500],
+              **({"empties": list(empties), "empties_containers": emptied} if empties else {}), **({"why": why.strip()[:300]} if why and why.strip() else {}),
+              **({"labware": where} if labware else {}),
+              **({"duration_min": float(duration_min)} if duration_min is not None else {})}
+    took = f" (about {duration_min:g} min)" if duration_min else ""
+    said = instruction.rstrip(" .")
+    ask = f"Done by hand: {said}{took}" + (f"; labware: {', '.join(where)}." if where else ".")
+    result = {"check_id": check_id, "check": MANUAL, "verdict": "pending", "judged_by": MANUAL_JUDGE,
+              "simulated": self.adapter.simulated, **detail,
+              "evidence": {"digital_twin": None, "sensors": None, "camera": CAMERA_NOTE},
+              "note": ("The device cannot do this; the person does it by hand. The digital twin does not follow it: "
+                       "liquid the person adds or removes is not in the twin's volumes.")}
+    self.pending[check_id] = result
+    result["ask_person"] = ask
+    result["next"] = (f"Show the person the instruction{took}. " + pass_now(check_id)
+                      + " Their approval, once they have done it, is the confirmation. If they could not do it, "
+                        "they deny it: stop, ask what happened, and record_verdict(verdict='fail') with their words. "
+                      + NO_DIALOG)
+    self.holds[check_id] = {"check": MANUAL, "state": "pending", "subject": None, "covers": [],
+                            "asked": f"by hand: {instruction[:200]}", "targets": [], "expect": ""}
+    self.runlog.record({"type": "verification", "check_id": check_id, "check": MANUAL, "verdict": "pending",
+                        "judged_by": MANUAL_JUDGE, **detail})
+    return result
+
+  def _empty(self, check_id: str, targets: list[str]) -> None:
+    """A manual step the person did removed the liquid in `targets`: the digital twin holds 0 uL there now."""
+    containers = self.adapter.require_layout().resolve_targets(list(targets))
+    before = {c.name: c.tracker.get_used_volume() for c in containers}
+    for c in containers:
+      c.tracker.set_volume(0)
+    self.runlog.record({"type": "twin", "event": "emptied", "check_id": check_id, "targets": list(targets),
+                        "removed_ul": {k: round(v, 3) for k, v in before.items() if v}})
 
   def mark_auto(self, check_id: str) -> None:
     """A check that waited for the person is the agent's to judge now (the server found auto applies)."""
@@ -263,8 +333,18 @@ class Verification:
     return " ".join(f"Before this load the person failed liquid_present check {cid} (they checked {h['asked']}): they "
                     "check those liquids against this layout too." for cid, h in cleared)
 
+  @staticmethod
+  def _named(check_id: str, hold: dict[str, Any]) -> str:
+    """A waiting hold in a refusal: a manual step by its instruction, a check by what the person checks."""
+    if hold["check"] == MANUAL:
+      return f"manual step {check_id} ({hold['asked']})"
+    return f"{hold['check']} check {check_id} (they check {hold['asked']})"
+
   def _until(self, hold: dict[str, Any]) -> str:
     """What a failed check holds back, and until when, as one sentence."""
+    if hold["check"] == MANUAL:
+      return ("Only drop_tips moves until the person passes a later manual step (they put right what they could not "
+              "do, and you ask for it again with request_manual_step).")
     if hold["check"] == "tips_mounted":
       covers = hold["covers"]
       until = (f"a drop_tips on {covers[0]} goes through, or the person passes a later tips_mounted check of it"
@@ -285,14 +365,15 @@ class Verification:
     (check_failed)."""
     waiting = {cid: h for cid, h in self.holds.items() if h["state"] == "pending"}
     if waiting:
-      named = " and ".join(f"{h['check']} check {cid} (they check {h['asked']})" for cid, h in waiting.items())
+      named = " and ".join(self._named(cid, h) for cid, h in waiting.items())
       auto = all(self.pending.get(c, {}).get("auto") for c in waiting)
       raise LabError("check_pending",
                      f"{named} {'waits' if len(waiting) == 1 else 'wait'} for "
                      + ("the agent's judgment of the camera images, so nothing moves until it comes." if auto else
                         "the person's verdict, so nothing moves until they answer."),
-                     f"{' '.join(self._answer(cid) for cid in waiting)}{'' if auto else ' Never a verdict of your own.'} "
-                     "A new verify of the same check replaces the one waiting.")
+                     f"{' '.join(self._answer(cid) for cid in waiting)}{'' if auto else ' Never a verdict of your own.'}"
+                     + (" A new verify of the same check replaces the one waiting."
+                        if any(h["check"] != MANUAL for h in waiting.values()) else ""))
     failed = {cid: h for cid, h in self.holds.items() if h["state"] == "failed"}
     for cid, hold in failed.items():
       if hold["check"] == "tips_mounted" and op not in ("drop_tips", "recover_tips"):
@@ -308,6 +389,12 @@ class Verification:
                        "for tips that sit crooked; if it holds none, the person takes any off by hand and you "
                        f"verify(check='tips_mounted', device='{hold['subject']}', expect='none'), then record_verdict "
                        "with its ask_person.")
+    for cid, hold in failed.items():
+      if hold["check"] == MANUAL and op != "drop_tips":
+        raise LabError("check_failed",
+                       f"the person could not do manual step {cid} ({hold['asked']}). {self._until(hold)}",
+                       "Ask the person what happened and go on only as they say: once it is put right, "
+                       "request_manual_step again and record_verdict with its ask_person.")
     for cid, hold in failed.items():
       if hold["check"] == "liquid_present" and op not in ("drop_tips", "load_layout"):
         raise LabError("check_failed",
@@ -326,8 +413,10 @@ class Verification:
         continue
       if hold["state"] == "pending":
         by = "the agent's judgment of the camera images" if self.pending.get(cid, {}).get("auto") else "the person's verdict"
-        parts.append(f"{hold['check']} check {cid} waits for {by} (checking {hold['asked']}): "
-                     f"{self._answer(cid)} Nothing moves before that.")
+        what = (f"manual step {cid} ({hold['asked']})" if hold["check"] == MANUAL else
+                f"{hold['check']} check {cid}")
+        checking = "" if hold["check"] == MANUAL else f" (checking {hold['asked']})"
+        parts.append(f"{what} waits for {by}{checking}: {self._answer(cid)} Nothing moves before that.")
       else:
         parts.append(f"The person failed {hold['check']} check {cid}: {self._until(hold)}")
     return " ".join(parts) + (" " if parts else "")
@@ -492,6 +581,8 @@ class Verification:
     result = {**self.pending.pop(check_id), "verdict": verdict, "judged_by": "human", "note": note}
     for key in ("next", "ask_person", "supersedes", "auto"):  # what the person was asked; the caller says what comes next
       result.pop(key, None)
+    if result["check"] == MANUAL and verdict == "pass" and result.get("empties"):
+      self._empty(check_id, result["empties"])
     self._settle(check_id, verdict)
     self.runlog.record({"type": "verification", "check_id": check_id, "check": result["check"],
                         "verdict": verdict, "judged_by": "human", "note": note})

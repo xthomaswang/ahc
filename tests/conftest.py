@@ -32,7 +32,7 @@ class Refused(Exception):
 
 
 # The tools that name their plan step (the server refuses them before a plan is reported).
-PLAN_TOOLS = {"load_layout", "verify", "pick_up_tips", "aspirate", "dispense", "mix", "drop_tips", "invoke", "recover_tips"}
+PLAN_TOOLS = {"load_layout", "verify", "request_manual_step", "pick_up_tips", "aspirate", "dispense", "mix", "drop_tips", "invoke", "recover_tips"}
 
 
 class LabClient:

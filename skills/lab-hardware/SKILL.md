@@ -232,6 +232,18 @@ decide: you prepare it, show it and wait.
   failed tip check only `drop_tips` moves (`check_failed`) until a `drop_tips` on that pipette goes
   through or a later tip check of it passes; after a failed liquid check only `drop_tips` and
   `load_layout` move until a later check of those wells passes or a new layout is loaded.
+- A step the device cannot do (centrifuge, incubate or shake off deck, vortex, move labware, add a
+  reagent by hand): `request_manual_step(instruction, plan_step, why, labware, duration_min)` with
+  one plain instruction ("Centrifuge plate at 6000 x g for 1 min, then put it back in its slot").
+  It is the person's in simulation too and holds motion while it waits (`check_pending`). Report
+  `waiting_for="person"`, then call `record_verdict(check_id, verdict="pass", note=<ask_person>)`
+  right away: the person approves it once they have done the step. Denied: they could not do it;
+  ask what happened and record `verdict="fail"` with their words, after which only `drop_tips` moves
+  until a later manual step passes. Liquid the step removes (a spin column's flow-through that is
+  discarded) goes in `empties` (targets): once the person passes the step, the digital twin holds
+  0 uL there. Anything else the person adds or removes is not in the twin's volumes, so load the
+  layout again with the volumes they report when later steps depend on them. Give each manual step
+  its own plan step.
 
 ## Cameras (only when `lab_overview.config.cameras` lists some)
 

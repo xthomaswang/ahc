@@ -388,6 +388,10 @@ def _check_text(entry: dict[str, Any], names: Callable[[str], str]) -> str:
   """What a person check asks, in words, from its run-log entry."""
   twin = ((entry.get("evidence") or {}).get("digital_twin")) or {}
   check = entry.get("check")
+  if check == "manual_step":  # work done by hand: the instruction itself, with the labware and how long
+    took = f" (about {entry['duration_min']:g} min)" if isinstance(entry.get("duration_min"), (int, float)) and entry["duration_min"] else ""
+    held = f" · labware: {', '.join(entry['labware'])}" if entry.get("labware") else ""
+    return f"by hand: {entry.get('instruction') or 'a manual step'}{took}{held}"
   if check == "deck_matches_layout":
     return "the deck matches the loaded layout"
   if check == "tips_mounted" and "pipettes" in twin:  # the check of every pipette at once
